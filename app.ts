@@ -12,6 +12,11 @@
 // 候补队列：add-waitlist 登记“固定时段 + 多资源”的候补（不占用资源，
 // 当前存在冲突也可登记）；process-waitlist 按登记顺序手动处理整个队列，
 // 为可兑现项各创建一项普通预约，受阻项继续等待且不影响后续项的检查。
+//
+// 资源临时停用：add-suspension 为单个已登记资源登记一段停用区间
+// （场地维护、设备检修、人员休息），登记前要求与该资源的全部有效预约
+// 无时间重叠；资源的实际可用时间 = 原开放区间合并后扣除全部有效停用的
+// 并集，创建/改期/系列/候补一律按实际可用时间检查完整覆盖。
 
 import {readFile, writeFile, rename, unlink} from 'node:fs/promises';
 
@@ -165,6 +170,7 @@ function isFullyCovered(segments: Array<[number, number]>, s: number, e: number)
 type ResourceType = 'venue' | 'equipment' | 'person';
 type BookingStatus = 'active' | 'cancelled';
 type WaitlistStatus = 'waiting' | 'fulfilled' | 'cancelled';
+type SuspensionStatus = 'active' | 'cancelled';
 
 interface ResourceRec {
   id: string;
@@ -196,16 +202,26 @@ interface WaitlistRec {
   bookingId?: string; // 已兑现时关联的普通预约标识
 }
 
+interface SuspensionRec {
+  id: string; // 停用标识 D0001…，稳定且不复用
+  resourceId: string; // 被停用的单个资源
+  start: string; // 停用开始时间
+  end: string; // 停用结束时间
+  status: SuspensionStatus;
+}
+
 interface Store {
   version: 1;
   resourceSeq: number;
   bookingSeq: number;
   seriesSeq: number;
   waitlistSeq: number; // 已分配的最大候补序号（计数不复用）
+  suspensionSeq: number; // 已分配的最大停用序号（计数不复用）
   resources: ResourceRec[];
   bookings: BookingRec[];
   series: SeriesRec[];
   waitlist: WaitlistRec[];
+  suspensions: SuspensionRec[];
 }
 
 const RESOURCE_TYPE_LABEL: Record<ResourceType, string> = {
@@ -230,10 +246,12 @@ function emptyStore(): Store {
     bookingSeq: 0,
     seriesSeq: 0,
     waitlistSeq: 0,
+    suspensionSeq: 0,
     resources: [],
     bookings: [],
     series: [],
     waitlist: [],
+    suspensions: [],
   };
 }
 
@@ -268,15 +286,21 @@ function validateStore(raw: unknown, file: string): Store {
     if (!isInt(o.waitlistSeq)) bad('waitlistSeq 必须是非负整数');
     store.waitlistSeq = o.waitlistSeq;
   }
+  if (o.suspensionSeq !== undefined) {
+    if (!isInt(o.suspensionSeq)) bad('suspensionSeq 必须是非负整数');
+    store.suspensionSeq = o.suspensionSeq;
+  }
 
   if (o.resources !== undefined && !Array.isArray(o.resources)) bad('resources 必须是数组');
   if (o.bookings !== undefined && !Array.isArray(o.bookings)) bad('bookings 必须是数组');
   if (o.series !== undefined && !Array.isArray(o.series)) bad('series 必须是数组');
   if (o.waitlist !== undefined && !Array.isArray(o.waitlist)) bad('waitlist 必须是数组');
+  if (o.suspensions !== undefined && !Array.isArray(o.suspensions)) bad('suspensions 必须是数组');
   const rawResources = (o.resources ?? []) as unknown[];
   const rawBookings = (o.bookings ?? []) as unknown[];
   const rawSeries = (o.series ?? []) as unknown[];
   const rawWaitlist = (o.waitlist ?? []) as unknown[];
+  const rawSuspensions = (o.suspensions ?? []) as unknown[];
 
   const resourceIds = new Set<string>();
   rawResources.forEach((item, idx) => {
@@ -461,10 +485,52 @@ function validateStore(raw: unknown, file: string): Store {
     if (!waitlistSeqs.has(i)) bad(`候补队列缺号：找不到登记序号 ${i} 的记录`);
   }
 
+  // 停用记录：引用真实资源；记录从不删除（取消也保留），标识序号集合必须恰好为 1..suspensionSeq
+  const suspensionIds = new Set<string>();
+  const suspensionSeqs = new Set<number>();
+  rawSuspensions.forEach((item, idx) => {
+    const at = `suspensions[${idx}]`;
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) bad(`${at} 必须是对象`);
+    const s = item as Record<string, unknown>;
+    if (typeof s.id !== 'string' || !/^D\d{4,}$/.test(s.id)) bad(`${at}.id 非法: ${String(s.id)}`);
+    if (suspensionIds.has(s.id)) bad(`停用标识重复: ${s.id}`);
+    suspensionIds.add(s.id);
+    const sn = Number(s.id.slice(1));
+    if (sn > store.suspensionSeq) store.suspensionSeq = sn;
+    suspensionSeqs.add(sn);
+
+    if (typeof s.resourceId !== 'string' || !resourceIds.has(s.resourceId)) {
+      bad(`${at}(${s.id}) 引用了未知资源: ${String(s.resourceId)}`);
+    }
+    if (typeof s.start !== 'string' || typeof s.end !== 'string') {
+      bad(`${at}(${s.id}) 起止时间必须是字符串`);
+    }
+    const ss = parseDateTime(s.start, `${at}(${s.id}).start`);
+    const se = parseDateTime(s.end, `${at}(${s.id}).end`);
+    if (se <= ss) bad(`${at}(${s.id}) 结束必须晚于开始`);
+    if (s.status !== 'active' && s.status !== 'cancelled') {
+      bad(`${at}(${s.id}).status 非法: ${String(s.status)}`);
+    }
+    store.suspensions.push({
+      id: s.id,
+      resourceId: s.resourceId,
+      start: s.start,
+      end: s.end,
+      status: s.status,
+    });
+  });
+  if (store.suspensionSeq !== 0 && store.suspensions.length === 0) {
+    bad('suspensionSeq 非零却没有任何停用记录（计数与记录不一致）');
+  }
+  for (let i = 1; i <= store.suspensionSeq; i++) {
+    if (!suspensionSeqs.has(i)) bad(`停用记录缺号：找不到序号 ${i} 的停用记录`);
+  }
+
   store.resources.sort((a, b) => a.id.localeCompare(b.id));
   store.bookings.sort((a, b) => a.id.localeCompare(b.id));
   store.series.sort((a, b) => a.id.localeCompare(b.id));
   store.waitlist.sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
+  store.suspensions.sort((a, b) => a.id.localeCompare(b.id));
   return store;
 }
 
@@ -547,25 +613,96 @@ function openSegmentsOf(r: ResourceRec): Array<[number, number]> {
   );
 }
 
-// 找出开放区间不能完整覆盖 [startMin, endMin) 的资源
+// 从连续区间中扣除一段区间（左闭右开）
+function subtractSegments(
+  segments: Array<[number, number]>,
+  cuts: Array<[number, number]>,
+): Array<[number, number]> {
+  let result = segments;
+  for (const [cs, ce] of cuts) {
+    const next: Array<[number, number]> = [];
+    for (const [s, e] of result) {
+      if (ce <= s || cs >= e) {
+        next.push([s, e]);
+        continue;
+      }
+      if (cs > s) next.push([s, cs]);
+      if (ce < e) next.push([ce, e]);
+    }
+    result = next;
+  }
+  return result;
+}
+
+function activeSuspensionsOf(store: Store, resourceId: string): SuspensionRec[] {
+  return store.suspensions.filter((s) => s.resourceId === resourceId && s.status === 'active');
+}
+
+// 资源实际可用时间：原开放区间合并后，扣除全部有效停用区间的并集（原开放记录保留）
+function availableSegmentsOf(store: Store, r: ResourceRec): Array<[number, number]> {
+  const cuts = activeSuspensionsOf(store, r.id).map(
+    (s) => [parseDateTime(s.start, '停用开始时间'), parseDateTime(s.end, '停用结束时间')] as [number, number],
+  );
+  return subtractSegments(openSegmentsOf(r), mergeIntervals(cuts));
+}
+
+// 与请求区间重叠的有效停用（按开始时间、标识排序），用于报告“停用导致不足”
+function overlappingActiveSuspensions(
+  store: Store,
+  resourceId: string,
+  startMin: number,
+  endMin: number,
+): SuspensionRec[] {
+  return activeSuspensionsOf(store, resourceId)
+    .map((s) => ({
+      s,
+      startMin: parseDateTime(s.start, '停用开始时间'),
+      endMin: parseDateTime(s.end, '停用结束时间'),
+    }))
+    .filter((x) => x.startMin < endMin && startMin < x.endMin)
+    .sort((a, b) => a.startMin - b.startMin || a.s.id.localeCompare(b.s.id))
+    .map((x) => x.s);
+}
+
+interface CoverageGap {
+  id: string;
+  r: ResourceRec;
+  suspensions: SuspensionRec[]; // 与请求区间重叠的有效停用；为空说明纯粹开放不足
+}
+
+// 找出实际可用时间（开放扣除有效停用）不能完整覆盖 [startMin, endMin) 的资源
 function findCoverageGaps(
   store: Store,
   ids: string[],
   startMin: number,
   endMin: number,
-): Array<{id: string; r: ResourceRec}> {
-  return ids
-    .map((id) => ({id, r: store.resources.find((x) => x.id === id)!}))
-    .filter(({r}) => !isFullyCovered(openSegmentsOf(r), startMin, endMin));
+): CoverageGap[] {
+  const gaps: CoverageGap[] = [];
+  for (const id of ids) {
+    const r = store.resources.find((x) => x.id === id)!;
+    if (isFullyCovered(availableSegmentsOf(store, r), startMin, endMin)) continue;
+    gaps.push({id, r, suspensions: overlappingActiveSuspensions(store, id, startMin, endMin)});
+  }
+  return gaps;
 }
 
-// 校验每个资源的开放区间都能完整覆盖 [startMin, endMin)
+// 报告一个覆盖不足资源：标识名称，以及与请求区间重叠的全部有效停用标识和时间
+function renderGap(gap: CoverageGap, indent: string): string[] {
+  const lines = [`${indent}- ${gap.id}（${gap.r.name}）`];
+  if (gap.suspensions.length > 0) {
+    lines.push(`${indent}  相关有效停用:`);
+    for (const s of gap.suspensions) lines.push(`${indent}    - ${s.id}（${s.start} → ${s.end}）`);
+  }
+  return lines;
+}
+
+// 校验每个资源的实际可用时间都能完整覆盖 [startMin, endMin)
 function assertOpenCoverage(store: Store, ids: string[], startMin: number, endMin: number): void {
   const failing = findCoverageGaps(store, ids, startMin, endMin);
   if (failing.length > 0) {
     throw new BizError(
-      '开放时间不足，以下资源的开放区间不能完整覆盖预约区间：\n' +
-        failing.map(({id, r}) => `- ${id}（${r.name}）`).join('\n'),
+      '可用时间不足：以下资源的开放区间扣除有效停用后，不能完整覆盖请求区间：\n' +
+        failing.flatMap((g) => renderGap(g, '')).join('\n'),
     );
   }
 }
@@ -850,7 +987,7 @@ interface BatchTarget {
 
 interface BatchFailure {
   target: BatchTarget;
-  gaps: Array<{id: string; r: ResourceRec}>;
+  gaps: CoverageGap[];
   external: Conflict[]; // 与本批之外有效预约的冲突
   internal: Array<{other: BatchTarget; shared: string[]}>; // 与本批其他目标安排的冲突
 }
@@ -1048,8 +1185,8 @@ async function cmdRescheduleBatch(args: string[]): Promise<void> {
     const blocks = failures.map(({target: t, gaps, external, internal}) => {
       const lines = [`第 ${t.index + 1} 项 ${t.booking.id} 目标 ${t.startRaw} → ${t.endRaw}：`];
       if (gaps.length > 0) {
-        lines.push('  开放不足资源:');
-        for (const {id, r} of gaps) lines.push(`    - ${id}（${r.name}）`);
+        lines.push('  可用不足资源（开放区间扣除有效停用）:');
+        for (const g of gaps) lines.push(...renderGap(g, '    '));
       }
       if (external.length + internal.length > 0) {
         lines.push('  冲突预约:');
@@ -1208,7 +1345,7 @@ interface MemberFailure {
   index: number; // 0 基
   startRaw: string;
   endRaw: string;
-  gaps: Array<{id: string; r: ResourceRec}>;
+  gaps: CoverageGap[];
   conflicts: Conflict[]; // 与既有有效预约的冲突
   internal: Array<{other: PlannedMember; otherIndex: number}>; // 与系列内其他成员的冲突
 }
@@ -1260,8 +1397,8 @@ async function cmdCreateSeries(args: string[]): Promise<void> {
     const blocks = failures.map((f) => {
       const lines = [`第 ${f.index + 1} 项 ${f.startRaw} → ${f.endRaw}：`];
       if (f.gaps.length > 0) {
-        lines.push('  开放不足资源:');
-        for (const {id, r} of f.gaps) lines.push(`    - ${id}（${r.name}）`);
+        lines.push('  可用不足资源（开放区间扣除有效停用）:');
+        for (const g of f.gaps) lines.push(...renderGap(g, '    '));
       }
       if (f.conflicts.length > 0) {
         lines.push('  与以下既有预约冲突:');
@@ -1513,7 +1650,7 @@ async function cmdProcessWaitlist(args: string[]): Promise<void> {
   const selected: Array<{w: WaitlistRec; bookingId: string; startMin: number; endMin: number}> = [];
   const blocked: Array<{
     w: WaitlistRec;
-    gaps: Array<{id: string; r: ResourceRec}>;
+    gaps: CoverageGap[];
     conflicts: PendingConflict[];
   }> = [];
 
@@ -1521,7 +1658,7 @@ async function cmdProcessWaitlist(args: string[]): Promise<void> {
     const startMin = parseDateTime(w.start, '候补开始时间');
     const endMin = parseDateTime(w.end, '候补结束时间');
 
-    // 1) 重查开放覆盖（资源开放区间可能已变化）
+    // 1) 重查实际可用覆盖（开放区间可能已变化，且可能新增了有效停用）
     const gaps = findCoverageGaps(store, w.resourceIds, startMin, endMin);
 
     // 2) 与当前全部有效预约（含系列成员，已取消不占用）求冲突
@@ -1611,13 +1748,13 @@ async function cmdProcessWaitlist(args: string[]): Promise<void> {
 function renderBlocked(
   store: Store,
   w: WaitlistRec,
-  gaps: Array<{id: string; r: ResourceRec}>,
+  gaps: CoverageGap[],
   conflicts: PendingConflict[],
 ): string {
   const lines = [`- 继续等待 ${w.id}：${w.start} → ${w.end}`];
   if (gaps.length > 0) {
-    lines.push('    开放不足资源:');
-    for (const {id, r} of gaps) lines.push(`      - ${id}（${r.name}）`);
+    lines.push('    可用不足资源（开放区间扣除有效停用）:');
+    for (const g of gaps) lines.push(...renderGap(g, '      '));
   }
   if (conflicts.length > 0) {
     lines.push('    冲突预约（共同资源时间重叠）:');
@@ -1632,10 +1769,114 @@ function renderBlocked(
 }
 
 // ---------------------------------------------------------------------------
+// 资源临时停用：场地维护、设备检修、人员休息的登记、列表与取消
+// ---------------------------------------------------------------------------
+
+async function cmdAddSuspension(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, ['resource', 'start', 'end']);
+  if (positionals.length > 0) throw new UsageError(`add-suspension 不接受位置参数: ${positionals.join(' ')}`);
+
+  const resourceId = requireFlag(values, 'resource');
+  const startRaw = requireFlag(values, 'start');
+  const endRaw = requireFlag(values, 'end');
+
+  const file = activeDataFile;
+  const store = await loadStore(file);
+
+  const resource = store.resources.find((r) => r.id === resourceId);
+  if (!resource) throw new BizError(`未知资源标识: ${resourceId}`);
+  const startMin = parseDateTime(startRaw, '停用开始时间');
+  const endMin = parseDateTime(endRaw, '停用结束时间');
+  if (endMin <= startMin) {
+    throw new BizError(`停用结束时间必须晚于开始时间（开始: ${startRaw}，结束: ${endRaw}），允许跨日`);
+  }
+  // 停用区间不要求原本开放；相同内容再次登记是另一记录，允许停用重叠或相接
+
+  // 登记前检查该资源的全部有效预约（含系列成员与候补兑现预约；已取消不阻挡）。
+  // 区间左闭右开，端点相接不算重叠；有重叠即拒绝，不改期或取消任何预约。
+  const affected = store.bookings
+    .filter((b) => b.status === 'active' && b.resourceIds.includes(resourceId))
+    .filter((b) => {
+      const bs = parseDateTime(b.start, '预约开始时间');
+      const be = parseDateTime(b.end, '预约结束时间');
+      return bs < endMin && startMin < be;
+    })
+    .sort((a, b) => a.id.localeCompare(b.id));
+  if (affected.length > 0) {
+    const lines = affected.map((b) => `- ${b.id}（${b.start} → ${b.end}）`);
+    throw new BizError(
+      `无法登记停用：资源 ${resourceId}（${resource.name}）在 ${startRaw} → ${endRaw} 与以下有效预约` +
+        `时间重叠（共 ${affected.length} 项，全部预约保持不变）：\n${lines.join('\n')}`,
+    );
+  }
+
+  // 全部校验通过后才分配标识、改内存、落盘
+  store.suspensionSeq += 1;
+  const id = `D${String(store.suspensionSeq).padStart(4, '0')}`;
+  store.suspensions.push({id, resourceId, start: startRaw, end: endRaw, status: 'active'});
+  await saveStore(file, store);
+  console.log(`已登记停用 ${id}`);
+  console.log(`  资源: ${resourceId}（${resource.name}）`);
+  console.log(`  时间: ${startRaw} → ${endRaw}`);
+  console.log('  该时段内此资源的实际可用时间已扣除本停用；已有候补不受影响，仅在再次手动处理时按新可用时间检查。');
+}
+
+async function cmdListSuspensions(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(`list-suspensions 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`);
+  }
+  if (positionals.length > 0) {
+    throw new UsageError(`list-suspensions 不接受位置参数: ${positionals.join(' ')}`);
+  }
+
+  const store = await loadStore(activeDataFile);
+  if (store.suspensions.length === 0) {
+    console.log('暂无停用记录。可使用 add-suspension 登记场地维护、设备检修或人员休息。');
+    return;
+  }
+  const items = store.suspensions
+    .map((s) => ({s, startMin: parseDateTime(s.start, '停用开始时间')}))
+    .sort((x, y) => x.startMin - y.startMin || x.s.id.localeCompare(y.s.id));
+  const active = items.filter(({s}) => s.status === 'active').length;
+  console.log(`停用记录（共 ${items.length} 条，按开始时间、标识排序；有效 ${active}，已取消 ${items.length - active}）：`);
+  for (const {s} of items) {
+    const r = store.resources.find((x) => x.id === s.resourceId)!;
+    const status = s.status === 'active' ? '有效' : '已取消';
+    console.log(`- ${s.id} [${status}] ${s.start} → ${s.end}`);
+    console.log(`    资源: ${s.resourceId}（${r.name}）`);
+  }
+}
+
+async function cmdCancelSuspension(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(`cancel-suspension 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`);
+  }
+  if (positionals.length !== 1) throw new UsageError('用法: cancel-suspension <停用标识>');
+  const id = positionals[0];
+  if (!/^D\d{4,}$/.test(id)) throw new BizError(`停用标识非法: ${id}`);
+
+  const file = activeDataFile;
+  const store = await loadStore(file);
+  const s = store.suspensions.find((x) => x.id === id);
+  if (!s) throw new BizError(`未知停用标识: ${id}`);
+  if (s.status === 'cancelled') {
+    // 幂等：重复取消成功且不做任何改动
+    console.log(`停用 ${id} 已是取消状态，未做改动。`);
+    return;
+  }
+  s.status = 'cancelled'; // 仅使该记录失效并保留历史；其他重叠停用仍然有效
+  await saveStore(file, store);
+  console.log(`已取消停用 ${id}，记录保留；该资源的实际可用时间相应恢复（不超出原开放时间）。`);
+  console.log('  取消不会自动创建预约或处理候补；候补仅在再次手动处理时尝试兑现。');
+}
+
+// ---------------------------------------------------------------------------
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列与候补队列）
+const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、候补队列与资源临时停用）
 
 用法:
   node app.ts [--data <数据文件>] <命令> [选项]
@@ -1701,8 +1942,21 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       绝不为增加兑现数量改变顺序。每个选中项各生成一项普通预约（不加入系列、
       不改动原预约），新预约与候补已兑现状态及关联标识原子保存后才报告成功；
       结果按队列顺序展示（选中项显示两种标识、时间与完整资源；等待项列出开放
-      不足资源、全部冲突预约及共同资源，含本轮新预约）。没有可兑现项也成功且
-      不改变记录或计数；普通创建、改期或取消不会自动处理候补
+      不足资源（含相关有效停用）、全部冲突预约及共同资源，含本轮新预约）。
+      没有可兑现项也成功且不改变记录或计数；普通创建、改期或取消不会自动处理候补
+
+停用命令（场地维护、设备检修、人员休息）:
+  add-suspension --resource <标识> \\
+      --start <YYYY-MM-DDTHH:mm> --end <YYYY-MM-DDTHH:mm>
+      为一个已登记资源登记一段临时停用，返回稳定且不复用的停用标识（如 D0001）；
+      停用区间不要求原本开放，相同内容再次登记是另一记录，允许停用重叠或相接。
+      登记前检查该资源的全部有效预约（含系列成员与候补兑现预约），有时间重叠
+      即拒绝并列出全部受影响预约标识及时间，不改期或取消它们；已取消预约不阻挡
+  list-suspensions
+      按开始时间、标识列出全部停用记录的资源、时间与有效/已取消状态（空结果明确提示）
+  cancel-suspension <停用标识>
+      使指定停用记录失效并保留历史；重复取消成功且无变化，未知标识失败；
+      其他重叠停用仍有效，恢复范围不超出原开放时间，取消不自动创建预约或处理候补
 
 批量改期清单（reschedule-batch 的 JSON 文件，UTF-8，顶层 {"items": [...]}）:
   清单不能为空；每项字段：
@@ -1732,15 +1986,17 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   为与机器时区无关的营业地时间，日期必须真实有效，结束晚于开始，允许跨日；
   按周移动按营业地日历日计算，跨月、闰日、跨年均准确，结果须落在 0001-9999 年内；
   区间左闭右开：一个预约的结束恰为另一预约的开始不算冲突；
-  开放区间重叠或相接视为连续开放，预约须被每个所选资源的开放区间完整覆盖；
+  开放区间重叠或相接视为连续开放；资源的实际可用时间为开放区间合并后扣除
+  全部有效停用区间的并集，预约与候补须被每个所选资源的实际可用时间完整覆盖；
   仅当存在共同资源且时间重叠时预约才冲突。
 
 退出码:
   0  成功
   1  业务或文件失败（名称为空、未知/重复资源或预约、已取消预约、时间非法、
-     开放不足、冲突、非法次数、超出四位年份、未知系列、未知候补、取消已兑现
-     候补、候补标识非法、改期清单不可读/损坏/内容非法、数据文件损坏（含候补
-     状态或关联非法）或保存失败等）
+     开放或可用不足、冲突、非法次数、超出四位年份、未知系列、未知候补、取消已兑现
+     候补、候补标识非法、停用与有效预约重叠、未知停用、停用标识非法、
+     改期清单不可读/损坏/内容非法、数据文件损坏（含候补或停用数据非法）
+     或保存失败等）
   2  用法错误（未知参数、缺少必需选项、多余位置参数等）
 
 示例:
@@ -1760,6 +2016,10 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   node app.ts list-waitlist
   node app.ts process-waitlist
   node app.ts cancel-waitlist W0001
+  node app.ts add-suspension --resource R0001 \\
+      --start 2026-10-20T00:00 --end 2026-10-21T00:00
+  node app.ts list-suspensions
+  node app.ts cancel-suspension D0001
 `;
 
 let activeDataFile = DEFAULT_DATA_FILE;
@@ -1816,6 +2076,15 @@ async function main(): Promise<void> {
       break;
     case 'process-waitlist':
       await cmdProcessWaitlist(commandArgs);
+      break;
+    case 'add-suspension':
+      await cmdAddSuspension(commandArgs);
+      break;
+    case 'list-suspensions':
+      await cmdListSuspensions(commandArgs);
+      break;
+    case 'cancel-suspension':
+      await cmdCancelSuspension(commandArgs);
       break;
     default:
       throw new UsageError(`未知命令: ${command}`);
