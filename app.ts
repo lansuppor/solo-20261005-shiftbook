@@ -1038,6 +1038,64 @@ function assertNoConflicts(conflicts: Conflict[], store: Store): void {
 }
 
 // ---------------------------------------------------------------------------
+// 多目标批次校验（无写入副作用）
+// 创建系列、批量改期、安全撤销与 iCalendar 导入共用的同一套批次可行性校验：
+// 针对“全部目标生效后”的安排，统一检查
+//   1) 实际可用覆盖——目标区间被每个资源的实际可用时间（开放合并后扣除有效
+//      停用并集）完整覆盖；
+//   2) 批外占用——与批外有效预约的共同资源左闭右开区间重叠（取消预约不占用）；
+//   3) 批内冲突——本批目标彼此之间的共同资源时间重叠（端点相接可行）。
+// 本函数只读：不修改 store、targets 或任何计数；收集全部失败项（按目标顺序），
+// 批内冲突在双方目标中都会出现。诊断的业务定位、排序与渲染以及校验通过后的
+// 提交（改内存、落盘、输出）仍由各入口负责。
+// ---------------------------------------------------------------------------
+
+interface BatchCheckTarget {
+  startMin: number;
+  endMin: number;
+  resourceIds: string[]; // 已校验、按标识排序
+}
+
+interface BatchCheckFailure {
+  index: number; // 目标在提交序列中的 0 基序号
+  gaps: CoverageGap[]; // 实际可用时间不能完整覆盖目标的资源（含相关有效停用）
+  external: Conflict[]; // 与批外有效预约的冲突（按预约标识排序）
+  internal: Array<{otherIndex: number; shared: string[]}>; // 与批内其他目标的冲突（按目标顺序）
+}
+
+// excludeBookingIds：本批涉及的既有预约标识——其当前占用不视为障碍（允许整批
+// 交换时段与资源）。创建系列与导入传空集；批量改期传本批全部预约标识；
+// 安全撤销传本操作涉及预约标识。
+function validateBatchTargets(
+  store: Store,
+  targets: BatchCheckTarget[],
+  excludeBookingIds: ReadonlySet<string> = new Set<string>(),
+): BatchCheckFailure[] {
+  const failures: BatchCheckFailure[] = [];
+  for (let i = 0; i < targets.length; i++) {
+    const t = targets[i];
+    const gaps = findCoverageGaps(store, t.resourceIds, t.startMin, t.endMin);
+    const external = findConflicts(store, t.resourceIds, t.startMin, t.endMin).filter(
+      (c) => !excludeBookingIds.has(c.booking.id),
+    );
+    const wanted = new Set(t.resourceIds);
+    const internal: BatchCheckFailure['internal'] = [];
+    for (let j = 0; j < targets.length; j++) {
+      if (j === i) continue;
+      const o = targets[j];
+      const overlap = o.startMin < t.endMin && t.startMin < o.endMin;
+      if (!overlap) continue;
+      const shared = o.resourceIds.filter((id) => wanted.has(id)).sort();
+      if (shared.length > 0) internal.push({otherIndex: j, shared});
+    }
+    if (gaps.length > 0 || external.length > 0 || internal.length > 0) {
+      failures.push({index: i, gaps, external, internal});
+    }
+  }
+  return failures;
+}
+
+// ---------------------------------------------------------------------------
 // 命令行解析
 // ---------------------------------------------------------------------------
 
@@ -1278,13 +1336,6 @@ interface BatchTarget {
   resourceIds: string[]; // 已校验、按标识排序，整体替换原集合
 }
 
-interface BatchFailure {
-  target: BatchTarget;
-  gaps: CoverageGap[];
-  external: Conflict[]; // 与本批之外有效预约的冲突
-  internal: Array<{other: BatchTarget; shared: string[]}>; // 与本批其他目标安排的冲突
-}
-
 // 读取清单文件：不可读、不是合法 JSON 均明确失败（绝不按空清单处理）
 async function loadManifest(file: string): Promise<unknown> {
   let text: string;
@@ -1450,32 +1501,15 @@ async function cmdRescheduleBatch(args: string[]): Promise<void> {
   const targets = planned as BatchTarget[];
   const batchIds = new Set(targets.map((t) => t.booking.id));
 
-  // 第二阶段：对“整批完成后”的安排做校验。
-  // 本批预约的旧占用一律不视为障碍（findConflicts 排除本批全部标识）；
+  // 第二阶段：对“整批完成后”的安排做共用批次校验（无写入副作用）。
+  // 本批预约的旧占用一律不视为障碍（排除本批全部标识）；
   // 障碍只来自本批之外的有效预约，以及本批各项的目标安排彼此之间。
-  const failures: BatchFailure[] = [];
-  for (const t of targets) {
-    const gaps = findCoverageGaps(store, t.resourceIds, t.startMin, t.endMin);
-    const external = findConflicts(store, t.resourceIds, t.startMin, t.endMin).filter(
-      (c) => !batchIds.has(c.booking.id),
-    );
-    const wanted = new Set(t.resourceIds);
-    const internal: BatchFailure['internal'] = [];
-    for (const o of targets) {
-      if (o.index === t.index) continue;
-      const overlap = o.startMin < t.endMin && t.startMin < o.endMin;
-      if (!overlap) continue;
-      const shared = o.resourceIds.filter((id) => wanted.has(id)).sort();
-      if (shared.length > 0) internal.push({other: o, shared});
-    }
-    if (gaps.length > 0 || external.length > 0 || internal.length > 0) {
-      failures.push({target: t, gaps, external, internal});
-    }
-  }
+  const failures = validateBatchTargets(store, targets, batchIds);
 
   if (failures.length > 0) {
     // 按清单顺序报告全部不满足条件的项；批内冲突在双方项中都会出现
-    const blocks = failures.map(({target: t, gaps, external, internal}) => {
+    const blocks = failures.map(({index, gaps, external, internal}) => {
+      const t = targets[index];
       const lines = [`第 ${t.index + 1} 项 ${t.booking.id} 目标 ${t.startRaw} → ${t.endRaw}：`];
       if (gaps.length > 0) {
         lines.push('  开放不足资源:');
@@ -1490,8 +1524,9 @@ async function cmdRescheduleBatch(args: string[]): Promise<void> {
           );
         }
         for (const x of internal) {
+          const o = targets[x.otherIndex];
           lines.push(
-            `    - ${x.other.booking.id}（本批第 ${x.other.index + 1} 项目标 ${x.other.startRaw} → ${x.other.endRaw}）` +
+            `    - ${o.booking.id}（本批第 ${o.index + 1} 项目标 ${o.startRaw} → ${o.endRaw}）` +
               `：共同资源 ${formatResourceIds(store, x.shared)}`,
           );
         }
@@ -1632,15 +1667,6 @@ async function cmdListBatchOps(args: string[]): Promise<void> {
   }
 }
 
-// 撤销校验的单项失败信息
-interface UndoFailure {
-  item: BatchOpItem;
-  index: number; // 提交顺序（0 基）
-  gaps: CoverageGap[];
-  external: Conflict[]; // 与本操作涉及预约之外有效预约的冲突
-  internal: Array<{other: BatchOpItem; otherIndex: number; shared: string[]}>; // 与本操作其他恢复安排的冲突
-}
-
 async function cmdUndoBatchOp(args: string[]): Promise<void> {
   const {values, positionals} = parseFlags(args, []);
   if (values.size > 0) {
@@ -1708,36 +1734,21 @@ async function cmdUndoBatchOp(args: string[]): Promise<void> {
     );
   }
 
-  // 可行性：对“整笔恢复后”的最终安排做校验。本操作涉及预约的当前占用一律排除
-  // （允许互换时段）；障碍只来自本操作之外的有效预约，以及各项恢复安排彼此之间。
+  // 可行性：对“整笔恢复后”的最终安排做共用批次校验（无写入副作用）。
+  // 本操作涉及预约的当前占用一律排除（允许互换时段）；
+  // 障碍只来自本操作之外的有效预约，以及各项恢复安排彼此之间。
   const involvedIds = new Set(op.items.map((it) => it.bookingId));
-  const failures: UndoFailure[] = [];
-  op.items.forEach((item, index) => {
-    const startMin = parseDateTime(item.before.start, '恢复开始时间');
-    const endMin = parseDateTime(item.before.end, '恢复结束时间');
-    const gaps = findCoverageGaps(store, item.before.resourceIds, startMin, endMin);
-    const external = findConflicts(store, item.before.resourceIds, startMin, endMin).filter(
-      (c) => !involvedIds.has(c.booking.id),
-    );
-    const wanted = new Set(item.before.resourceIds);
-    const internal: UndoFailure['internal'] = [];
-    op.items.forEach((other, otherIndex) => {
-      if (otherIndex === index) return;
-      const oStart = parseDateTime(other.before.start, '恢复开始时间');
-      const oEnd = parseDateTime(other.before.end, '恢复结束时间');
-      const overlap = oStart < endMin && startMin < oEnd;
-      if (!overlap) return;
-      const shared = other.before.resourceIds.filter((id) => wanted.has(id)).sort();
-      if (shared.length > 0) internal.push({other, otherIndex, shared});
-    });
-    if (gaps.length > 0 || external.length > 0 || internal.length > 0) {
-      failures.push({item, index, gaps, external, internal});
-    }
-  });
+  const restoreTargets: BatchCheckTarget[] = op.items.map((it) => ({
+    startMin: parseDateTime(it.before.start, '恢复开始时间'),
+    endMin: parseDateTime(it.before.end, '恢复结束时间'),
+    resourceIds: it.before.resourceIds,
+  }));
+  const failures = validateBatchTargets(store, restoreTargets, involvedIds);
 
   if (failures.length > 0) {
     // 按提交顺序报告全部失败项；批内冲突在双方项中都会出现
-    const blocks = failures.map(({item, index, gaps, external, internal}) => {
+    const blocks = failures.map(({index, gaps, external, internal}) => {
+      const item = op.items[index];
       const lines = [
         `第 ${index + 1} 项 ${item.bookingId} 恢复为 ${item.before.start} → ${item.before.end}：`,
       ];
@@ -1754,8 +1765,9 @@ async function cmdUndoBatchOp(args: string[]): Promise<void> {
           );
         }
         for (const x of internal) {
+          const other = op.items[x.otherIndex];
           lines.push(
-            `    - ${x.other.bookingId}（本操作第 ${x.otherIndex + 1} 项恢复为 ${x.other.before.start} → ${x.other.before.end}）` +
+            `    - ${other.bookingId}（本操作第 ${x.otherIndex + 1} 项恢复为 ${other.before.start} → ${other.before.end}）` +
               `：共同资源 ${formatResourceIds(store, x.shared)}`,
           );
         }
@@ -1884,16 +1896,6 @@ function planWeeklyMembers(startMin: number, endMin: number, count: number): Pla
   return members;
 }
 
-// 系列成员校验失败的聚合结构
-interface MemberFailure {
-  index: number; // 0 基
-  startRaw: string;
-  endRaw: string;
-  gaps: CoverageGap[];
-  conflicts: Conflict[]; // 与既有有效预约的冲突
-  internal: Array<{other: PlannedMember; otherIndex: number}>; // 与系列内其他成员的冲突
-}
-
 async function cmdCreateSeries(args: string[]): Promise<void> {
   const {values, positionals} = parseFlags(args, ['resource', 'start', 'end', 'count'], ['resource']);
   if (positionals.length > 0) throw new UsageError(`create-series 不接受位置参数: ${positionals.join(' ')}`);
@@ -1917,36 +1919,25 @@ async function cmdCreateSeries(args: string[]): Promise<void> {
   // 先展开全部成员时间（含跨月、闰日、跨年、年份范围校验）
   const members = planWeeklyMembers(startMin, endMin, count);
 
-  // 逐项校验：开放覆盖、与既有有效预约冲突、与系列内其他成员冲突
-  const failures: MemberFailure[] = [];
-  for (let i = 0; i < members.length; i++) {
-    const m = members[i];
-    const gaps = findCoverageGaps(store, ids, m.startMin, m.endMin);
-    const conflicts = findConflicts(store, ids, m.startMin, m.endMin);
-    const internal: Array<{other: PlannedMember; otherIndex: number}> = [];
-    for (let j = 0; j < members.length; j++) {
-      if (j === i) continue;
-      const o = members[j];
-      if (o.startMin < m.endMin && m.startMin < o.endMin) {
-        internal.push({other: o, otherIndex: j});
-      }
-    }
-    if (gaps.length > 0 || conflicts.length > 0 || internal.length > 0) {
-      failures.push({index: i, startRaw: m.startRaw, endRaw: m.endRaw, gaps, conflicts, internal});
-    }
-  }
+  // 以展开后的全部成员为目标做共用批次校验（无写入副作用）：
+  // 开放覆盖、与既有有效预约冲突、与系列内其他成员冲突
+  const failures = validateBatchTargets(
+    store,
+    members.map((m) => ({startMin: m.startMin, endMin: m.endMin, resourceIds: ids})),
+  );
 
   if (failures.length > 0) {
     // 按发生顺序报告所有失败项；任一项不满足则整批失败，不分配任何标识、不写文件
     const blocks = failures.map((f) => {
-      const lines = [`第 ${f.index + 1} 项 ${f.startRaw} → ${f.endRaw}：`];
+      const m = members[f.index];
+      const lines = [`第 ${f.index + 1} 项 ${m.startRaw} → ${m.endRaw}：`];
       if (f.gaps.length > 0) {
         lines.push('  开放不足资源:');
         lines.push(...gapLines(f.gaps, '    '));
       }
-      if (f.conflicts.length > 0) {
+      if (f.external.length > 0) {
         lines.push('  与以下既有预约冲突:');
-        for (const c of f.conflicts) {
+        for (const c of f.external) {
           lines.push(
             `    - ${c.booking.id}（${c.booking.start} → ${c.booking.end}）` +
               `：共同资源 ${formatResourceIds(store, c.shared)}`,
@@ -1956,8 +1947,9 @@ async function cmdCreateSeries(args: string[]): Promise<void> {
       if (f.internal.length > 0) {
         lines.push('  与系列内其他成员冲突:');
         for (const x of f.internal) {
+          const o = members[x.otherIndex];
           lines.push(
-            `    - 第 ${x.otherIndex + 1} 项（${x.other.startRaw} → ${x.other.endRaw}）：双方时间重叠`,
+            `    - 第 ${x.otherIndex + 1} 项（${o.startRaw} → ${o.endRaw}）：双方时间重叠`,
           );
         }
       }
@@ -2883,34 +2875,19 @@ async function cmdImportIcal(args: string[]): Promise<void> {
     );
   }
 
-  // 仅新项接受目标校验；重放项关联的旧预约本就在 store.bookings 中，
-  // 按当前状态与安排自然参与占用（已取消不占用，改期后按新安排占用）
+  // 仅以新 UID 事件为目标做共用批次校验（无写入副作用）；重放项关联的旧预约
+  // 本就在 store.bookings 中，按当前状态与安排自然参与占用（已取消不占用，
+  // 改期后按新安排占用），不用首次导入快照代替现状
   const newItems = items.filter((it) => it.replay === undefined);
-  interface ImportFailure {
-    item: ImportItem;
-    gaps: CoverageGap[];
-    external: Conflict[]; // 与全部既有有效预约（含重放项关联预约）的冲突
-    internal: Array<{other: ImportItem; shared: string[]}>; // 批内新项之间的冲突
-  }
-  const failures: ImportFailure[] = [];
-  for (const it of newItems) {
-    const gaps = findCoverageGaps(store, ids, it.ev.startMin, it.ev.endMin);
-    const external = findConflicts(store, ids, it.ev.startMin, it.ev.endMin);
-    const internal: ImportFailure['internal'] = [];
-    for (const o of newItems) {
-      if (o === it) continue;
-      const overlap = o.ev.startMin < it.ev.endMin && it.ev.startMin < o.ev.endMin;
-      // 新项统一使用同一资源集合，时间重叠即共同资源冲突
-      if (overlap) internal.push({other: o, shared: ids});
-    }
-    if (gaps.length > 0 || external.length > 0 || internal.length > 0) {
-      failures.push({item: it, gaps, external, internal});
-    }
-  }
+  const failures = validateBatchTargets(
+    store,
+    newItems.map((it) => ({startMin: it.ev.startMin, endMin: it.ev.endMin, resourceIds: ids})),
+  );
 
   if (failures.length > 0) {
     // 按文件顺序报告全部失败 UID、时间、不足资源（含相关停用）与全部冲突；批内冲突双方互列
-    const blocks = failures.map(({item, gaps, external, internal}) => {
+    const blocks = failures.map(({index, gaps, external, internal}) => {
+      const item = newItems[index];
       const lines = [
         `第 ${item.index + 1} 项 UID “${item.ev.uid}”（${item.ev.startRaw} → ${item.ev.endRaw}）：`,
       ];
@@ -2930,9 +2907,10 @@ async function cmdImportIcal(args: string[]): Promise<void> {
       if (internal.length > 0) {
         lines.push('  批内冲突:');
         for (const x of internal) {
+          const o = newItems[x.otherIndex];
           lines.push(
-            `    - 第 ${x.other.index + 1} 项 UID “${x.other.ev.uid}”` +
-              `（${x.other.ev.startRaw} → ${x.other.ev.endRaw}）` +
+            `    - 第 ${o.index + 1} 项 UID “${o.ev.uid}”` +
+              `（${o.ev.startRaw} → ${o.ev.endRaw}）` +
               `：共同资源 ${formatResourceIds(store, x.shared)}`,
           );
         }
