@@ -8,6 +8,9 @@
 //
 // 预约系列：create-series 按周（每 7 个营业地日历日）生成多项预约，
 // 全部成员使用相同资源；成员记录与普通预约同表，带 seriesId 归属。
+//
+// 候补：add-waitlist 登记单次固定时段的多资源等待项（不占用资源），
+// process-waitlist 手动按登记顺序处理整个队列，兑现项各生成一项普通预约。
 
 import {readFile, writeFile, rename, unlink} from 'node:fs/promises';
 
@@ -181,14 +184,29 @@ interface SeriesRec {
   id: string;
 }
 
+type WaitlistStatus = 'waiting' | 'fulfilled' | 'cancelled';
+
+// 候补：单次固定时段的多资源等待项；登记时不占用资源，
+// 兑现后生成一项普通预约并记录其标识，原请求与关联永久保留
+interface WaitlistRec {
+  id: string;
+  resourceIds: string[];
+  start: string;
+  end: string;
+  status: WaitlistStatus;
+  bookingId?: string; // 仅 fulfilled 时存在
+}
+
 interface Store {
   version: 1;
   resourceSeq: number;
   bookingSeq: number;
   seriesSeq: number;
+  waitlistSeq: number;
   resources: ResourceRec[];
   bookings: BookingRec[];
   series: SeriesRec[];
+  waitlist: WaitlistRec[]; // 数组顺序即登记顺序，不排序
 }
 
 const RESOURCE_TYPE_LABEL: Record<ResourceType, string> = {
@@ -212,9 +230,11 @@ function emptyStore(): Store {
     resourceSeq: 0,
     bookingSeq: 0,
     seriesSeq: 0,
+    waitlistSeq: 0,
     resources: [],
     bookings: [],
     series: [],
+    waitlist: [],
   };
 }
 
@@ -245,13 +265,19 @@ function validateStore(raw: unknown, file: string): Store {
     if (!isInt(o.seriesSeq)) bad('seriesSeq 必须是非负整数');
     store.seriesSeq = o.seriesSeq;
   }
+  if (o.waitlistSeq !== undefined) {
+    if (!isInt(o.waitlistSeq)) bad('waitlistSeq 必须是非负整数');
+    store.waitlistSeq = o.waitlistSeq;
+  }
 
   if (o.resources !== undefined && !Array.isArray(o.resources)) bad('resources 必须是数组');
   if (o.bookings !== undefined && !Array.isArray(o.bookings)) bad('bookings 必须是数组');
   if (o.series !== undefined && !Array.isArray(o.series)) bad('series 必须是数组');
+  if (o.waitlist !== undefined && !Array.isArray(o.waitlist)) bad('waitlist 必须是数组');
   const rawResources = (o.resources ?? []) as unknown[];
   const rawBookings = (o.bookings ?? []) as unknown[];
   const rawSeries = (o.series ?? []) as unknown[];
+  const rawWaitlist = (o.waitlist ?? []) as unknown[];
 
   const resourceIds = new Set<string>();
   rawResources.forEach((item, idx) => {
@@ -343,6 +369,57 @@ function validateStore(raw: unknown, file: string): Store {
     store.bookings.push(rec);
     const n = Number(b.id.slice(1));
     if (n > store.bookingSeq) store.bookingSeq = n;
+  });
+
+  // 候补最后校验：可引用资源与预约；数组顺序即登记顺序，不排序
+  const waitlistIds = new Set<string>();
+  rawWaitlist.forEach((item, idx) => {
+    const at = `waitlist[${idx}]`;
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) bad(`${at} 必须是对象`);
+    const w = item as Record<string, unknown>;
+    if (typeof w.id !== 'string' || !/^W\d{4,}$/.test(w.id)) bad(`${at}.id 非法: ${String(w.id)}`);
+    if (waitlistIds.has(w.id)) bad(`候补标识重复: ${w.id}`);
+    waitlistIds.add(w.id);
+    if (!Array.isArray(w.resourceIds) || w.resourceIds.length === 0) {
+      bad(`${at}(${w.id}).resourceIds 必须是非空数组`);
+    }
+    const ids = w.resourceIds as unknown[];
+    const seen = new Set<string>();
+    ids.forEach((rid) => {
+      if (typeof rid !== 'string' || !resourceIds.has(rid)) {
+        bad(`${at}(${w.id}) 引用了未知资源: ${String(rid)}`);
+      }
+      if (seen.has(rid)) bad(`${at}(${w.id}) 资源重复: ${rid}`);
+      seen.add(rid);
+    });
+    if (typeof w.start !== 'string' || typeof w.end !== 'string') {
+      bad(`${at}(${w.id}) 起止时间必须是字符串`);
+    }
+    const s = parseDateTime(w.start, `${at}(${w.id}).start`);
+    const e = parseDateTime(w.end, `${at}(${w.id}).end`);
+    if (e <= s) bad(`${at}(${w.id}) 结束必须晚于开始`);
+    if (w.status !== 'waiting' && w.status !== 'fulfilled' && w.status !== 'cancelled') {
+      bad(`${at}(${w.id}).status 非法: ${String(w.status)}`);
+    }
+    const rec: WaitlistRec = {
+      id: w.id,
+      resourceIds: [...(ids as string[])].sort(),
+      start: w.start,
+      end: w.end,
+      status: w.status,
+    };
+    if (w.status === 'fulfilled') {
+      if (typeof w.bookingId !== 'string' || !/^B\d{4,}$/.test(w.bookingId)) {
+        bad(`${at}(${w.id}) 已兑现但 bookingId 缺失或非法: ${String(w.bookingId)}`);
+      }
+      if (!bookingIds.has(w.bookingId)) bad(`${at}(${w.id}) 引用了未知预约: ${w.bookingId}`);
+      rec.bookingId = w.bookingId;
+    } else if (w.bookingId !== undefined) {
+      bad(`${at}(${w.id}) 状态为 ${w.status}，不得携带 bookingId`);
+    }
+    store.waitlist.push(rec);
+    const n = Number(w.id.slice(1));
+    if (n > store.waitlistSeq) store.waitlistSeq = n;
   });
 
   store.resources.sort((a, b) => a.id.localeCompare(b.id));
@@ -1261,6 +1338,197 @@ async function cmdCancelSeries(args: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// 候补（单次固定时段的多资源等待队列）
+// ---------------------------------------------------------------------------
+
+const WAITLIST_STATUS_LABEL: Record<WaitlistStatus, string> = {
+  waiting: '等待',
+  fulfilled: '已兑现',
+  cancelled: '已取消',
+};
+
+async function cmdAddWaitlist(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, ['resource', 'start', 'end'], ['resource']);
+  if (positionals.length > 0) throw new UsageError(`add-waitlist 不接受位置参数: ${positionals.join(' ')}`);
+
+  const resourceArgs = values.get('resource');
+  if (!resourceArgs || resourceArgs.length === 0) throw new UsageError('至少需要一个 --resource');
+  const startRaw = requireFlag(values, 'start');
+  const endRaw = requireFlag(values, 'end');
+
+  const file = activeDataFile;
+  const store = await loadStore(file);
+
+  const ids = resolveResourceIds(store, resourceArgs);
+  const startMin = parseDateTime(startRaw, '候补开始时间');
+  const endMin = parseDateTime(endRaw, '候补结束时间');
+  if (endMin <= startMin) {
+    throw new BizError(`候补结束时间必须晚于开始时间（开始: ${startRaw}，结束: ${endRaw}），允许跨日`);
+  }
+  // 登记要求开放区间完整覆盖；但不要求当前无冲突——有预约冲突或资源空闲均可登记
+  assertOpenCoverage(store, ids, startMin, endMin);
+
+  // 重复登记相同内容视为另一项候补：每次都分配新标识，不占用资源
+  store.waitlistSeq += 1;
+  const id = `W${String(store.waitlistSeq).padStart(4, '0')}`;
+  store.waitlist.push({id, resourceIds: ids, start: startRaw, end: endRaw, status: 'waiting'});
+  await saveStore(file, store);
+  console.log(`已登记候补 ${id}（进入等待队列，不占用资源）`);
+  console.log(`  时间: ${startRaw} → ${endRaw}`);
+  console.log(`  资源: ${formatResourceIds(store, ids)}`);
+}
+
+async function cmdListWaitlist(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(`list-waitlist 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`);
+  }
+  if (positionals.length > 0) {
+    throw new UsageError(`list-waitlist 不接受位置参数: ${positionals.join(' ')}`);
+  }
+  const store = await loadStore(activeDataFile);
+  if (store.waitlist.length === 0) {
+    console.log('暂无候补。可使用 add-waitlist 登记单次固定时段的多资源候补。');
+    return;
+  }
+  console.log(`候补队列（共 ${store.waitlist.length} 项，按登记顺序）：`);
+  store.waitlist.forEach((w, i) => {
+    console.log(`- 第 ${i + 1} 项 ${w.id} [${WAITLIST_STATUS_LABEL[w.status]}] ${w.start} → ${w.end}`);
+    console.log(`    资源: ${formatResourceIds(store, w.resourceIds)}`);
+    if (w.status === 'fulfilled' && w.bookingId !== undefined) {
+      console.log(`    兑现预约: ${w.bookingId}`);
+    }
+  });
+}
+
+async function cmdCancelWaitlist(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(`cancel-waitlist 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`);
+  }
+  if (positionals.length !== 1) throw new UsageError('用法: cancel-waitlist <候补标识>');
+  const id = positionals[0];
+
+  const file = activeDataFile;
+  const store = await loadStore(file);
+  const w = store.waitlist.find((x) => x.id === id);
+  if (!w) throw new BizError(`未知候补标识: ${id}`);
+  if (w.status === 'fulfilled') {
+    throw new BizError(
+      `候补 ${id} 已兑现（预约 ${w.bookingId}），不能取消候补；` +
+        `如需取消该预约请使用 cancel-booking ${w.bookingId}（候补保留原请求与关联，不恢复等待）`,
+    );
+  }
+  if (w.status === 'cancelled') {
+    // 幂等：再次取消成功且不做任何改动
+    console.log(`候补 ${id} 已是取消状态，未做改动。`);
+    return;
+  }
+  w.status = 'cancelled'; // 记录保留，不再参与处理
+  await saveStore(file, store);
+  console.log(`已取消候补 ${id}（原请求 ${w.start} → ${w.end}），记录保留。`);
+}
+
+// 手动处理整个候补队列：按成功登记顺序遍历等待项，逐项重查开放覆盖与冲突；
+// 全部资源可用才兑现（生成一项普通预约），受阻项继续等待并检查后项，顺序不变
+async function cmdProcessWaitlist(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(`process-waitlist 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`);
+  }
+  if (positionals.length > 0) {
+    throw new UsageError(`process-waitlist 不接受位置参数: ${positionals.join(' ')}`);
+  }
+
+  const file = activeDataFile;
+  const store = await loadStore(file);
+
+  interface Outcome {
+    entry: WaitlistRec;
+    bookingId?: string; // 本次兑现生成的预约标识
+    gaps: Array<{id: string; r: ResourceRec}>; // 最终安排下开放不足的资源
+    conflicts: Conflict[]; // 最终安排下的全部冲突预约（含本次新预约）
+  }
+  const outcomes: Outcome[] = [];
+  for (const w of store.waitlist) {
+    if (w.status !== 'waiting') continue; // 已兑现/已取消项不再处理，绝不重复创建预约
+    const startMin = parseDateTime(w.start, '候补开始时间');
+    const endMin = parseDateTime(w.end, '候补结束时间');
+    const gaps = findCoverageGaps(store, w.resourceIds, startMin, endMin);
+    // findConflicts 针对当前有效预约（含系列成员）；本次已选中项生成的新预约
+    // 已写入 store.bookings，因此天然参与后续项的冲突检查
+    const conflicts = findConflicts(store, w.resourceIds, startMin, endMin);
+    if (gaps.length === 0 && conflicts.length === 0) {
+      store.bookingSeq += 1;
+      const bookingId = `B${String(store.bookingSeq).padStart(4, '0')}`;
+      // 普通预约：不加入系列、不改动任何原预约
+      store.bookings.push({
+        id: bookingId,
+        resourceIds: [...w.resourceIds],
+        start: w.start,
+        end: w.end,
+        status: 'active',
+      });
+      store.bookings.sort((a, b) => a.id.localeCompare(b.id));
+      w.status = 'fulfilled';
+      w.bookingId = bookingId;
+      outcomes.push({entry: w, bookingId, gaps, conflicts});
+    } else {
+      outcomes.push({entry: w, gaps, conflicts});
+    }
+  }
+
+  const printOutcomes = (): void => {
+    for (const o of outcomes) {
+      const w = o.entry;
+      if (o.bookingId !== undefined) {
+        console.log(`- ${w.id} → 已兑现，生成预约 ${o.bookingId}`);
+      } else {
+        console.log(`- ${w.id} → 继续等待`);
+      }
+      console.log(`    时间: ${w.start} → ${w.end}`);
+      console.log(`    资源: ${formatResourceIds(store, w.resourceIds)}`);
+      if (o.bookingId === undefined) {
+        if (o.gaps.length > 0) {
+          console.log('    开放不足资源:');
+          for (const {id, r} of o.gaps) console.log(`      - ${id}（${r.name}）`);
+        }
+        if (o.conflicts.length > 0) {
+          console.log('    冲突预约:');
+          for (const c of o.conflicts) {
+            console.log(
+              `      - ${c.booking.id}（${c.booking.start} → ${c.booking.end}）` +
+                `：共同资源 ${formatResourceIds(store, c.shared)}`,
+            );
+          }
+        }
+      }
+    }
+  };
+
+  const fulfilledCount = outcomes.filter((o) => o.bookingId !== undefined).length;
+  if (fulfilledCount === 0) {
+    // 无可兑现项：成功、明确说明，且不改动任何记录或标识计数（不写文件）
+    if (outcomes.length === 0) {
+      console.log('候补队列中没有等待项，本次无可兑现项（未改动任何记录或标识计数）。');
+    } else {
+      console.log(
+        `候补处理完成：本次无可兑现项，${outcomes.length} 项继续等待（未改动任何记录或标识计数）。`,
+      );
+      printOutcomes();
+    }
+    return;
+  }
+
+  // 新预约、候补已兑现状态及对应预约标识一并原子保存后才报告成功
+  await saveStore(file, store);
+  console.log(
+    `候补处理完成：本次兑现 ${fulfilledCount} 项，${outcomes.length - fulfilledCount} 项继续等待。`,
+  );
+  printOutcomes();
+}
+
+// ---------------------------------------------------------------------------
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
@@ -1311,6 +1579,25 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       整体取消该系列仍有效的成员（含单独改期者）并释放资源，记录保留；
       已取消成员与无关预约不受影响；重复取消成功且不变，未知系列失败
 
+候补命令（单次固定时段的多资源等待队列）:
+  add-waitlist --resource <标识> [--resource <标识> ...] \\
+      --start <YYYY-MM-DDTHH:mm> --end <YYYY-MM-DDTHH:mm>
+      登记一项候补：至少一个不同的已登记资源，全部资源的连续开放区间须完整
+      覆盖起止时间；当前有预约冲突或资源空闲均可登记。返回稳定不复用的候补
+      标识（如 W0001），不占用资源；重复登记相同内容视为另一项候补
+  list-waitlist
+      按登记顺序列出全部候补的标识、原时间、资源、等待/已兑现/已取消状态
+      及兑现后的预约标识
+  cancel-waitlist <候补标识>
+      取消等待中的候补，记录保留；重复取消成功且不变；
+      未知标识或取消已兑现项失败
+  process-waitlist
+      手动处理整个队列：按成功登记顺序遍历全部等待项，重查开放覆盖，并检查
+      与当前有效预约（含系列成员）及本次已选中项的冲突；全部资源可用才兑现，
+      为每个选中项生成一项普通预约（不加入系列、不改动原预约），受阻项继续
+      等待并检查后项，顺序不变。普通创建、改期或取消不自动处理候补；
+      没有可兑现项也成功且不改变记录或计数
+
 批量改期清单（reschedule-batch 的 JSON 文件，UTF-8，顶层 {"items": [...]}）:
   清单不能为空；每项字段：
     "bookingId":   要改期的预约标识（如 B0001）；未知或在清单中重复均整批拒绝，
@@ -1345,8 +1632,9 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
 退出码:
   0  成功
   1  业务或文件失败（名称为空、未知/重复资源或预约、已取消预约、时间非法、
-     开放不足、冲突、非法次数、超出四位年份、未知系列、改期清单不可读/损坏/
-     内容非法、数据文件损坏或保存失败等）
+     开放不足、冲突、非法次数、超出四位年份、未知系列、未知候补标识、
+     取消已兑现候补、改期清单不可读/损坏/内容非法、候补状态或关联非法、
+     数据文件损坏或保存失败等）
   2  用法错误（未知参数、缺少必需选项、多余位置参数等）
 
 示例:
@@ -1361,6 +1649,11 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   node app.ts reschedule-batch ./reschedule.json
   node app.ts list-bookings --date 2026-10-12
   node app.ts cancel-series S0001
+  node app.ts add-waitlist --resource R0001 \\
+      --start 2026-10-05T10:00 --end 2026-10-05T11:00
+  node app.ts process-waitlist
+  node app.ts list-waitlist
+  node app.ts cancel-waitlist W0001
 `;
 
 let activeDataFile = DEFAULT_DATA_FILE;
@@ -1405,6 +1698,18 @@ async function main(): Promise<void> {
       break;
     case 'cancel-series':
       await cmdCancelSeries(commandArgs);
+      break;
+    case 'add-waitlist':
+      await cmdAddWaitlist(commandArgs);
+      break;
+    case 'list-waitlist':
+      await cmdListWaitlist(commandArgs);
+      break;
+    case 'cancel-waitlist':
+      await cmdCancelWaitlist(commandArgs);
+      break;
+    case 'process-waitlist':
+      await cmdProcessWaitlist(commandArgs);
       break;
     default:
       throw new UsageError(`未知命令: ${command}`);
