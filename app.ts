@@ -9,9 +9,11 @@
 // 预约系列：create-series 按周（每 7 个营业地日历日）生成多项预约，
 // 全部成员使用相同资源；成员记录与普通预约同表，带 seriesId 归属。
 //
-// 候补队列：add-waitlist 登记“固定时段 + 多资源”的候补（不占用资源，
-// 当前存在冲突也可登记）；process-waitlist 按登记顺序手动处理整个队列，
-// 为可兑现项各创建一项普通预约，受阻项继续等待且不影响后续项的检查。
+// 候补队列：add-waitlist 登记“固定时段 + 多资源”的候补，
+// add-flex-waitlist 登记“弹性窗口 + 所需连续时长 + 多资源”的候补（不占用资源，
+// 登记时窗口内共同实际可用时间能容纳完整时长即可，忽略预约占用）；两种候补共用
+// 同一条登记顺序，process-waitlist 按登记顺序手动处理整个队列（弹性项取窗口内
+// 最早可行开始），为可兑现项各创建一项普通预约，受阻项继续等待且不影响后续项。
 
 import {readFile, writeFile, rename, unlink} from 'node:fs/promises';
 
@@ -158,6 +160,57 @@ function isFullyCovered(segments: Array<[number, number]>, s: number, e: number)
   return segments.some(([a, b]) => a <= s && e <= b);
 }
 
+// 将一组已合并区间裁剪到窗口 [wStart, wEnd) 内（左闭右开），丢弃不相交段
+function clipSegments(
+  segments: Array<[number, number]>,
+  wStart: number,
+  wEnd: number,
+): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (const [s, e] of segments) {
+    const a = Math.max(s, wStart);
+    const b = Math.min(e, wEnd);
+    if (a < b) out.push([a, b]);
+  }
+  return out;
+}
+
+// 两组已合并区间的交集（左闭右开）；切点相接（b===a）长度为 0，自然不产生段
+function intersectSegments(
+  a: Array<[number, number]>,
+  b: Array<[number, number]>,
+): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    const lo = Math.max(a[i][0], b[j][0]);
+    const hi = Math.min(a[i][1], b[j][1]);
+    if (lo < hi) out.push([lo, hi]);
+    if (a[i][1] < b[j][1]) i++;
+    else j++;
+  }
+  return out;
+}
+
+// 多资源在窗口 [wStart, wEnd) 内的共同实际可用区间：
+// 各自实际可用时间（开放合并后扣除有效停用并集）裁进窗口后逐组求交
+function commonAvailableSegments(
+  store: Store,
+  ids: string[],
+  wStart: number,
+  wEnd: number,
+): Array<[number, number]> {
+  let common: Array<[number, number]> = [[wStart, wEnd]];
+  for (const id of ids) {
+    const r = store.resources.find((x) => x.id === id)!;
+    const clipped = clipSegments(availableSegmentsOf(store, r), wStart, wEnd);
+    common = intersectSegments(common, clipped);
+    if (common.length === 0) break;
+  }
+  return common;
+}
+
 // ---------------------------------------------------------------------------
 // 数据模型与文件存取
 // ---------------------------------------------------------------------------
@@ -165,6 +218,7 @@ function isFullyCovered(segments: Array<[number, number]>, s: number, e: number)
 type ResourceType = 'venue' | 'equipment' | 'person';
 type BookingStatus = 'active' | 'cancelled';
 type WaitlistStatus = 'waiting' | 'fulfilled' | 'cancelled';
+type WaitlistKind = 'fixed' | 'flexible'; // 固定时段候补 / 弹性时段候补
 type ClosureStatus = 'active' | 'cancelled';
 
 interface ResourceRec {
@@ -189,9 +243,11 @@ interface SeriesRec {
 
 interface WaitlistRec {
   id: string; // 候补标识 W0001…，稳定且不复用
+  kind: WaitlistKind; // fixed=固定时段；flexible=弹性时段（窗口内寻找最早连续时长）
   resourceIds: string[]; // 原请求资源（按标识排序）
-  start: string; // 原请求开始时间
-  end: string; // 原请求结束时间
+  start: string; // 原请求开始时间；弹性项为窗口开始
+  end: string; // 原请求结束时间；弹性项为窗口结束
+  durationMinutes?: number; // 仅弹性项：所需连续时长（正整数分钟，不超过窗口长度）
   status: WaitlistStatus;
   seq: number; // 登记序号：1 基，列表与处理均按此稳定排序，重启后仍在
   bookingId?: string; // 已兑现时关联的普通预约标识
@@ -432,6 +488,34 @@ function validateStore(raw: unknown, file: string): Store {
     const we = parseDateTime(w.end as string, `${at}(${w.id}).end`);
     if (we <= ws) bad(`${at}(${w.id}) 结束必须晚于开始`);
 
+    // 旧文件无 kind 字段，按固定时段候补直接兼容
+    let kind: WaitlistKind = 'fixed';
+    if (w.kind !== undefined) {
+      if (w.kind !== 'fixed' && w.kind !== 'flexible') {
+        bad(`${at}(${w.id}).kind 非法: ${String(w.kind)}`);
+      }
+      kind = w.kind;
+    }
+
+    // 弹性项独有 durationMinutes：正整数分钟且不超过窗口长度；
+    // 固定项不得携带（携带即视为状态机损坏）
+    let durationMinutes: number | undefined;
+    if (w.durationMinutes !== undefined) {
+      if (!isInt(w.durationMinutes) || w.durationMinutes < 1) {
+        bad(`${at}(${w.id}).durationMinutes 必须是正整数`);
+      }
+      durationMinutes = w.durationMinutes;
+    }
+    if (kind === 'flexible') {
+      if (durationMinutes === undefined) {
+        bad(`${at}(${w.id}) 弹性候补缺少 durationMinutes`);
+      } else if (durationMinutes > we - ws) {
+        bad(`${at}(${w.id}) 所需时长 ${durationMinutes} 分钟超过窗口长度 ${we - ws} 分钟`);
+      }
+    } else if (durationMinutes !== undefined) {
+      bad(`${at}(${w.id}) 固定时段候补不应携带 durationMinutes`);
+    }
+
     if (w.status !== 'waiting' && w.status !== 'fulfilled' && w.status !== 'cancelled') {
       bad(`${at}(${w.id}).status 非法: ${String(w.status)}`);
     }
@@ -463,12 +547,14 @@ function validateStore(raw: unknown, file: string): Store {
 
     const rec: WaitlistRec = {
       id: w.id,
+      kind,
       resourceIds: [...(ids as string[])].sort(),
       start: w.start as string,
       end: w.end as string,
       status: w.status as WaitlistStatus,
       seq: w.seq,
     };
+    if (durationMinutes !== undefined) rec.durationMinutes = durationMinutes;
     if (bookingId !== undefined) rec.bookingId = bookingId;
     store.waitlist.push(rec);
   });
@@ -1508,7 +1594,8 @@ async function cmdCancelSeries(args: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// 候补队列：固定时段多资源候补的登记、列表、取消与手动整体处理
+// 候补队列：固定时段 / 弹性时段多资源候补的登记、列表、取消与手动整体处理
+// 两种候补共用同一条登记顺序（seq），process-waitlist 按序逐项重查
 // ---------------------------------------------------------------------------
 
 const WAITLIST_STATUS_LABEL: Record<WaitlistStatus, string> = {
@@ -1516,6 +1603,19 @@ const WAITLIST_STATUS_LABEL: Record<WaitlistStatus, string> = {
   fulfilled: '已兑现',
   cancelled: '已取消',
 };
+
+const WAITLIST_KIND_LABEL: Record<WaitlistKind, string> = {
+  fixed: '固定时段',
+  flexible: '弹性时段',
+};
+
+// 原请求的统一展示：固定项给原时段；弹性项给窗口与所需连续时长
+function renderWaitlistRequest(w: WaitlistRec): string {
+  if (w.kind === 'flexible') {
+    return `弹性窗口 ${w.start} → ${w.end}（所需连续时长 ${w.durationMinutes} 分钟）`;
+  }
+  return `固定时段 ${w.start} → ${w.end}`;
+}
 
 async function cmdAddWaitlist(args: string[]): Promise<void> {
   const {values, positionals} = parseFlags(args, ['resource', 'start', 'end'], ['resource']);
@@ -1542,12 +1642,121 @@ async function cmdAddWaitlist(args: string[]): Promise<void> {
   store.waitlistSeq += 1;
   const seq = store.waitlistSeq;
   const id = `W${String(seq).padStart(4, '0')}`;
-  store.waitlist.push({id, resourceIds: ids, start: startRaw, end: endRaw, status: 'waiting', seq});
+  store.waitlist.push({
+    id,
+    kind: 'fixed',
+    resourceIds: ids,
+    start: startRaw,
+    end: endRaw,
+    status: 'waiting',
+    seq,
+  });
   await saveStore(file, store);
-  console.log(`已登记候补 ${id}（登记序号 ${seq}，不占用资源）`);
+  console.log(`已登记固定时段候补 ${id}（登记序号 ${seq}，不占用资源）`);
   console.log(`  时间: ${startRaw} → ${endRaw}`);
   console.log(`  资源: ${formatResourceIds(store, ids)}`);
   console.log('  当前是否存在预约冲突均可登记；可使用 process-waitlist 手动处理整个队列。');
+}
+
+// 解析正整数分钟时长（不接受 0、负数、小数与前导零）
+function parseDurationMinutes(raw: string): number {
+  if (!/^[1-9]\d*$/.test(raw)) {
+    throw new BizError(`时长非法: “${raw}”，必须是正整数分钟`);
+  }
+  return Number(raw);
+}
+
+// 解析弹性候补的“窗口开始/窗口结束”
+function parseFlexWindow(
+  value: string,
+): {start: string; end: string; startMin: number; endMin: number} {
+  const parts = String(value ?? '').split('/');
+  if (parts.length !== 2 || parts[0] === '' || parts[1] === '') {
+    throw new BizError(
+      `弹性窗口格式非法: “${value}”，应为 窗口开始/窗口结束（YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm）`,
+    );
+  }
+  const start = parts[0];
+  const end = parts[1];
+  const startMin = parseDateTime(start, '弹性窗口开始时间');
+  const endMin = parseDateTime(end, '弹性窗口结束时间');
+  if (endMin <= startMin) {
+    throw new BizError(`弹性窗口结束时间必须晚于开始时间: “${value}”，允许跨日`);
+  }
+  return {start, end, startMin, endMin};
+}
+
+// 渲染一组分钟区间（附分钟数），按开始时间排序；空集给明确提示
+function renderMinuteSegments(segments: Array<[number, number]>, indent: string): string[] {
+  if (segments.length === 0) return [`${indent}（无）`];
+  return segments.map(([s, e]) => {
+    const startRaw = formatDateTime(s);
+    const endRaw = formatDateTime(e);
+    return `${indent}- ${startRaw} → ${endRaw}（${e - s} 分钟）`;
+  });
+}
+
+async function cmdAddFlexWaitlist(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, ['resource', 'window', 'duration'], ['resource']);
+  if (positionals.length > 0) {
+    throw new UsageError(`add-flex-waitlist 不接受位置参数: ${positionals.join(' ')}`);
+  }
+
+  const resourceArgs = values.get('resource');
+  if (!resourceArgs || resourceArgs.length === 0) throw new UsageError('至少需要一个 --resource');
+  const windowRaw = requireFlag(values, 'window');
+  const durationRaw = requireFlag(values, 'duration');
+
+  const file = activeDataFile;
+  const store = await loadStore(file);
+
+  const ids = resolveResourceIds(store, resourceArgs);
+  const win = parseFlexWindow(windowRaw);
+  const durationMinutes = parseDurationMinutes(durationRaw);
+  const windowLength = win.endMin - win.startMin;
+  if (durationMinutes > windowLength) {
+    throw new BizError(
+      `所需连续时长 ${durationMinutes} 分钟超过窗口长度 ${windowLength} 分钟（窗口: ${win.start} → ${win.end}）`,
+    );
+  }
+
+  // 登记忽略预约占用；只要求窗口内全部资源的“共同实际可用时间”
+  // （开放合并扣除有效停用并集，无需整窗开放）存在能容纳完整时长的连续区间
+  const common = commonAvailableSegments(store, ids, win.startMin, win.endMin);
+  if (!common.some(([s, e]) => e - s >= durationMinutes)) {
+    const lines = [
+      `弹性候补登记失败：窗口 ${win.start} → ${win.end} 内，全部资源的共同实际可用时间` +
+        `不存在长度不少于 ${durationMinutes} 分钟的连续区间（登记忽略预约占用，无需整窗开放）。`,
+      '窗口内全部最大共同实际可用区间（开放区间合并重叠或相接后扣除有效停用并集）:',
+    ];
+    if (common.length === 0) {
+      lines.push('  （空集：窗口内全部资源没有任何共同实际可用时间）');
+    } else {
+      lines.push(...renderMinuteSegments(common, '  '));
+    }
+    throw new BizError(lines.join('\n'));
+  }
+
+  // 候补不占用任何资源：仅追加队列记录，与固定候补共用同一条登记顺序
+  store.waitlistSeq += 1;
+  const seq = store.waitlistSeq;
+  const id = `W${String(seq).padStart(4, '0')}`;
+  store.waitlist.push({
+    id,
+    kind: 'flexible',
+    resourceIds: ids,
+    start: win.start,
+    end: win.end,
+    durationMinutes,
+    status: 'waiting',
+    seq,
+  });
+  await saveStore(file, store);
+  console.log(`已登记弹性时段候补 ${id}（登记序号 ${seq}，不占用资源）`);
+  console.log(`  窗口: ${win.start} → ${win.end}（窗口长度 ${windowLength} 分钟）`);
+  console.log(`  所需连续时长: ${durationMinutes} 分钟`);
+  console.log(`  资源: ${formatResourceIds(store, ids)}`);
+  console.log('  登记忽略预约占用；process-waitlist 将在窗口内为全部资源寻找最早可行的连续安排。');
 }
 
 async function cmdListWaitlist(args: string[]): Promise<void> {
@@ -1561,7 +1770,9 @@ async function cmdListWaitlist(args: string[]): Promise<void> {
 
   const store = await loadStore(activeDataFile);
   if (store.waitlist.length === 0) {
-    console.log('候补队列为空。可使用 add-waitlist 登记固定时段的多资源候补。');
+    console.log(
+      '候补队列为空。可使用 add-waitlist 登记固定时段候补，或 add-flex-waitlist 登记弹性时段候补。',
+    );
     return;
   }
   const waiting = store.waitlist.filter((w) => w.status === 'waiting').length;
@@ -1571,10 +1782,13 @@ async function cmdListWaitlist(args: string[]): Promise<void> {
     `候补队列（共 ${store.waitlist.length} 项，按登记顺序；等待 ${waiting}，已兑现 ${fulfilled}，已取消 ${cancelled}）：`,
   );
   for (const w of store.waitlist) { // 已按 seq 升序加载
-    console.log(`- ${w.id} [${WAITLIST_STATUS_LABEL[w.status]}] ${w.start} → ${w.end}`);
+    console.log(`- ${w.id} [${WAITLIST_STATUS_LABEL[w.status]}] ${renderWaitlistRequest(w)}`);
     console.log(`    资源: ${formatResourceIds(store, w.resourceIds)}`);
     if (w.status === 'fulfilled' && w.bookingId !== undefined) {
-      console.log(`    兑现预约: ${w.bookingId}（候补保留原请求与关联，不恢复等待）`);
+      // 显示关联标识及其当前实际时间（该预约可被改期或取消；候补保留原请求与关联，不恢复等待）
+      const b = store.bookings.find((x) => x.id === w.bookingId);
+      const actual = b ? `（实际 ${b.start} → ${b.end}）` : '';
+      console.log(`    兑现预约: ${w.bookingId}${actual}（候补保留原请求与关联，不恢复等待）`);
     }
   }
 }
@@ -1605,13 +1819,38 @@ async function cmdCancelWaitlist(args: string[]): Promise<void> {
   console.log(`已取消候补 ${id}，记录保留；该候补不再参与 process-waitlist 处理。`);
 }
 
-// 处理队列时统一的冲突描述（既有预约或本轮新预约）
-interface PendingConflict {
-  bookingId: string;
-  start: string;
-  end: string;
-  shared: string[];
-  fromWaitlistId?: string; // 本轮兑现自哪一项候补
+// 弹性项的窗口占用：与任一资源的有效预约（含本轮已选新预约）时间重叠即计入；
+// 全部资源必须同时连续空闲，故任一资源被占都使该时刻不可安排。
+// 返回裁剪到窗口内并合并后的占用区间。
+function flexBusySegments(
+  store: Store,
+  ids: string[],
+  wStart: number,
+  wEnd: number,
+): Array<[number, number]> {
+  const wanted = new Set(ids);
+  const cuts: Array<[number, number]> = [];
+  for (const b of store.bookings) {
+    if (b.status !== 'active') continue;
+    if (!b.resourceIds.some((id) => wanted.has(id))) continue;
+    const bStart = parseDateTime(b.start, '预约开始时间');
+    const bEnd = parseDateTime(b.end, '预约结束时间');
+    const a = Math.max(bStart, wStart);
+    const c = Math.min(bEnd, wEnd);
+    if (a < c) cuts.push([a, c]);
+  }
+  return mergeIntervals(cuts);
+}
+
+// 弹性项在窗口内的全部最大共同空闲区间（共同实际可用扣除有效预约与本轮已选占用）
+function flexFreeSegments(
+  store: Store,
+  w: WaitlistRec,
+): Array<[number, number]> {
+  const wStart = parseDateTime(w.start, '弹性窗口开始时间');
+  const wEnd = parseDateTime(w.end, '弹性窗口结束时间');
+  const common = commonAvailableSegments(store, w.resourceIds, wStart, wEnd);
+  return subtractSegments(common, flexBusySegments(store, w.resourceIds, wStart, wEnd));
 }
 
 async function cmdProcessWaitlist(args: string[]): Promise<void> {
@@ -1626,7 +1865,7 @@ async function cmdProcessWaitlist(args: string[]): Promise<void> {
   const file = activeDataFile;
   const store = await loadStore(file);
 
-  // 已兑现/已取消项永不重新处理；只按登记顺序遍历等待项
+  // 已兑现/已取消项永不重新处理；两种候补只按共同的登记顺序遍历等待项
   const waiting = store.waitlist.filter((w) => w.status === 'waiting');
   if (waiting.length === 0) {
     // 明确说明且不改变记录或计数（不落盘）
@@ -1638,89 +1877,88 @@ async function cmdProcessWaitlist(args: string[]): Promise<void> {
     return;
   }
 
-  // 本轮已选中项（即时预约标识在选中时分配，全部成功后一次性落盘；
-  // 若保存失败，磁盘原文件、记录与计数均不变）
-  const selected: Array<{w: WaitlistRec; bookingId: string; startMin: number; endMin: number}> = [];
-  const blocked: Array<{
+  // 本轮选中项即时分配预约标识并入内存（含弹性项的实际开始/结束）；
+  // 后来者据此看到先选中者的占用，全部成功后一次性原子落盘；
+  // 若保存失败，磁盘原文件、记录与计数均不变。
+  const selected: Array<{
     w: WaitlistRec;
-    gaps: CoverageGap[];
-    conflicts: PendingConflict[];
+    bookingId: string;
+    startRaw: string;
+    endRaw: string;
+    startMin: number;
+    endMin: number;
   }> = [];
+  const blocked: WaitlistRec[] = [];
 
   for (const w of waiting) {
-    const startMin = parseDateTime(w.start, '候补开始时间');
-    const endMin = parseDateTime(w.end, '候补结束时间');
+    let slot: {startMin: number; endMin: number} | null = null;
 
-    // 1) 重查开放覆盖（资源开放区间可能已变化）
-    const gaps = findCoverageGaps(store, w.resourceIds, startMin, endMin);
-
-    // 2) 与当前全部有效预约（含系列成员，已取消不占用）求冲突
-    const wanted = new Set(w.resourceIds);
-    const conflicts: PendingConflict[] = [];
-    for (const b of store.bookings) {
-      if (b.status !== 'active') continue;
-      const bStart = parseDateTime(b.start, '预约开始时间');
-      const bEnd = parseDateTime(b.end, '预约结束时间');
-      if (!(bStart < endMin && startMin < bEnd)) continue;
-      const shared = b.resourceIds.filter((id) => wanted.has(id)).sort();
-      if (shared.length > 0) conflicts.push({bookingId: b.id, start: b.start, end: b.end, shared});
-    }
-    // 3) 与本轮已选中项求冲突——后来者不能顶掉先选中者，顺序绝不改变
-    for (const s of selected) {
-      if (!(s.startMin < endMin && startMin < s.endMin)) continue;
-      const shared = s.w.resourceIds.filter((id) => wanted.has(id)).sort();
-      if (shared.length > 0) {
-        conflicts.push({
-          bookingId: s.bookingId,
-          start: s.w.start,
-          end: s.w.end,
-          shared,
-          fromWaitlistId: s.w.id,
-        });
+    if (w.kind === 'fixed') {
+      // 固定项使用原时段：重查开放覆盖与冲突（store.bookings 已含本轮先选新预约）
+      const startMin = parseDateTime(w.start, '候补开始时间');
+      const endMin = parseDateTime(w.end, '候补结束时间');
+      const gaps = findCoverageGaps(store, w.resourceIds, startMin, endMin);
+      const conflicts = findConflicts(store, w.resourceIds, startMin, endMin);
+      if (gaps.length === 0 && conflicts.length === 0) slot = {startMin, endMin};
+    } else {
+      // 弹性项取窗口内最早可行的开始分钟，结束不超出窗口；不能拼接空隙
+      const duration = w.durationMinutes!;
+      const free = flexFreeSegments(store, w);
+      for (const [s, e] of free) {
+        if (e - s >= duration) {
+          slot = {startMin: s, endMin: s + duration};
+          break;
+        }
       }
     }
-    conflicts.sort((a, b) => a.bookingId.localeCompare(b.bookingId));
 
-    if (gaps.length === 0 && conflicts.length === 0) {
-      // 全部资源可用才选中；受阻项跳过并继续检查后项
-      store.bookingSeq += 1;
-      const bookingId = `B${String(store.bookingSeq).padStart(4, '0')}`;
-      selected.push({w, bookingId, startMin, endMin});
-    } else {
-      blocked.push({w, gaps, conflicts});
+    if (slot === null) {
+      // 受阻项等待并继续后项：不重排队列、不移动任何已选项
+      blocked.push(w);
+      continue;
     }
+
+    const startRaw = formatDateTime(slot.startMin);
+    const endRaw = formatDateTime(slot.endMin);
+    if (startRaw === null || endRaw === null) {
+      // 理论不可达：窗口本身已校验在 0001-9999 内，安排不超出窗口
+      throw new BizError(`候补 ${w.id} 的安排超出四位年份范围，本轮拒绝兑现（原记录保留）`);
+    }
+    store.bookingSeq += 1;
+    const bookingId = `B${String(store.bookingSeq).padStart(4, '0')}`;
+    store.bookings.push({
+      id: bookingId,
+      resourceIds: w.resourceIds,
+      start: startRaw,
+      end: endRaw,
+      status: 'active',
+    });
+    w.status = 'fulfilled';
+    w.bookingId = bookingId;
+    selected.push({w, bookingId, startRaw, endRaw, startMin: slot.startMin, endMin: slot.endMin});
   }
+
+  // 本轮预约标识 -> 来源候补标识，供阻挡报告标注“本轮新预约”
+  const fromWaitlistByBooking = new Map(selected.map((s) => [s.bookingId, s.w.id]));
 
   if (selected.length === 0) {
     // 没有可兑现项也成功：明确说明，不保存、不改变记录或计数
     console.log(
-      `候补处理完成：本轮处理 ${waiting.length} 项等待候补，没有可兑现项（开放不足或仍有冲突），` +
-        '全部继续等待；记录、占用与标识计数不变。',
+      `候补处理完成：本轮处理 ${waiting.length} 项等待候补，没有可兑现项` +
+        '（固定项开放不足或仍有冲突；弹性项窗口内无足够长的共同空闲），全部继续等待；记录、占用与标识计数不变。',
     );
-    for (const {w, gaps, conflicts} of blocked) {
-      console.log(renderBlocked(store, w, gaps, conflicts));
+    for (const w of blocked) {
+      console.log(renderBlocked(store, w, fromWaitlistByBooking));
     }
     return;
   }
 
-  // 为每个选中项各生成一项普通预约（不加入系列、不改动原预约），
-  // 新预约、候补已兑现状态及关联预约标识一次性原子落盘后才报告成功。
-  for (const s of selected) {
-    store.bookings.push({
-      id: s.bookingId,
-      resourceIds: s.w.resourceIds,
-      start: s.w.start,
-      end: s.w.end,
-      status: 'active',
-    });
-    s.w.status = 'fulfilled';
-    s.w.bookingId = s.bookingId;
-  }
+  // 选中项的普通预约已在内存中生成、候补已置为已兑现并有关联；
+  // 一次性原子落盘后才报告成功。
   store.bookings.sort((a, b) => a.id.localeCompare(b.id));
   await saveStore(file, store);
 
   const selectedById = new Map(selected.map((s) => [s.w.id, s]));
-  const blockedById = new Map(blocked.map((b) => [b.w.id, b]));
   console.log(
     `候补处理完成：按登记顺序处理 ${waiting.length} 项等待候补，本轮兑现 ${selected.length} 项，` +
       `${blocked.length} 项继续等待（已兑现/已取消项未参与）。`,
@@ -1728,35 +1966,55 @@ async function cmdProcessWaitlist(args: string[]): Promise<void> {
   for (const w of waiting) { // 结果严格按队列顺序展示
     const s = selectedById.get(w.id);
     if (s) {
-      console.log(`- 兑现 ${w.id} → 新预约 ${s.bookingId}（普通预约，不属于任何系列）`);
-      console.log(`    时间: ${w.start} → ${w.end}`);
+      console.log(`- 兑现 ${w.id}（${WAITLIST_KIND_LABEL[w.kind]}）→ 新预约 ${s.bookingId}（普通预约，不属于任何系列）`);
+      if (w.kind === 'flexible') console.log(`    原请求: ${renderWaitlistRequest(w)}`);
+      console.log(`    实际时间: ${s.startRaw} → ${s.endRaw}`);
       console.log(`    资源: ${formatResourceIds(store, w.resourceIds)}`);
     } else {
-      const b = blockedById.get(w.id)!;
-      console.log(renderBlocked(store, w, b.gaps, b.conflicts));
+      console.log(renderBlocked(store, w, fromWaitlistByBooking));
     }
   }
 }
 
+// 受阻项报告：固定项列开放不足与全部阻挡（含本轮后项产生的预约——
+// 本函数在全部选择完成后按最终占用渲染）；弹性项列窗口内全部最大共同空闲区间及分钟数
 function renderBlocked(
   store: Store,
   w: WaitlistRec,
-  gaps: CoverageGap[],
-  conflicts: PendingConflict[],
+  fromWaitlistByBooking: Map<string, string>,
 ): string {
-  const lines = [`- 继续等待 ${w.id}：${w.start} → ${w.end}`];
-  if (gaps.length > 0) {
-    lines.push('    开放不足资源:');
-    lines.push(...gapLines(gaps, '      '));
-  }
-  if (conflicts.length > 0) {
-    lines.push('    冲突预约（共同资源时间重叠）:');
-    for (const c of conflicts) {
-      const note = c.fromWaitlistId ? `（本轮新预约，兑现自候补 ${c.fromWaitlistId}）` : '';
-      lines.push(
-        `      - ${c.bookingId}${note}（${c.start} → ${c.end}）：共同资源 ${formatResourceIds(store, c.shared)}`,
-      );
+  const lines = [`- 继续等待 ${w.id}（${WAITLIST_KIND_LABEL[w.kind]}）：${renderWaitlistRequest(w)}`];
+
+  if (w.kind === 'fixed') {
+    const startMin = parseDateTime(w.start, '候补开始时间');
+    const endMin = parseDateTime(w.end, '候补结束时间');
+    const gaps = findCoverageGaps(store, w.resourceIds, startMin, endMin);
+    if (gaps.length > 0) {
+      lines.push('    开放不足资源:');
+      lines.push(...gapLines(gaps, '      '));
     }
+    const conflicts = findConflicts(store, w.resourceIds, startMin, endMin);
+    if (conflicts.length > 0) {
+      lines.push('    冲突预约（共同资源时间重叠）:');
+      for (const c of conflicts) {
+        const fromId = fromWaitlistByBooking.get(c.booking.id);
+        const note = fromId ? `（本轮新预约，兑现自候补 ${fromId}）` : '';
+        lines.push(
+          `      - ${c.booking.id}${note}（${c.booking.start} → ${c.booking.end}）` +
+            `：共同资源 ${formatResourceIds(store, c.shared)}`,
+        );
+      }
+    }
+    return lines.join('\n');
+  }
+
+  // 弹性项：按最终安排列出窗口内全部最大共同空闲区间及分钟数（按开始时间排序）
+  const free = flexFreeSegments(store, w);
+  lines.push('    窗口内全部最大共同空闲区间（全部资源同时连续可用，按开始时间排序）:');
+  if (free.length === 0) {
+    lines.push('      （空集：窗口内全部资源没有任何共同空闲区间，无法容纳所需连续时长）');
+  } else {
+    lines.push(...renderMinuteSegments(free, '      '));
   }
   return lines.join('\n');
 }
@@ -1875,7 +2133,7 @@ async function cmdCancelClosure(args: string[]): Promise<void> {
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、候补队列与资源临时停用）
+const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列与资源临时停用）
 
 用法:
   node app.ts [--data <数据文件>] <命令> [选项]
@@ -1922,27 +2180,37 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       整体取消该系列仍有效的成员（含单独改期者）并释放资源，记录保留；
       已取消成员与无关预约不受影响；重复取消成功且不变，未知系列失败
 
-候补命令（单次固定时段的多资源候补，不自动处理）:
+候补命令（固定时段 / 弹性时段的多资源候补，不自动处理，两种共用一条登记顺序）:
   add-waitlist --resource <标识> [--resource <标识> ...] \\
       --start <YYYY-MM-DDTHH:mm> --end <YYYY-MM-DDTHH:mm>
-      登记一项候补：至少一个不同的已登记资源，全部资源须被连续开放完整覆盖；
-      当前有预约冲突或资源空闲均可登记，候补不占用资源。返回稳定且不复用的
-      候补标识（如 W0001）；重复登记相同内容视为另一项候补
+      登记一项固定时段候补：至少一个不同的已登记资源，全部资源须被连续开放
+      完整覆盖；当前有预约冲突或资源空闲均可登记，候补不占用资源。返回稳定
+      且不复用的候补标识（如 W0001）；重复登记相同内容视为另一项候补
+  add-flex-waitlist --resource <标识> [--resource <标识> ...] \\
+      --window <开始/结束> --duration <正整数分钟>
+      登记一项弹性时段候补：在窗口（YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm，
+      真实有效、结束晚于开始、允许跨日、与机器时区无关）内为全部资源寻找所需
+      连续时长的最早安排；时长为不超过窗口长度的正整数分钟。登记忽略预约
+      占用，但窗口内全部资源的共同实际可用时间（开放合并重叠或相接后扣除
+      有效停用并集，无需整窗开放）须能容纳完整时长，否则拒绝。候补不占用
+      资源，返回稳定且不复用的候补标识；重复登记相同内容视为另一项候补
   list-waitlist
-      按登记顺序列出全部候补的标识、原时间、资源、等待/已兑现/已取消状态及
-      兑现后的预约标识（空队列明确提示）
+      按登记顺序列出全部候补的标识、种类、两种原请求（固定时段或弹性窗口+
+      时长）、资源、等待/已兑现/已取消状态及兑现后的预约标识（空队列明确提示）
   cancel-waitlist <候补标识>
-      取消等待中的候补（记录保留，仍在列表中显示为已取消）；重复取消已取消项
-      成功且不变；未知标识或取消已兑现项失败
+      取消等待中的候补（固定或弹性均可；记录保留，仍在列表中显示为已取消）；
+      重复取消已取消项成功且不变；未知标识或取消已兑现项失败
   process-waitlist
-      手动处理整个队列：按成功登记顺序遍历全部等待项，重查开放覆盖，并检查与
-      当前有效预约（含系列成员、不含已取消）及本轮已选中项的冲突（共同资源且
-      左闭右开重叠才冲突）；全部资源可用才选中，受阻项继续等待并继续检查后项，
-      绝不为增加兑现数量改变顺序。每个选中项各生成一项普通预约（不加入系列、
-      不改动原预约），新预约与候补已兑现状态及关联标识原子保存后才报告成功；
-      结果按队列顺序展示（选中项显示两种标识、时间与完整资源；等待项列出开放
-      不足资源、全部冲突预约及共同资源，含本轮新预约）。没有可兑现项也成功且
-      不改变记录或计数；普通创建、改期或取消不会自动处理候补
+      手动处理整个队列：按成功登记顺序逐项重查。固定项使用原时段（重查开放
+      覆盖与冲突）；弹性项在窗口内取最早可行的开始分钟（结束不超出窗口，
+      全部资源同时连续可用，不能拼接空隙），扣除有效预约及本轮已选项占用。
+      全部资源可用才选中，受阻项继续等待并继续检查后项，绝不重排队列或移动
+      已选项。每个选中项各生成一项普通预约（不加入系列、不改动原预约），
+      新预约与候补已兑现状态及关联标识原子保存后才报告成功；结果按队列顺序
+      展示（选中项显示两种标识、实际时间与完整资源；固定等待项列开放不足与
+      全部阻挡含本轮后项产生的预约；弹性等待项按最终安排列出窗口内全部最大
+      共同空闲区间及分钟数，按开始时间排序，空集明确提示）。没有可兑现项也
+      成功且不改变记录或计数；预约或停用变更不自动处理候补
 
 停用命令（场地维护、设备检修、人员休息）:
   add-closure --resource <标识> --start <YYYY-MM-DDTHH:mm> --end <YYYY-MM-DDTHH:mm>
@@ -2021,6 +2289,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   node app.ts cancel-series S0001
   node app.ts add-waitlist --resource R0001 --resource R0002 \\
       --start 2026-10-12T10:00 --end 2026-10-12T11:00
+  node app.ts add-flex-waitlist --resource R0001 --resource R0002 \\
+      --window 2026-10-12T08:00/2026-10-12T18:00 --duration 60
   node app.ts list-waitlist
   node app.ts process-waitlist
   node app.ts cancel-waitlist W0001
@@ -2075,6 +2345,9 @@ async function main(): Promise<void> {
       break;
     case 'add-waitlist':
       await cmdAddWaitlist(commandArgs);
+      break;
+    case 'add-flex-waitlist':
+      await cmdAddFlexWaitlist(commandArgs);
       break;
     case 'list-waitlist':
       await cmdListWaitlist(commandArgs);
