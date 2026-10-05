@@ -220,6 +220,7 @@ type BookingStatus = 'active' | 'cancelled';
 type WaitlistStatus = 'waiting' | 'fulfilled' | 'cancelled';
 type WaitlistKind = 'fixed' | 'flexible'; // 固定时段候补 / 弹性时段候补
 type ClosureStatus = 'active' | 'cancelled';
+type BatchOpStatus = 'active' | 'undone'; // 批量改期操作：未撤销 / 已撤销
 
 interface ResourceRec {
   id: string;
@@ -261,6 +262,20 @@ interface ClosureRec {
   status: ClosureStatus;
 }
 
+// 一次批量改期提交中的单项快照（按清单顺序）
+interface BatchOpItem {
+  bookingId: string;
+  seriesId?: string; // 提交时的系列归属（无系列则不含）
+  before: {start: string; end: string; resourceIds: string[]}; // 改期前安排
+  after: {start: string; end: string; resourceIds: string[]}; // 改期后安排（提交目标）
+}
+
+interface BatchOpRec {
+  id: string; // 批量改期操作标识 O0001…，稳定且不复用（即使记录已撤销）
+  status: BatchOpStatus;
+  items: BatchOpItem[]; // 按提交（清单）顺序
+}
+
 interface Store {
   version: 1;
   resourceSeq: number;
@@ -268,11 +283,13 @@ interface Store {
   seriesSeq: number;
   waitlistSeq: number; // 已分配的最大候补序号（计数不复用）
   closureSeq: number; // 已分配的最大停用序号（计数不复用）
+  batchSeq: number; // 已分配的最大批量改期操作序号（计数不复用，撤销也不回收）
   resources: ResourceRec[];
   bookings: BookingRec[];
   series: SeriesRec[];
   waitlist: WaitlistRec[];
   closures: ClosureRec[];
+  batchOps: BatchOpRec[];
 }
 
 const RESOURCE_TYPE_LABEL: Record<ResourceType, string> = {
@@ -298,11 +315,13 @@ function emptyStore(): Store {
     seriesSeq: 0,
     waitlistSeq: 0,
     closureSeq: 0,
+    batchSeq: 0,
     resources: [],
     bookings: [],
     series: [],
     waitlist: [],
     closures: [],
+    batchOps: [],
   };
 }
 
@@ -341,17 +360,23 @@ function validateStore(raw: unknown, file: string): Store {
     if (!isInt(o.closureSeq)) bad('closureSeq 必须是非负整数');
     store.closureSeq = o.closureSeq;
   }
+  if (o.batchSeq !== undefined) {
+    if (!isInt(o.batchSeq)) bad('batchSeq 必须是非负整数');
+    store.batchSeq = o.batchSeq;
+  }
 
   if (o.resources !== undefined && !Array.isArray(o.resources)) bad('resources 必须是数组');
   if (o.bookings !== undefined && !Array.isArray(o.bookings)) bad('bookings 必须是数组');
   if (o.series !== undefined && !Array.isArray(o.series)) bad('series 必须是数组');
   if (o.waitlist !== undefined && !Array.isArray(o.waitlist)) bad('waitlist 必须是数组');
   if (o.closures !== undefined && !Array.isArray(o.closures)) bad('closures 必须是数组');
+  if (o.batchOps !== undefined && !Array.isArray(o.batchOps)) bad('batchOps 必须是数组');
   const rawResources = (o.resources ?? []) as unknown[];
   const rawBookings = (o.bookings ?? []) as unknown[];
   const rawSeries = (o.series ?? []) as unknown[];
   const rawWaitlist = (o.waitlist ?? []) as unknown[];
   const rawClosures = (o.closures ?? []) as unknown[];
+  const rawBatchOps = (o.batchOps ?? []) as unknown[];
 
   const resourceIds = new Set<string>();
   rawResources.forEach((item, idx) => {
@@ -608,11 +633,130 @@ function validateStore(raw: unknown, file: string): Store {
     if (!closureNums.has(i)) bad(`停用记录缺号：找不到标识序号 ${i} 的记录`);
   }
 
+  // 批量改期操作记录：撤销也不删除、不回收标识；快照与现状可能不同（期间被其他
+  // 入口改期或取消），这不算损坏——因此只校验记录结构、引用与快照自身合法性，
+  // 不要求快照与预约当前安排一致。
+  const batchOpIds = new Set<string>();
+  const batchOpNums = new Set<number>();
+  rawBatchOps.forEach((item, idx) => {
+    const at = `batchOps[${idx}]`;
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) bad(`${at} 必须是对象`);
+    const op = item as Record<string, unknown>;
+    if (typeof op.id !== 'string' || !/^O\d{4,}$/.test(op.id)) bad(`${at}.id 非法: ${String(op.id)}`);
+    if (batchOpIds.has(op.id)) bad(`批量改期操作标识重复: ${op.id}`);
+    batchOpIds.add(op.id);
+    const on = Number(op.id.slice(1));
+    if (on > store.batchSeq) store.batchSeq = on;
+    batchOpNums.add(on);
+
+    if (op.status !== 'active' && op.status !== 'undone') {
+      bad(`${at}(${op.id}).status 非法: ${String(op.status)}`);
+    }
+
+    if (!Array.isArray(op.items) || op.items.length === 0) {
+      bad(`${at}(${op.id}).items 必须是非空数组`);
+    }
+    const itemRecs = op.items as unknown[];
+    const itemBookingIds = new Set<string>();
+    const validateSide = (
+      sideRaw: unknown,
+      sideName: string,
+    ): {start: string; end: string; resourceIds: string[]} => {
+      const sat = `${at}(${op.id}).items[?].${sideName}`;
+      if (typeof sideRaw !== 'object' || sideRaw === null || Array.isArray(sideRaw)) {
+        bad(`${sat} 必须是对象`);
+      }
+      const side = sideRaw as Record<string, unknown>;
+      for (const k of Object.keys(side)) {
+        if (k !== 'start' && k !== 'end' && k !== 'resourceIds') {
+          bad(`${sat} 存在未知字段 “${k}”（只允许 start、end、resourceIds）`);
+        }
+      }
+      if (typeof side.start !== 'string' || typeof side.end !== 'string') {
+        bad(`${sat} 起止时间必须是字符串`);
+      }
+      const s = parseDateTime(side.start as string, `${sat}.start`);
+      const e = parseDateTime(side.end as string, `${sat}.end`);
+      if (e <= s) bad(`${sat} 结束必须晚于开始`);
+      if (!Array.isArray(side.resourceIds) || side.resourceIds.length === 0) {
+        bad(`${sat}.resourceIds 必须是非空数组`);
+      }
+      const ids = side.resourceIds as unknown[];
+      const seen = new Set<string>();
+      ids.forEach((rid) => {
+        if (typeof rid !== 'string' || !resourceIds.has(rid)) {
+          bad(`${sat} 引用了未知资源: ${String(rid)}`);
+        }
+        if (seen.has(rid as string)) bad(`${sat} 资源重复: ${rid}`);
+        seen.add(rid as string);
+      });
+      return {start: side.start as string, end: side.end as string, resourceIds: [...seen].sort()};
+    };
+
+    const opItems: BatchOpItem[] = [];
+    itemRecs.forEach((itRaw, j) => {
+      const iat = `${at}(${op.id}).items[${j}]`;
+      if (typeof itRaw !== 'object' || itRaw === null || Array.isArray(itRaw)) {
+        bad(`${iat} 必须是对象`);
+      }
+      const it = itRaw as Record<string, unknown>;
+      for (const k of Object.keys(it)) {
+        if (k !== 'bookingId' && k !== 'seriesId' && k !== 'before' && k !== 'after') {
+          bad(`${iat} 存在未知字段 “${k}”（只允许 bookingId、seriesId、before、after）`);
+        }
+      }
+      if (typeof it.bookingId !== 'string' || !/^B\d{4,}$/.test(it.bookingId)) {
+        bad(`${iat}.bookingId 非法: ${String(it.bookingId)}`);
+      }
+      if (itemBookingIds.has(it.bookingId as string)) {
+        bad(`${iat} 预约标识在同一操作内重复: ${it.bookingId}`);
+      }
+      itemBookingIds.add(it.bookingId as string);
+      // 预约记录从不物理删除（取消也保留），引用必须可解析
+      if (!bookingById.has(it.bookingId as string)) {
+        bad(`${iat} 引用了未知预约: ${it.bookingId}`);
+      }
+      let seriesId: string | undefined;
+      if (it.seriesId !== undefined) {
+        if (typeof it.seriesId !== 'string' || !/^S\d{4,}$/.test(it.seriesId)) {
+          bad(`${iat}.seriesId 非法: ${String(it.seriesId)}`);
+        }
+        if (!seriesIds.has(it.seriesId)) bad(`${iat} 引用了未知系列: ${it.seriesId}`);
+        seriesId = it.seriesId;
+      }
+      if (it.before === undefined) bad(`${iat} 缺少改期前快照 before`);
+      if (it.after === undefined) bad(`${iat} 缺少改期后快照 after`);
+      const before = validateSide(it.before, 'before');
+      const after = validateSide(it.after, 'after');
+      const rec: BatchOpItem = {
+        bookingId: it.bookingId as string,
+        before,
+        after,
+      };
+      if (seriesId !== undefined) rec.seriesId = seriesId;
+      opItems.push(rec);
+    });
+
+    store.batchOps.push({
+      id: op.id,
+      status: op.status as BatchOpStatus,
+      items: opItems,
+    });
+  });
+  if (store.batchSeq !== 0 && store.batchOps.length === 0) {
+    bad('batchSeq 非零却没有任何批量改期操作记录（计数与记录不一致）');
+  }
+  // 操作记录从不删除（撤销也保留），标识序号集合必须恰好为 1..batchSeq
+  for (let i = 1; i <= store.batchSeq; i++) {
+    if (!batchOpNums.has(i)) bad(`批量改期操作记录缺号：找不到标识序号 ${i} 的记录`);
+  }
+
   store.resources.sort((a, b) => a.id.localeCompare(b.id));
   store.bookings.sort((a, b) => a.id.localeCompare(b.id));
   store.series.sort((a, b) => a.id.localeCompare(b.id));
   store.waitlist.sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
   store.closures.sort((a, b) => a.id.localeCompare(b.id));
+  store.batchOps.sort((a, b) => Number(a.id.slice(1)) - Number(b.id.slice(1)));
   return store;
 }
 
@@ -1292,37 +1436,288 @@ async function cmdRescheduleBatch(args: string[]): Promise<void> {
   // 全部验证通过：一次性替换各项目标安排并原子落盘。
   // 仅改时间与资源；标识、status、seriesId、标识计数全部不变，不创建任何预约或系列。
   // 若保存失败，磁盘原文件保留；本进程亦以退出码 1 结束，不会报告成功。
-  const noChange = targets.every(
-    (t) =>
-      t.booking.start === t.startRaw &&
-      t.booking.end === t.endRaw &&
-      t.booking.resourceIds.length === t.resourceIds.length &&
-      t.booking.resourceIds.every((id, j) => id === t.resourceIds[j]),
-  );
+  // 资源集合均已按标识排序，按位比较即可
+  const sameArrangement = (t: BatchTarget): boolean =>
+    t.booking.start === t.startRaw &&
+    t.booking.end === t.endRaw &&
+    t.booking.resourceIds.length === t.resourceIds.length &&
+    t.booking.resourceIds.every((id, j) => id === t.resourceIds[j]);
+  const noChange = targets.every(sameArrangement);
   if (noChange) {
-    // 幂等：提交的安排与现状完全一致时成功且不触碰数据文件
+    // 幂等：提交的安排与现状完全一致时成功且不触碰数据文件；
+    // 不生成改期操作记录、不推进操作计数
     console.log(
-      `批量改期成功：共 ${targets.length} 项，安排均与现状一致，无业务变化（标识与系列归属不变，数据文件未改动）`,
+      `批量改期成功：共 ${targets.length} 项，安排均与现状一致，无业务变化` +
+        '（标识与系列归属不变，未生成改期操作记录，数据文件与标识计数未改动）',
     );
     for (const t of targets) {
-      console.log(`第 ${t.index + 1} 项 ${t.booking.id}: ${t.startRaw} → ${t.endRaw}`);
+      console.log(`第 ${t.index + 1} 项 ${t.booking.id}:`);
+      if (t.booking.seriesId) console.log(`  所属系列: ${t.booking.seriesId}（保持不变）`);
+      console.log(`  时间: ${t.startRaw} → ${t.endRaw}`);
+      console.log(`  资源: ${formatResourceIds(store, t.resourceIds)}`);
     }
     return;
   }
+
+  // 至少一项有变化：在改动前抓取全部提交项的完整快照（标识、提交时系列归属、
+  // 改期前后时间与完整资源集合，顺序即清单顺序），生成一条“未撤销”操作记录，
+  // 与新安排在同一次原子保存中落盘后才报告成功；保存失败则不留记录、不推进计数。
+  const opItems: BatchOpItem[] = targets.map((t) => {
+    const item: BatchOpItem = {
+      bookingId: t.booking.id,
+      before: {
+        start: t.booking.start,
+        end: t.booking.end,
+        resourceIds: [...t.booking.resourceIds],
+      },
+      after: {start: t.startRaw, end: t.endRaw, resourceIds: [...t.resourceIds]},
+    };
+    if (t.booking.seriesId !== undefined) item.seriesId = t.booking.seriesId;
+    return item;
+  });
+  store.batchSeq += 1;
+  const opId = `O${String(store.batchSeq).padStart(4, '0')}`;
   for (const t of targets) {
     t.booking.start = t.startRaw;
     t.booking.end = t.endRaw;
     t.booking.resourceIds = t.resourceIds;
   }
+  store.batchOps.push({id: opId, status: 'active', items: opItems});
   await saveStore(file, store);
 
-  console.log(`批量改期成功：共 ${targets.length} 项（标识与系列归属不变，未创建预约或系列，未推进标识计数）`);
+  console.log(
+    `批量改期成功：操作标识 ${opId}，共 ${targets.length} 项（标识与系列归属不变，未创建预约或系列）`,
+  );
   for (const t of targets) {
     console.log(`第 ${t.index + 1} 项 ${t.booking.id}:`);
     if (t.booking.seriesId) console.log(`  所属系列: ${t.booking.seriesId}（保持不变）`);
     console.log(`  时间: ${t.startRaw} → ${t.endRaw}`);
     console.log(`  资源: ${formatResourceIds(store, t.resourceIds)}`);
   }
+  console.log(`本次改期已记录为 ${opId}：可用 list-batch-ops 查询，undo-batch-op ${opId} 整笔安全撤销。`);
+}
+
+// ---------------------------------------------------------------------------
+// 批量改期操作记录：查询与安全撤销
+// 快照只描述该次提交的前后安排；之后其他入口造成的现状变化不算损坏，
+// 撤销时按“当前值”与记录的改期后安排逐项核对。
+// ---------------------------------------------------------------------------
+
+const BATCH_OP_STATUS_LABEL: Record<BatchOpStatus, string> = {
+  active: '未撤销',
+  undone: '已撤销',
+};
+
+// 判断预约当前安排是否与某一快照完全一致（时间 + 完整资源集合，资源均已排序）
+function arrangementMatches(b: BookingRec, side: BatchOpItem['before']): boolean {
+  return (
+    b.start === side.start &&
+    b.end === side.end &&
+    b.resourceIds.length === side.resourceIds.length &&
+    b.resourceIds.every((id, j) => id === side.resourceIds[j])
+  );
+}
+
+// 渲染单项的前后安排（系列归属在首行给出）
+function renderBatchOpItem(store: Store, item: BatchOpItem, index: number, indent: string): string[] {
+  const lines = [
+    `${indent}第 ${index + 1} 项 ${item.bookingId}` +
+      (item.seriesId !== undefined ? `（系列 ${item.seriesId}）` : ''),
+  ];
+  lines.push(`${indent}  改期前: ${item.before.start} → ${item.before.end}`);
+  lines.push(`${indent}    资源: ${formatResourceIds(store, item.before.resourceIds)}`);
+  lines.push(`${indent}  改期后: ${item.after.start} → ${item.after.end}`);
+  lines.push(`${indent}    资源: ${formatResourceIds(store, item.after.resourceIds)}`);
+  return lines;
+}
+
+async function cmdListBatchOps(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(
+      `list-batch-ops 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`,
+    );
+  }
+  if (positionals.length > 0) {
+    throw new UsageError(`list-batch-ops 不接受位置参数: ${positionals.join(' ')}`);
+  }
+
+  const store = await loadStore(activeDataFile);
+  if (store.batchOps.length === 0) {
+    console.log(
+      '暂无批量改期操作记录（无变化提交不建记录；可用 reschedule-batch 提交批量改期，undo-batch-op <操作标识> 撤销）。',
+    );
+    return;
+  }
+  // 记录按标识序号（即成功提交先后）加载与展示；项按提交顺序
+  const undone = store.batchOps.filter((o) => o.status === 'undone').length;
+  console.log(
+    `批量改期操作记录（共 ${store.batchOps.length} 条，按操作先后；未撤销 ${store.batchOps.length - undone} 条，已撤销 ${undone} 条）：`,
+  );
+  for (const op of store.batchOps) {
+    console.log(`- ${op.id} [${BATCH_OP_STATUS_LABEL[op.status]}]（${op.items.length} 项，按提交顺序）`);
+    op.items.forEach((item, i) => {
+      console.log(renderBatchOpItem(store, item, i, '    ').join('\n'));
+    });
+  }
+}
+
+// 撤销校验的单项失败信息
+interface UndoFailure {
+  item: BatchOpItem;
+  index: number; // 提交顺序（0 基）
+  gaps: CoverageGap[];
+  external: Conflict[]; // 与本操作涉及预约之外有效预约的冲突
+  internal: Array<{other: BatchOpItem; otherIndex: number; shared: string[]}>; // 与本操作其他恢复安排的冲突
+}
+
+async function cmdUndoBatchOp(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(
+      `undo-batch-op 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`,
+    );
+  }
+  if (positionals.length !== 1) {
+    throw new UsageError('用法: undo-batch-op <批量改期操作标识>');
+  }
+  const opId = positionals[0];
+  if (!/^O\d{4,}$/.test(opId)) throw new BizError(`批量改期操作标识非法: ${opId}`);
+
+  const file = activeDataFile;
+  const store = await loadStore(file);
+  const op = store.batchOps.find((x) => x.id === opId);
+  if (!op) throw new BizError(`未知批量改期操作标识: ${opId}`);
+
+  if (op.status === 'undone') {
+    // 幂等：重复撤销已撤销记录成功且不触碰当前安排——即使之后又有改期
+    console.log(`操作 ${opId} 已是撤销状态，未做任何改动（当前安排保持不变）。`);
+    return;
+  }
+
+  // 前置一致性：全部涉及预约须仍有效，且当前时间、资源集合、系列归属与该记录的
+  // 改期后安排完全一致；按当前值比对，期间改动后又恢复一致仍可撤销。
+  // 任一不一致即整笔拒绝并列出全部不一致预约。
+  const mismatches: string[] = [];
+  const involved = new Map<string, {booking: BookingRec; item: BatchOpItem; index: number}>();
+  op.items.forEach((item, index) => {
+    const b = store.bookings.find((x) => x.id === item.bookingId);
+    if (!b) {
+      mismatches.push(`第 ${index + 1} 项 ${item.bookingId}：预约记录不存在（数据可能已损坏）`);
+      return;
+    }
+    if (b.status === 'cancelled') {
+      mismatches.push(`第 ${index + 1} 项 ${b.id}：预约已取消，撤销不能复活已取消预约`);
+      return;
+    }
+    involved.set(b.id, {booking: b, item, index});
+    const reasons: string[] = [];
+    if (!arrangementMatches(b, item.after)) {
+      reasons.push(
+        `当前安排（${b.start} → ${b.end}；资源 ${b.resourceIds.join('、')}）` +
+          `与记录改期后安排（${item.after.start} → ${item.after.end}；资源 ${item.after.resourceIds.join('、')}）不一致`,
+      );
+    }
+    const curSeries = b.seriesId;
+    const recSeries = item.seriesId;
+    if (curSeries !== recSeries) {
+      reasons.push(
+        `当前系列归属 ${curSeries ?? '无'} 与记录的系列归属 ${recSeries ?? '无'} 不一致`,
+      );
+    }
+    if (reasons.length > 0) {
+      mismatches.push(`第 ${index + 1} 项 ${b.id}：` + reasons.join('；'));
+    }
+  });
+
+  if (mismatches.length > 0) {
+    throw new BizError(
+      `撤销 ${opId} 被拒绝：存在 ${mismatches.length} 项涉及预约的当前状态与该记录改期后安排不一致` +
+        '（整笔不变，未恢复任何安排、未改变记录状态）：\n' +
+        mismatches.map((m) => `- ${m}`).join('\n'),
+    );
+  }
+
+  // 可行性：对“整笔恢复后”的最终安排做校验。本操作涉及预约的当前占用一律排除
+  // （允许互换时段）；障碍只来自本操作之外的有效预约，以及各项恢复安排彼此之间。
+  const involvedIds = new Set(op.items.map((it) => it.bookingId));
+  const failures: UndoFailure[] = [];
+  op.items.forEach((item, index) => {
+    const startMin = parseDateTime(item.before.start, '恢复开始时间');
+    const endMin = parseDateTime(item.before.end, '恢复结束时间');
+    const gaps = findCoverageGaps(store, item.before.resourceIds, startMin, endMin);
+    const external = findConflicts(store, item.before.resourceIds, startMin, endMin).filter(
+      (c) => !involvedIds.has(c.booking.id),
+    );
+    const wanted = new Set(item.before.resourceIds);
+    const internal: UndoFailure['internal'] = [];
+    op.items.forEach((other, otherIndex) => {
+      if (otherIndex === index) return;
+      const oStart = parseDateTime(other.before.start, '恢复开始时间');
+      const oEnd = parseDateTime(other.before.end, '恢复结束时间');
+      const overlap = oStart < endMin && startMin < oEnd;
+      if (!overlap) return;
+      const shared = other.before.resourceIds.filter((id) => wanted.has(id)).sort();
+      if (shared.length > 0) internal.push({other, otherIndex, shared});
+    });
+    if (gaps.length > 0 || external.length > 0 || internal.length > 0) {
+      failures.push({item, index, gaps, external, internal});
+    }
+  });
+
+  if (failures.length > 0) {
+    // 按提交顺序报告全部失败项；批内冲突在双方项中都会出现
+    const blocks = failures.map(({item, index, gaps, external, internal}) => {
+      const lines = [
+        `第 ${index + 1} 项 ${item.bookingId} 恢复为 ${item.before.start} → ${item.before.end}：`,
+      ];
+      if (gaps.length > 0) {
+        lines.push('  开放不足资源:');
+        lines.push(...gapLines(gaps, '    '));
+      }
+      if (external.length + internal.length > 0) {
+        lines.push('  冲突预约:');
+        for (const c of external) {
+          lines.push(
+            `    - ${c.booking.id}（${c.booking.start} → ${c.booking.end}）` +
+              `：共同资源 ${formatResourceIds(store, c.shared)}`,
+          );
+        }
+        for (const x of internal) {
+          lines.push(
+            `    - ${x.other.bookingId}（本操作第 ${x.otherIndex + 1} 项恢复为 ${x.other.before.start} → ${x.other.before.end}）` +
+              `：共同资源 ${formatResourceIds(store, x.shared)}`,
+          );
+        }
+      }
+      return lines.join('\n');
+    });
+    throw new BizError(
+      `撤销 ${opId} 失败：共 ${failures.length} 项恢复安排不满足条件（按提交顺序），整笔未改动：\n${blocks.join('\n')}`,
+    );
+  }
+
+  // 全部校验通过：将涉及预约恢复为各自原时间与原资源，并把记录置为“已撤销”，
+  // 同一次原子保存落盘后才报告成功。不新增撤销记录、不改变任何标识计数，
+  // 不动 status/seriesId、候补原请求与兑现关联，不触碰无关预约，不自动处理候补。
+  for (const {booking, item} of involved.values()) {
+    booking.start = item.before.start;
+    booking.end = item.before.end;
+    booking.resourceIds = [...item.before.resourceIds];
+  }
+  op.status = 'undone';
+  await saveStore(file, store);
+
+  console.log(
+    `已安全撤销 ${opId}：共 ${op.items.length} 项恢复为改期前安排（标识、有效状态与系列归属不变，未新增记录、未改变标识计数）`,
+  );
+  op.items.forEach((item, i) => {
+    console.log(
+      `  第 ${i + 1} 项 ${item.bookingId}` + (item.seriesId !== undefined ? `（系列 ${item.seriesId}）` : ''),
+    );
+    console.log(`    时间: ${item.before.start} → ${item.before.end}`);
+    console.log(`    资源: ${formatResourceIds(store, item.before.resourceIds)}`);
+  });
 }
 
 async function cmdCancelBooking(args: string[]): Promise<void> {
@@ -2133,7 +2528,7 @@ async function cmdCancelClosure(args: string[]): Promise<void> {
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列与资源临时停用）
+const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用，以及批量改期记录与安全撤销）
 
 用法:
   node app.ts [--data <数据文件>] <命令> [选项]
@@ -2161,7 +2556,23 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   reschedule-batch <改期清单文件>
       按本地 JSON 清单原子批量改期多项预约（可一次交换时段、重排多项资源），
       清单写法见下方“批量改期清单”；整批全部通过校验并完整保存后才报告成功，
-      任一项不满足则整批失败且原有时间、资源、状态、系列归属与占用全部不变
+      任一项不满足则整批失败且原有时间、资源、状态、系列归属与占用全部不变。
+      至少一项有变化时生成稳定且不复用的操作标识（如 O0001）并与新安排原子
+      保存，记录全部提交项的预约标识、系列归属、改期前后时间与完整资源集合及
+      清单顺序；安排均与现状一致的提交成功但不建记录、不改文件或计数
+  list-batch-ops
+      按操作先后列出全部批量改期操作记录（未撤销/已撤销状态，项按提交顺序
+      显示改期前后时间与完整资源、系列归属）；空结果明确提示
+  undo-batch-op <操作标识>
+      按操作标识整笔安全撤销：涉及预约须仍有效，且当前时间、资源集合、系列
+      归属与该记录改期后安排一致（按当前值比对，期间改动后恢复一致仍可撤销；
+      不能复活已取消预约），否则整笔拒绝并列出全部不一致预约。再按整笔恢复后
+      的最终安排校验开放覆盖与冲突（排除涉及预约自身的当前占用，允许互换时段；
+      受阻列出全部失败项、开放不足资源、相关有效停用与全部冲突预约及共同资源）。
+      通过后原子恢复原时间与原资源并置为已撤销；不新增记录、不改变标识计数，
+      系列归属、候补原请求与兑现关联不变，无关预约不变，不自动处理候补。
+      重复撤销已撤销记录成功且不触碰当前安排（即使之后又有改期）；未知标识失败。
+      撤销后重提交相同清单若产生变化，生成新的操作标识（不按清单路径或内容复用）
   cancel-booking <预约标识>
       取消单项预约并释放全部资源；系列成员只取消该项；重复取消成功且无变化
   list-bookings --date <YYYY-MM-DD>
@@ -2247,8 +2658,12 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   其他待改预约的旧占用阻挡，只要最终安排可行整批即成功（如互换时段）；
   逐项检查目标区间被全部目标资源的连续开放区间完整覆盖，以及与本批之外有效
   预约、与本批其他目标安排的冲突。开放不足或冲突时按清单顺序报告全部失败项
-  （批内冲突在双方项中互相列明）。成功只改时间与资源，标识与系列归属不变，
-  不创建预约或系列、不推进标识计数；清单不可读、损坏或内容非法同样整批失败。
+  （批内冲突在双方项中互相列明）。成功只改时间与资源，预约标识与系列归属
+  不变，不创建预约或系列、不推进预约/系列/候补/停用标识计数；至少一项有
+  变化时生成稳定且不复用的批量改期操作标识（O0001…），记录全部提交项并与
+  改期原子保存，全部项安排均与现状一致时成功但不建记录、不改文件或操作计数；
+  清单不可读、损坏或内容非法同样整批失败。记录可用 list-batch-ops 查询、
+  undo-batch-op <操作标识> 整笔安全撤销（撤销不新增记录、不回收或推进计数）。
   清单示例:
     {
       "items": [
@@ -2271,8 +2686,9 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   1  业务或文件失败（名称为空、未知/重复资源或预约、已取消预约、时间非法、
      开放不足、冲突、非法次数、超出四位年份、未知系列、未知候补、取消已兑现
      候补、候补标识非法、停用区间与有效预约重叠、未知停用、停用标识非法、
-     改期清单不可读/损坏/内容非法、数据文件损坏（含候补或停用状态非法）或
-     保存失败等）
+     改期清单不可读/损坏/内容非法、未知批量改期操作、撤销涉及预约与记录
+     不一致或恢复安排受阻、数据文件损坏（含候补、停用或批量改期记录结构、
+     引用或快照非法）或保存失败等）
   2  用法错误（未知参数、缺少必需选项、多余位置参数等）
 
 示例:
@@ -2285,6 +2701,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   node app.ts list-series
   node app.ts reschedule-booking B0002 --start 2026-10-12T14:00 --end 2026-10-12T15:00
   node app.ts reschedule-batch ./reschedule.json
+  node app.ts list-batch-ops
+  node app.ts undo-batch-op O0001
   node app.ts list-bookings --date 2026-10-12
   node app.ts cancel-series S0001
   node app.ts add-waitlist --resource R0001 --resource R0002 \\
@@ -2327,6 +2745,12 @@ async function main(): Promise<void> {
       break;
     case 'reschedule-batch':
       await cmdRescheduleBatch(commandArgs);
+      break;
+    case 'list-batch-ops':
+      await cmdListBatchOps(commandArgs);
+      break;
+    case 'undo-batch-op':
+      await cmdUndoBatchOp(commandArgs);
       break;
     case 'cancel-booking':
       await cmdCancelBooking(commandArgs);
