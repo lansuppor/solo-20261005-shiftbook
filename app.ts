@@ -14,6 +14,12 @@
 // 登记时窗口内共同实际可用时间能容纳完整时长即可，忽略预约占用）；两种候补共用
 // 同一条登记顺序，process-waitlist 按登记顺序手动处理整个队列（弹性项取窗口内
 // 最早可行开始），为可兑现项各创建一项普通预约，受阻项继续等待且不影响后续项。
+//
+// 批量改期记录：reschedule-batch 成功且至少一项有实际变化时，生成稳定且不复用的
+// 操作标识 G0001…，记录全部提交项（按清单顺序）的预约标识、系列归属、改期前后
+// 时间与完整资源集合，与改期原子保存；list-reschedule-records 按提交顺序查询，
+// undo-reschedule <操作标识> 在全部涉及预约仍有效且现状与记录的改期后安排一致时，
+// 将整笔恢复至改期前安排（按整笔恢复后的最终安排校验，允许互换时段）并标记已撤销。
 
 import {readFile, writeFile, rename, unlink} from 'node:fs/promises';
 
@@ -261,6 +267,28 @@ interface ClosureRec {
   status: ClosureStatus;
 }
 
+type RescheduleRecordStatus = 'applied' | 'undone'; // 未撤销 / 已撤销
+
+// 改期前/后快照：起止时间与完整资源集合（按标识排序）
+interface RescheduleSnapshot {
+  start: string;
+  end: string;
+  resourceIds: string[];
+}
+
+interface RescheduleRecordItem {
+  bookingId: string; // 提交项的预约标识
+  seriesId?: string; // 记录时的系列归属（无归属则缺省）
+  before: RescheduleSnapshot; // 改期前安排
+  after: RescheduleSnapshot; // 改期后安排
+}
+
+interface RescheduleRecord {
+  id: string; // 操作标识 G0001…，稳定且不复用
+  status: RescheduleRecordStatus;
+  items: RescheduleRecordItem[]; // 全部提交项，按清单顺序
+}
+
 interface Store {
   version: 1;
   resourceSeq: number;
@@ -268,11 +296,13 @@ interface Store {
   seriesSeq: number;
   waitlistSeq: number; // 已分配的最大候补序号（计数不复用）
   closureSeq: number; // 已分配的最大停用序号（计数不复用）
+  rescheduleSeq: number; // 已分配的最大改期操作序号（计数不复用）
   resources: ResourceRec[];
   bookings: BookingRec[];
   series: SeriesRec[];
   waitlist: WaitlistRec[];
   closures: ClosureRec[];
+  rescheduleRecords: RescheduleRecord[];
 }
 
 const RESOURCE_TYPE_LABEL: Record<ResourceType, string> = {
@@ -298,11 +328,13 @@ function emptyStore(): Store {
     seriesSeq: 0,
     waitlistSeq: 0,
     closureSeq: 0,
+    rescheduleSeq: 0,
     resources: [],
     bookings: [],
     series: [],
     waitlist: [],
     closures: [],
+    rescheduleRecords: [],
   };
 }
 
@@ -341,17 +373,25 @@ function validateStore(raw: unknown, file: string): Store {
     if (!isInt(o.closureSeq)) bad('closureSeq 必须是非负整数');
     store.closureSeq = o.closureSeq;
   }
+  if (o.rescheduleSeq !== undefined) {
+    if (!isInt(o.rescheduleSeq)) bad('rescheduleSeq 必须是非负整数');
+    store.rescheduleSeq = o.rescheduleSeq;
+  }
 
   if (o.resources !== undefined && !Array.isArray(o.resources)) bad('resources 必须是数组');
   if (o.bookings !== undefined && !Array.isArray(o.bookings)) bad('bookings 必须是数组');
   if (o.series !== undefined && !Array.isArray(o.series)) bad('series 必须是数组');
   if (o.waitlist !== undefined && !Array.isArray(o.waitlist)) bad('waitlist 必须是数组');
   if (o.closures !== undefined && !Array.isArray(o.closures)) bad('closures 必须是数组');
+  if (o.rescheduleRecords !== undefined && !Array.isArray(o.rescheduleRecords)) {
+    bad('rescheduleRecords 必须是数组');
+  }
   const rawResources = (o.resources ?? []) as unknown[];
   const rawBookings = (o.bookings ?? []) as unknown[];
   const rawSeries = (o.series ?? []) as unknown[];
   const rawWaitlist = (o.waitlist ?? []) as unknown[];
   const rawClosures = (o.closures ?? []) as unknown[];
+  const rawRescheduleRecords = (o.rescheduleRecords ?? []) as unknown[];
 
   const resourceIds = new Set<string>();
   rawResources.forEach((item, idx) => {
@@ -608,11 +648,101 @@ function validateStore(raw: unknown, file: string): Store {
     if (!closureNums.has(i)) bad(`停用记录缺号：找不到标识序号 ${i} 的记录`);
   }
 
+  // 批量改期记录：引用真实存在的预约/系列/资源；快照只记录历史，
+  // 不要求与预约现状一致（后续改期或取消保留记录，不算数据损坏）；
+  // 记录从不删除（撤销仅改状态），标识序号集合必须恰好为 1..rescheduleSeq
+  const recordIds = new Set<string>();
+  const recordNums = new Set<number>();
+  const bookingIdSet = new Set(store.bookings.map((b) => b.id));
+  const parseSnapshot = (value: unknown, sat: string): RescheduleSnapshot => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      bad(`${sat} 必须是对象`);
+    }
+    const snap = value as Record<string, unknown>;
+    if (typeof snap.start !== 'string' || typeof snap.end !== 'string') {
+      bad(`${sat} 起止时间必须是字符串`);
+    }
+    const s = parseDateTime(snap.start as string, `${sat}.start`);
+    const e = parseDateTime(snap.end as string, `${sat}.end`);
+    if (e <= s) bad(`${sat} 结束必须晚于开始`);
+    if (!Array.isArray(snap.resourceIds) || snap.resourceIds.length === 0) {
+      bad(`${sat}.resourceIds 必须是非空数组`);
+    }
+    const seen = new Set<string>();
+    (snap.resourceIds as unknown[]).forEach((rid) => {
+      if (typeof rid !== 'string' || !resourceIds.has(rid)) {
+        bad(`${sat} 引用了未知资源: ${String(rid)}`);
+      }
+      if (seen.has(rid)) bad(`${sat} 资源重复: ${rid}`);
+      seen.add(rid);
+    });
+    return {start: snap.start as string, end: snap.end as string, resourceIds: [...seen].sort()};
+  };
+  rawRescheduleRecords.forEach((item, idx) => {
+    const at = `rescheduleRecords[${idx}]`;
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) bad(`${at} 必须是对象`);
+    const rec = item as Record<string, unknown>;
+    if (typeof rec.id !== 'string' || !/^G\d{4,}$/.test(rec.id)) bad(`${at}.id 非法: ${String(rec.id)}`);
+    if (recordIds.has(rec.id)) bad(`改期操作标识重复: ${rec.id}`);
+    recordIds.add(rec.id);
+    const gn = Number(rec.id.slice(1));
+    if (gn > store.rescheduleSeq) store.rescheduleSeq = gn;
+    recordNums.add(gn);
+
+    if (rec.status !== 'applied' && rec.status !== 'undone') {
+      bad(`${at}(${rec.id}).status 非法: ${String(rec.status)}`);
+    }
+    if (!Array.isArray(rec.items) || rec.items.length === 0) {
+      bad(`${at}(${rec.id}).items 必须是非空数组`);
+    }
+    const seenItemBookings = new Set<string>();
+    const items = (rec.items as unknown[]).map((rawItem, j) => {
+      const iat = `${at}(${rec.id}).items[${j}]`;
+      if (typeof rawItem !== 'object' || rawItem === null || Array.isArray(rawItem)) {
+        bad(`${iat} 必须是对象`);
+      }
+      const it = rawItem as Record<string, unknown>;
+      if (typeof it.bookingId !== 'string' || !/^B\d{4,}$/.test(it.bookingId)) {
+        bad(`${iat}.bookingId 非法: ${String(it.bookingId)}`);
+      }
+      if (!bookingIdSet.has(it.bookingId)) bad(`${iat} 引用了未知预约: ${it.bookingId}`);
+      if (seenItemBookings.has(it.bookingId)) {
+        bad(`${iat} 预约标识在记录内重复: ${it.bookingId}`);
+      }
+      seenItemBookings.add(it.bookingId);
+
+      let seriesId: string | undefined;
+      if (it.seriesId !== undefined) {
+        if (typeof it.seriesId !== 'string' || !/^S\d{4,}$/.test(it.seriesId)) {
+          bad(`${iat}.seriesId 非法: ${String(it.seriesId)}`);
+        }
+        if (!seriesIds.has(it.seriesId)) bad(`${iat} 引用了未知系列: ${it.seriesId}`);
+        seriesId = it.seriesId;
+      }
+
+      const entry: RescheduleRecordItem = {
+        bookingId: it.bookingId,
+        before: parseSnapshot(it.before, `${iat}.before`),
+        after: parseSnapshot(it.after, `${iat}.after`),
+      };
+      if (seriesId !== undefined) entry.seriesId = seriesId;
+      return entry;
+    });
+    store.rescheduleRecords.push({id: rec.id, status: rec.status, items});
+  });
+  if (store.rescheduleSeq !== 0 && store.rescheduleRecords.length === 0) {
+    bad('rescheduleSeq 非零却没有任何改期操作记录（计数与记录不一致）');
+  }
+  for (let i = 1; i <= store.rescheduleSeq; i++) {
+    if (!recordNums.has(i)) bad(`改期操作记录缺号：找不到标识序号 ${i} 的记录`);
+  }
+
   store.resources.sort((a, b) => a.id.localeCompare(b.id));
   store.bookings.sort((a, b) => a.id.localeCompare(b.id));
   store.series.sort((a, b) => a.id.localeCompare(b.id));
   store.waitlist.sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
   store.closures.sort((a, b) => a.id.localeCompare(b.id));
+  store.rescheduleRecords.sort((a, b) => Number(a.id.slice(1)) - Number(b.id.slice(1)));
   return store;
 }
 
@@ -1289,9 +1419,8 @@ async function cmdRescheduleBatch(args: string[]): Promise<void> {
     );
   }
 
-  // 全部验证通过：一次性替换各项目标安排并原子落盘。
-  // 仅改时间与资源；标识、status、seriesId、标识计数全部不变，不创建任何预约或系列。
-  // 若保存失败，磁盘原文件保留；本进程亦以退出码 1 结束，不会报告成功。
+  // 幂等：提交的安排与现状完全一致时成功且不触碰数据文件——
+  // 不生成记录、不推进操作计数、不写文件
   const noChange = targets.every(
     (t) =>
       t.booking.start === t.startRaw &&
@@ -1300,28 +1429,250 @@ async function cmdRescheduleBatch(args: string[]): Promise<void> {
       t.booking.resourceIds.every((id, j) => id === t.resourceIds[j]),
   );
   if (noChange) {
-    // 幂等：提交的安排与现状完全一致时成功且不触碰数据文件
     console.log(
-      `批量改期成功：共 ${targets.length} 项，安排均与现状一致，无业务变化（标识与系列归属不变，数据文件未改动）`,
+      `批量改期成功：共 ${targets.length} 项，安排均与现状一致，无业务变化（标识与系列归属不变，数据文件未改动，未生成改期记录）`,
     );
     for (const t of targets) {
       console.log(`第 ${t.index + 1} 项 ${t.booking.id}: ${t.startRaw} → ${t.endRaw}`);
     }
     return;
   }
+
+  // 全部验证通过：生成改期操作记录（改动前取快照），一次性替换各项目标安排，
+  // 记录与改期一并原子落盘后才算成功。
+  // 仅改时间与资源；预约标识、status、seriesId、预约/系列标识计数全部不变，
+  // 不创建任何预约或系列。若保存失败，磁盘原文件保留（记录与改期都不生效），
+  // 本进程亦以退出码 1 结束，不会报告成功。
+  store.rescheduleSeq += 1;
+  const recordId = `G${String(store.rescheduleSeq).padStart(4, '0')}`;
+  const record: RescheduleRecord = {
+    id: recordId,
+    status: 'applied',
+    items: targets.map((t) => {
+      const item: RescheduleRecordItem = {
+        bookingId: t.booking.id,
+        before: {
+          start: t.booking.start,
+          end: t.booking.end,
+          resourceIds: [...t.booking.resourceIds],
+        },
+        after: {start: t.startRaw, end: t.endRaw, resourceIds: [...t.resourceIds]},
+      };
+      if (t.booking.seriesId !== undefined) item.seriesId = t.booking.seriesId;
+      return item;
+    }),
+  };
   for (const t of targets) {
     t.booking.start = t.startRaw;
     t.booking.end = t.endRaw;
     t.booking.resourceIds = t.resourceIds;
   }
+  store.rescheduleRecords.push(record);
   await saveStore(file, store);
 
-  console.log(`批量改期成功：共 ${targets.length} 项（标识与系列归属不变，未创建预约或系列，未推进标识计数）`);
+  console.log(`批量改期成功：共 ${targets.length} 项（标识与系列归属不变，未创建预约或系列，预约/系列标识计数不变）`);
+  console.log(`操作标识: ${recordId}（已记录本次改期；可用 list-reschedule-records 查询、undo-reschedule ${recordId} 撤销）`);
   for (const t of targets) {
     console.log(`第 ${t.index + 1} 项 ${t.booking.id}:`);
     if (t.booking.seriesId) console.log(`  所属系列: ${t.booking.seriesId}（保持不变）`);
     console.log(`  时间: ${t.startRaw} → ${t.endRaw}`);
     console.log(`  资源: ${formatResourceIds(store, t.resourceIds)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 批量改期记录：查询与按操作标识安全撤销
+// 记录由 reschedule-batch 在有实际变化时生成（G0001…，稳定且不复用）；
+// 撤销把整笔恢复至改期前安排，按整笔恢复后的最终安排校验（允许互换时段）
+// ---------------------------------------------------------------------------
+
+const RESCHEDULE_STATUS_LABEL: Record<RescheduleRecordStatus, string> = {
+  applied: '未撤销',
+  undone: '已撤销',
+};
+
+// 两个已排序资源集合是否完全一致
+function sameResourceIds(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+async function cmdListRescheduleRecords(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(
+      `list-reschedule-records 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`,
+    );
+  }
+  if (positionals.length > 0) {
+    throw new UsageError(`list-reschedule-records 不接受位置参数: ${positionals.join(' ')}`);
+  }
+
+  const store = await loadStore(activeDataFile);
+  if (store.rescheduleRecords.length === 0) {
+    console.log('暂无批量改期记录。reschedule-batch 成功且至少一项有实际变化时会生成可撤销的操作记录。');
+    return;
+  }
+  console.log(`批量改期记录（共 ${store.rescheduleRecords.length} 条，按提交顺序）：`);
+  for (const rec of store.rescheduleRecords) {
+    console.log(`- ${rec.id} [${RESCHEDULE_STATUS_LABEL[rec.status]}]（共 ${rec.items.length} 项，按清单顺序）`);
+    rec.items.forEach((it, j) => {
+      const series = it.seriesId !== undefined ? `（系列 ${it.seriesId}）` : '';
+      console.log(`    第 ${j + 1} 项 ${it.bookingId}${series}:`);
+      console.log(
+        `      改期前: ${it.before.start} → ${it.before.end}；资源: ${formatResourceIds(store, it.before.resourceIds)}`,
+      );
+      console.log(
+        `      改期后: ${it.after.start} → ${it.after.end}；资源: ${formatResourceIds(store, it.after.resourceIds)}`,
+      );
+    });
+  }
+}
+
+async function cmdUndoReschedule(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(
+      `undo-reschedule 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`,
+    );
+  }
+  if (positionals.length !== 1) throw new UsageError('用法: undo-reschedule <操作标识>');
+  const id = positionals[0];
+  if (!/^G\d{4,}$/.test(id)) throw new BizError(`改期操作标识非法: ${id}`);
+
+  const file = activeDataFile;
+  const store = await loadStore(file);
+  const record = store.rescheduleRecords.find((r) => r.id === id);
+  if (!record) throw new BizError(`未知改期操作标识: ${id}`);
+  if (record.status === 'undone') {
+    // 幂等：重复撤销成功且不触碰当前安排（即使之后又有改期），也不写文件
+    console.log(`改期操作 ${id} 已是已撤销状态，未做改动（当前安排保持不变）。`);
+    return;
+  }
+
+  // 一致性检查（按当前值比对）：全部涉及预约仍有效，且当前时间、资源集合、
+  // 系列归属与该记录的改期后安排一致；期间改动后恢复一致的仍可撤销，
+  // 已取消预约不能复活。任一不一致即整笔拒绝并列出全部不一致预约。
+  const involved = record.items.map((item, index) => ({
+    index,
+    item,
+    booking: store.bookings.find((b) => b.id === item.bookingId)!,
+  }));
+  const mismatches: string[] = [];
+  for (const {index, item, booking} of involved) {
+    const at = `第 ${index + 1} 项 ${item.bookingId}`;
+    if (booking.status !== 'active') {
+      mismatches.push(`${at} 当前已取消（撤销不能复活已取消预约）`);
+      continue;
+    }
+    const sameTime = booking.start === item.after.start && booking.end === item.after.end;
+    const sameResources = sameResourceIds(booking.resourceIds, item.after.resourceIds);
+    const sameSeries = (booking.seriesId ?? null) === (item.seriesId ?? null);
+    if (!sameTime || !sameResources || !sameSeries) {
+      mismatches.push(
+        `${at} 现状（时间 ${booking.start} → ${booking.end}，` +
+          `资源 ${formatResourceIds(store, booking.resourceIds)}，` +
+          `系列 ${booking.seriesId ?? '无'}）与记录的改期后安排（时间 ${item.after.start} → ${item.after.end}，` +
+          `资源 ${formatResourceIds(store, item.after.resourceIds)}，` +
+          `系列 ${item.seriesId ?? '无'}）不一致`,
+      );
+    }
+  }
+  if (mismatches.length > 0) {
+    throw new BizError(
+      `无法撤销改期操作 ${id}：以下预约与该记录的改期后安排不一致` +
+        `（按当前值比对，恢复一致后可再撤销），整笔未改动：\n${mismatches.map((m) => `- ${m}`).join('\n')}`,
+    );
+  }
+
+  // 恢复目标校验：针对整笔恢复后的最终安排。涉及预约的当前占用一律不视为
+  // 障碍（排除整笔标识，允许互换时段）；障碍只来自其他有效预约与恢复目标彼此。
+  const involvedIds = new Set(record.items.map((it) => it.bookingId));
+  interface UndoFailure {
+    index: number;
+    item: RescheduleRecordItem;
+    startMin: number;
+    endMin: number;
+    gaps: CoverageGap[];
+    external: Conflict[];
+    internal: Array<{other: RescheduleRecordItem; otherIndex: number; shared: string[]}>;
+  }
+  const failures: UndoFailure[] = [];
+  for (const {index, item} of involved) {
+    const startMin = parseDateTime(item.before.start, '恢复开始时间');
+    const endMin = parseDateTime(item.before.end, '恢复结束时间');
+    const gaps = findCoverageGaps(store, item.before.resourceIds, startMin, endMin);
+    const external = findConflicts(store, item.before.resourceIds, startMin, endMin).filter(
+      (c) => !involvedIds.has(c.booking.id),
+    );
+    const wanted = new Set(item.before.resourceIds);
+    const internal: UndoFailure['internal'] = [];
+    for (const o of involved) {
+      if (o.index === index) continue;
+      const os = parseDateTime(o.item.before.start, '恢复开始时间');
+      const oe = parseDateTime(o.item.before.end, '恢复结束时间');
+      if (!(os < endMin && startMin < oe)) continue;
+      const shared = o.item.before.resourceIds.filter((rid) => wanted.has(rid)).sort();
+      if (shared.length > 0) {
+        internal.push({other: o.item, otherIndex: o.index, shared});
+      }
+    }
+    if (gaps.length > 0 || external.length > 0 || internal.length > 0) {
+      failures.push({index, item, startMin, endMin, gaps, external, internal});
+    }
+  }
+  if (failures.length > 0) {
+    const blocks = failures.map((f) => {
+      const lines = [
+        `第 ${f.index + 1} 项 ${f.item.bookingId} 恢复目标 ${f.item.before.start} → ${f.item.before.end}：`,
+      ];
+      if (f.gaps.length > 0) {
+        lines.push('  开放不足资源:');
+        lines.push(...gapLines(f.gaps, '    '));
+      }
+      if (f.external.length + f.internal.length > 0) {
+        lines.push('  冲突预约:');
+        for (const c of f.external) {
+          lines.push(
+            `    - ${c.booking.id}（${c.booking.start} → ${c.booking.end}）` +
+              `：共同资源 ${formatResourceIds(store, c.shared)}`,
+          );
+        }
+        for (const x of f.internal) {
+          lines.push(
+            `    - ${x.other.bookingId}（本记录第 ${x.otherIndex + 1} 项恢复目标 ` +
+              `${x.other.before.start} → ${x.other.before.end}）` +
+              `：共同资源 ${formatResourceIds(store, x.shared)}`,
+          );
+        }
+      }
+      return lines.join('\n');
+    });
+    throw new BizError(
+      `撤销改期操作 ${id} 失败：恢复至改期前安排后共 ${failures.length} 项不满足条件` +
+        `（按清单顺序），整笔未改动：\n${blocks.join('\n')}`,
+    );
+  }
+
+  // 全部通过：将整笔恢复至改期前时间与资源并标记已撤销，原子落盘后才报告成功。
+  // 不新增撤销记录、不推进任何标识计数；预约标识、有效状态、系列归属及候补
+  // 原请求与兑现关联不变，无关预约不变，不自动处理候补。
+  for (const {item, booking} of involved) {
+    booking.start = item.before.start;
+    booking.end = item.before.end;
+    booking.resourceIds = [...item.before.resourceIds];
+  }
+  record.status = 'undone';
+  await saveStore(file, store);
+
+  console.log(
+    `已撤销改期操作 ${id}：共 ${involved.length} 项预约恢复至改期前安排` +
+      '（标识、有效状态与系列归属不变，未新增记录、未推进标识计数）。',
+  );
+  for (const {index, booking} of involved) {
+    console.log(`第 ${index + 1} 项 ${booking.id}:`);
+    if (booking.seriesId) console.log(`  所属系列: ${booking.seriesId}（保持不变）`);
+    console.log(`  时间: ${booking.start} → ${booking.end}`);
+    console.log(`  资源: ${formatResourceIds(store, booking.resourceIds)}`);
   }
 }
 
@@ -2133,7 +2484,7 @@ async function cmdCancelClosure(args: string[]): Promise<void> {
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列与资源临时停用）
+const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用与批量改期记录/撤销）
 
 用法:
   node app.ts [--data <数据文件>] <命令> [选项]
@@ -2161,7 +2512,23 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   reschedule-batch <改期清单文件>
       按本地 JSON 清单原子批量改期多项预约（可一次交换时段、重排多项资源），
       清单写法见下方“批量改期清单”；整批全部通过校验并完整保存后才报告成功，
-      任一项不满足则整批失败且原有时间、资源、状态、系列归属与占用全部不变
+      任一项不满足则整批失败且原有时间、资源、状态、系列归属与占用全部不变。
+      成功且至少一项有实际变化时生成稳定且不复用的操作标识（如 G0001）并
+      记录全部提交项（按清单顺序）的预约标识、系列归属、改期前后时间与完整
+      资源集合，记录与改期原子保存；无变化提交成功但不建记录、不改文件
+  list-reschedule-records
+      按提交顺序列出全部批量改期记录：操作标识、未撤销/已撤销状态，及每项
+      （按清单顺序）的预约标识、系列归属、改期前后时间与完整资源集合；
+      无记录时明确提示
+  undo-reschedule <操作标识>
+      撤销一笔未撤销的批量改期：全部涉及预约须仍有效，且当前时间、资源集合、
+      系列归属与该记录的改期后安排一致（按当前值比对，期间改动后恢复一致
+      仍可撤销；不能复活已取消预约），否则整笔拒绝并列出不一致预约。通过后
+      将全部涉及预约恢复至改期前时间与资源，按整笔恢复后的最终安排校验
+      （排除其当前占用，允许互换时段；检查批内与批外有效预约），受阻时列出
+      全部失败项、开放不足资源及相关停用、全部冲突预约及共同资源，整笔不变。
+      成功原子保存恢复安排与已撤销状态，不新增记录、不推进标识计数；
+      重复撤销已撤销记录成功且不触碰当前安排，未知标识失败
   cancel-booking <预约标识>
       取消单项预约并释放全部资源；系列成员只取消该项；重复取消成功且无变化
   list-bookings --date <YYYY-MM-DD>
@@ -2271,8 +2638,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   1  业务或文件失败（名称为空、未知/重复资源或预约、已取消预约、时间非法、
      开放不足、冲突、非法次数、超出四位年份、未知系列、未知候补、取消已兑现
      候补、候补标识非法、停用区间与有效预约重叠、未知停用、停用标识非法、
-     改期清单不可读/损坏/内容非法、数据文件损坏（含候补或停用状态非法）或
-     保存失败等）
+     改期清单不可读/损坏/内容非法、未知改期操作标识、撤销条件不满足、
+     数据文件损坏（含候补、停用或改期记录状态非法）或保存失败等）
   2  用法错误（未知参数、缺少必需选项、多余位置参数等）
 
 示例:
@@ -2285,6 +2652,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   node app.ts list-series
   node app.ts reschedule-booking B0002 --start 2026-10-12T14:00 --end 2026-10-12T15:00
   node app.ts reschedule-batch ./reschedule.json
+  node app.ts list-reschedule-records
+  node app.ts undo-reschedule G0001
   node app.ts list-bookings --date 2026-10-12
   node app.ts cancel-series S0001
   node app.ts add-waitlist --resource R0001 --resource R0002 \\
@@ -2327,6 +2696,12 @@ async function main(): Promise<void> {
       break;
     case 'reschedule-batch':
       await cmdRescheduleBatch(commandArgs);
+      break;
+    case 'list-reschedule-records':
+      await cmdListRescheduleRecords(commandArgs);
+      break;
+    case 'undo-reschedule':
+      await cmdUndoReschedule(commandArgs);
       break;
     case 'cancel-booking':
       await cmdCancelBooking(commandArgs);
