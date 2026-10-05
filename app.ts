@@ -457,19 +457,20 @@ interface Conflict {
   shared: string[];
 }
 
-// 与“已预约”记录求冲突：共同资源且时间重叠（左闭右开）；可排除自身
+// 与“已预约”记录求冲突：共同资源且时间重叠（左闭右开）；可排除一批标识
+// （单项改期排除自身；批量改期排除整批，使本批旧占用不作为障碍）
 function findConflicts(
   store: Store,
   ids: string[],
   startMin: number,
   endMin: number,
-  excludeBookingId?: string,
+  excludeBookingIds?: ReadonlySet<string>,
 ): Conflict[] {
   const wanted = new Set(ids);
   const conflicts: Conflict[] = [];
   for (const b of store.bookings) {
     if (b.status !== 'active') continue;
-    if (excludeBookingId !== undefined && b.id === excludeBookingId) continue;
+    if (excludeBookingIds !== undefined && excludeBookingIds.has(b.id)) continue;
     const bStart = parseDateTime(b.start, '预约开始时间');
     const bEnd = parseDateTime(b.end, '预约结束时间');
     const overlap = bStart < endMin && startMin < bEnd;
@@ -702,7 +703,7 @@ async function cmdRescheduleBooking(args: string[]): Promise<void> {
 
   assertOpenCoverage(store, ids, startMin, endMin);
   // 改期检查排除自身
-  assertNoConflicts(findConflicts(store, ids, startMin, endMin, id), store);
+  assertNoConflicts(findConflicts(store, ids, startMin, endMin, new Set([id])), store);
 
   // 全部可用后整体替换旧安排并落盘；失败则本进程内存与磁盘上的原安排都不变。
   // seriesId 不随改期变化：改期后仍属原系列。
@@ -714,6 +715,177 @@ async function cmdRescheduleBooking(args: string[]): Promise<void> {
   if (booking.seriesId) console.log(`  所属系列: ${booking.seriesId}（改期后仍属该系列）`);
   console.log(`  时间: ${startRaw} → ${endRaw}`);
   console.log(`  资源: ${formatResourceIds(store, ids)}`);
+}
+
+// ---------------------------------------------------------------------------
+// 批量改期（原子：整批成功或整批不变）
+// ---------------------------------------------------------------------------
+
+interface BatchPlanItem {
+  bookingId: string;
+  startRaw: string;
+  endRaw: string;
+  startMin: number;
+  endMin: number;
+  ids: string[]; // 完整目标资源集合（排序后），整体替换原集合
+}
+
+interface BatchFailure {
+  item: BatchPlanItem;
+  gaps: Array<{id: string; r: ResourceRec}>;
+  conflicts: Conflict[]; // 与清单之外有效预约的冲突
+  internal: Array<{other: BatchPlanItem; shared: string[]}>; // 与清单内其他项目标安排的冲突
+}
+
+async function cmdRescheduleBatch(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(`reschedule-batch 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`);
+  }
+  if (positionals.length !== 1) throw new UsageError('用法: reschedule-batch <清单文件>');
+  const manifestFile = positionals[0];
+
+  let text: string;
+  try {
+    text = await readFile(manifestFile, 'utf8');
+  } catch (err) {
+    throw new BizError(`无法读取改期清单 ${manifestFile}: ${(err as Error).message}`);
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (err) {
+    throw new BizError(`改期清单 ${manifestFile} 已损坏，不是合法 JSON：${(err as Error).message}`);
+  }
+
+  const bad = (reason: string): never => {
+    throw new BizError(`改期清单 ${manifestFile} 内容非法：${reason}（整批未改期，数据未变）`);
+  };
+  if (!Array.isArray(raw)) {
+    bad('顶层必须是数组，每项形如 {"booking":"B0001","start":"...","end":"...","resources":["R0001"]}');
+  }
+  if (raw.length === 0) bad('清单不能为空，至少需要一项');
+
+  const file = activeDataFile;
+  const store = await loadStore(file);
+
+  // 逐项解析：未知/重复预约、已取消、空资源集合、未知/重复资源、非法时间，任一问题即拒绝整批
+  const items: BatchPlanItem[] = [];
+  const seenBookings = new Set<string>();
+  raw.forEach((entry, idx) => {
+    const at = `第 ${idx + 1} 项`;
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      bad(`${at} 必须是对象，形如 {"booking":"B0001","start":"...","end":"...","resources":["R0001"]}`);
+    }
+    const e = entry as Record<string, unknown>;
+    for (const key of Object.keys(e)) {
+      if (!['booking', 'start', 'end', 'resources'].includes(key)) bad(`${at} 含未知字段: ${key}`);
+    }
+    if (typeof e.booking !== 'string' || e.booking === '') {
+      bad(`${at}.booking 缺失或非法，应为已存在的有效预约标识`);
+    }
+    const bookingId = e.booking;
+    if (seenBookings.has(bookingId)) bad(`预约 ${bookingId} 在清单中重复出现`);
+    seenBookings.add(bookingId);
+    const booking = store.bookings.find((b) => b.id === bookingId);
+    if (!booking) bad(`未知预约标识: ${bookingId}`);
+    if (booking.status === 'cancelled') bad(`预约 ${bookingId} 已取消，不能改期`);
+
+    const startRaw = e.start as string;
+    const endRaw = e.end as string;
+    const startMin = parseDateTime(startRaw, `${at}（${bookingId}）开始时间`);
+    const endMin = parseDateTime(endRaw, `${at}（${bookingId}）结束时间`);
+    if (endMin <= startMin) {
+      bad(`${at}（${bookingId}）结束时间必须晚于开始时间（开始: ${startRaw}，结束: ${endRaw}），允许跨日`);
+    }
+
+    if (!Array.isArray(e.resources) || e.resources.length === 0) {
+      bad(`${at}（${bookingId}）.resources 必须是非空数组（完整目标资源集合，整体替换原集合）`);
+    }
+    (e.resources as unknown[]).forEach((r) => {
+      if (typeof r !== 'string' || r === '') bad(`${at}（${bookingId}）.resources 含非法资源标识: ${String(r)}`);
+    });
+    let ids: string[];
+    try {
+      ids = resolveResourceIds(store, e.resources as string[]);
+    } catch (err) {
+      if (err instanceof BizError) bad(`${at}（${bookingId}）${err.message}`);
+      throw err;
+    }
+    items.push({bookingId, startRaw, endRaw, startMin, endMin, ids});
+  });
+
+  // 校验整批完成后的安排：本批预约的旧占用不作为障碍（整批排除），
+  // 逐项检查开放覆盖、与清单之外有效预约的冲突、与清单内其他项目标安排的冲突
+  const batchIds = new Set(items.map((it) => it.bookingId));
+  const failures: BatchFailure[] = [];
+  for (const it of items) {
+    const gaps = findCoverageGaps(store, it.ids, it.startMin, it.endMin);
+    const conflicts = findConflicts(store, it.ids, it.startMin, it.endMin, batchIds);
+    const wanted = new Set(it.ids);
+    const internal: Array<{other: BatchPlanItem; shared: string[]}> = [];
+    for (const o of items) {
+      if (o.bookingId === it.bookingId) continue;
+      if (o.startMin < it.endMin && it.startMin < o.endMin) {
+        const shared = o.ids.filter((id) => wanted.has(id)).sort();
+        if (shared.length > 0) internal.push({other: o, shared});
+      }
+    }
+    if (gaps.length > 0 || conflicts.length > 0 || internal.length > 0) {
+      failures.push({item: it, gaps, conflicts, internal});
+    }
+  }
+
+  if (failures.length > 0) {
+    // 按清单顺序报告全部不满足条件的项；批内冲突在双方项中互相列明
+    const blocks = failures.map((f) => {
+      const lines = [`- ${f.item.bookingId} 目标 ${f.item.startRaw} → ${f.item.endRaw}：`];
+      if (f.gaps.length > 0) {
+        lines.push('    开放不足资源:');
+        for (const {id, r} of f.gaps) lines.push(`      - ${id}（${r.name}）`);
+      }
+      if (f.conflicts.length > 0) {
+        lines.push('    与以下既有预约冲突:');
+        for (const c of f.conflicts) {
+          lines.push(
+            `      - ${c.booking.id}（${c.booking.start} → ${c.booking.end}）` +
+              `：共同资源 ${formatResourceIds(store, c.shared)}`,
+          );
+        }
+      }
+      if (f.internal.length > 0) {
+        lines.push('    与清单内其他项的目标冲突:');
+        for (const x of f.internal) {
+          lines.push(
+            `      - ${x.other.bookingId}（目标 ${x.other.startRaw} → ${x.other.endRaw}）` +
+              `：共同资源 ${formatResourceIds(store, x.shared)}`,
+          );
+        }
+      }
+      return lines.join('\n');
+    });
+    throw new BizError(
+      `批量改期失败：共 ${failures.length} 项不满足条件（按清单顺序），整批未改期，全部预约保持原安排：\n${blocks.join('\n')}`,
+    );
+  }
+
+  // 全部验证通过：整体替换各项目标安排，一次性落盘。
+  // 标识、状态、系列归属与各项计数不变；未列入清单的预约不受影响。
+  for (const it of items) {
+    const booking = store.bookings.find((b) => b.id === it.bookingId)!;
+    booking.start = it.startRaw;
+    booking.end = it.endRaw;
+    booking.resourceIds = it.ids;
+  }
+  await saveStore(file, store);
+
+  console.log(`已批量改期 ${items.length} 项预约（标识与系列归属保持不变，未推进任何标识计数）：`);
+  for (const it of items) {
+    const booking = store.bookings.find((b) => b.id === it.bookingId)!;
+    console.log(`- ${it.bookingId}: ${it.startRaw} → ${it.endRaw}`);
+    console.log(`    资源: ${formatResourceIds(store, it.ids)}`);
+    if (booking.seriesId) console.log(`    所属系列: ${booking.seriesId}（仍属该系列）`);
+  }
 }
 
 async function cmdCancelBooking(args: string[]): Promise<void> {
@@ -1013,6 +1185,18 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       [--resource <标识> ...]
       修改时间和/或资源（出现 --resource 即整体替换资源集合），标识保持不变；
       系列成员改期后仍属原系列，已取消项不能改期
+  reschedule-batch <清单文件>
+      按 JSON 清单对多项预约原子改期（一次交换时段或调整多项资源安排）：
+      全部验证通过并完整保存后才生效，任一项不满足则整批不变。
+      清单为 JSON 数组，不能为空，每项形如：
+        {"booking":"B0001","start":"YYYY-MM-DDTHH:mm","end":"YYYY-MM-DDTHH:mm",
+         "resources":["R0001","R0002"]}
+      booking 为已存在的有效预约标识（普通预约与不同系列成员可混合提交，
+      无需整系列提交，也不得重复）；resources 为完整目标资源集合
+      （整体替换原集合，至少一个，不得重复或未知）；
+      校验针对整批完成后的最终安排：本批预约的旧占用不作为障碍，
+      清单内各项的目标安排之间同样不得冲突；
+      标识与系列归属不变，不创建预约或系列，也不推进标识计数
   cancel-booking <预约标识>
       取消单项预约并释放全部资源；系列成员只取消该项；重复取消成功且无变化
   list-bookings --date <YYYY-MM-DD>
@@ -1042,7 +1226,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
 退出码:
   0  成功
   1  业务失败（名称为空、未知/重复资源、时间非法、开放不足、冲突、
-     非法次数、超出四位年份、未知系列、数据文件损坏等）
+     非法次数、超出四位年份、未知系列、改期清单不可读/损坏/内容非法、
+     数据文件损坏等）
   2  用法错误（未知参数、缺少必需选项、多余位置参数等）
 
 示例:
@@ -1054,6 +1239,7 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       --start 2026-10-05T10:00 --end 2026-10-05T11:00 --count 4
   node app.ts list-series
   node app.ts reschedule-booking B0002 --start 2026-10-12T14:00 --end 2026-10-12T15:00
+  node app.ts reschedule-batch ./reschedule.json
   node app.ts list-bookings --date 2026-10-12
   node app.ts cancel-series S0001
 `;
@@ -1082,6 +1268,9 @@ async function main(): Promise<void> {
       break;
     case 'reschedule-booking':
       await cmdRescheduleBooking(commandArgs);
+      break;
+    case 'reschedule-batch':
+      await cmdRescheduleBatch(commandArgs);
       break;
     case 'cancel-booking':
       await cmdCancelBooking(commandArgs);
