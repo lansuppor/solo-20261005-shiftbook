@@ -1,15 +1,24 @@
-// shiftbook —— 本地多资源单次预约命令行工具
+// shiftbook —— 本地多资源预约命令行工具
 // 运行环境：Node.js 24（直接执行 TypeScript，无外部运行依赖）
 //
 // 时间一律使用与机器时区无关的营业地时间：
 //   日期时间 YYYY-MM-DDTHH:mm，查询日期 YYYY-MM-DD
 // 内部统一换算为“自公元 1 年起的分钟数”做比较，杜绝时区影响。
 // 区间左闭右开 [start, end)，允许跨日。
+//
+// 预约系列：create-series 按周（每 7 个营业地日历日）生成多项预约，
+// 全部成员使用相同资源；成员记录与普通预约同表，带 seriesId 归属。
 
 import {readFile, writeFile, rename, unlink} from 'node:fs/promises';
 
 const APP = 'shiftbook';
 const DEFAULT_DATA_FILE = 'shiftbook-data.json';
+
+// 四位年份范围（与输入格式 YYYY 一致）；系列推算出的时间落在此范围外即拒绝
+const MIN_YEAR = 1;
+const MAX_YEAR = 9999;
+// 系列最大次数：首项 + 每周一次，杜绝荒谬输入导致的长循环
+const MAX_OCCURRENCES = 100000;
 
 // ---------------------------------------------------------------------------
 // 错误类型：UsageError -> 退出码 2；BizError -> 退出码 1
@@ -34,7 +43,7 @@ function daysInMonth(y: number, m: number): number {
   return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1];
 }
 
-// Howard Hinnant 的 civil-from-days 逆算法（对负年同样成立）
+// Howard Hinnant 的 civil-from-days 算法（对负年同样成立）
 function daysFromCivil(y: number, m: number, d: number): number {
   const yy = y - (m <= 2 ? 1 : 0);
   const era = Math.floor(yy >= 0 ? yy / 400 : (yy - 399) / 400);
@@ -42,6 +51,33 @@ function daysFromCivil(y: number, m: number, d: number): number {
   const doy = Math.floor((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1;
   const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy;
   return era * 146097 + doe - 719468;
+}
+
+// civil-from-days 逆算法：分钟数还原为营业地（年, 月, 日, 时, 分）
+function civilFromDays(z: number): {y: number; m: number; d: number} {
+  const zz = z + 719468;
+  const era = Math.floor(zz >= 0 ? Math.floor(zz / 146097) : Math.floor((zz - 146096) / 146097));
+  const doe = zz - era * 146097; // [0, 146096]
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365);
+  const y = yoe + era * 400;
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100)); // [0, 365]
+  const mp = Math.floor((5 * doy + 2) / 153); // [0, 11]
+  const d = doy - Math.floor((153 * mp + 2) / 5) + 1; // [1, 31]
+  const m = mp + (mp < 10 ? 3 : -9); // [1, 12]
+  return {y: y + (m <= 2 ? 1 : 0), m, d};
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+// 分钟数 -> YYYY-MM-DDTHH:mm；超出四位年份范围返回 null（绝不依赖机器时区）
+function formatDateTime(min: number): string | null {
+  const day = Math.floor(min / 1440);
+  const rem = min - day * 1440;
+  const {y, m, d} = civilFromDays(day);
+  if (y < MIN_YEAR || y > MAX_YEAR) return null;
+  return `${String(y).padStart(4, '0')}-${pad2(m)}-${pad2(d)}T${pad2(Math.floor(rem / 60))}:${pad2(rem % 60)}`;
 }
 
 function parseDateTime(value: string, label: string): number {
@@ -137,14 +173,21 @@ interface BookingRec {
   start: string;
   end: string;
   status: BookingStatus;
+  seriesId?: string;
+}
+
+interface SeriesRec {
+  id: string;
 }
 
 interface Store {
   version: 1;
   resourceSeq: number;
   bookingSeq: number;
+  seriesSeq: number;
   resources: ResourceRec[];
   bookings: BookingRec[];
+  series: SeriesRec[];
 }
 
 const RESOURCE_TYPE_LABEL: Record<ResourceType, string> = {
@@ -163,7 +206,15 @@ const RESOURCE_TYPE_MAP: Record<string, ResourceType> = {
 };
 
 function emptyStore(): Store {
-  return {version: 1, resourceSeq: 0, bookingSeq: 0, resources: [], bookings: []};
+  return {
+    version: 1,
+    resourceSeq: 0,
+    bookingSeq: 0,
+    seriesSeq: 0,
+    resources: [],
+    bookings: [],
+    series: [],
+  };
 }
 
 function isInt(v: unknown): v is number {
@@ -189,11 +240,17 @@ function validateStore(raw: unknown, file: string): Store {
     if (!isInt(o.bookingSeq)) bad('bookingSeq 必须是非负整数');
     store.bookingSeq = o.bookingSeq;
   }
+  if (o.seriesSeq !== undefined) {
+    if (!isInt(o.seriesSeq)) bad('seriesSeq 必须是非负整数');
+    store.seriesSeq = o.seriesSeq;
+  }
 
   if (o.resources !== undefined && !Array.isArray(o.resources)) bad('resources 必须是数组');
   if (o.bookings !== undefined && !Array.isArray(o.bookings)) bad('bookings 必须是数组');
+  if (o.series !== undefined && !Array.isArray(o.series)) bad('series 必须是数组');
   const rawResources = (o.resources ?? []) as unknown[];
   const rawBookings = (o.bookings ?? []) as unknown[];
+  const rawSeries = (o.series ?? []) as unknown[];
 
   const resourceIds = new Set<string>();
   rawResources.forEach((item, idx) => {
@@ -221,6 +278,20 @@ function validateStore(raw: unknown, file: string): Store {
     store.resources.push({id: r.id, type: r.type, name: r.name, open});
     const n = Number(r.id.slice(1));
     if (n > store.resourceSeq) store.resourceSeq = n;
+  });
+
+  // 系列先于预约校验：预约的 seriesId 必须指向真实存在的系列
+  const seriesIds = new Set<string>();
+  rawSeries.forEach((item, idx) => {
+    const at = `series[${idx}]`;
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) bad(`${at} 必须是对象`);
+    const s = item as Record<string, unknown>;
+    if (typeof s.id !== 'string' || !/^S\d{4,}$/.test(s.id)) bad(`${at}.id 非法: ${String(s.id)}`);
+    if (seriesIds.has(s.id)) bad(`系列标识重复: ${s.id}`);
+    seriesIds.add(s.id);
+    store.series.push({id: s.id});
+    const n = Number(s.id.slice(1));
+    if (n > store.seriesSeq) store.seriesSeq = n;
   });
 
   const bookingIds = new Set<string>();
@@ -252,19 +323,30 @@ function validateStore(raw: unknown, file: string): Store {
     if (b.status !== 'active' && b.status !== 'cancelled') {
       bad(`${at}(${b.id}).status 非法: ${String(b.status)}`);
     }
-    store.bookings.push({
+    let seriesId: string | undefined;
+    if (b.seriesId !== undefined) {
+      if (typeof b.seriesId !== 'string' || !/^S\d{4,}$/.test(b.seriesId)) {
+        bad(`${at}(${b.id}).seriesId 非法: ${String(b.seriesId)}`);
+      }
+      if (!seriesIds.has(b.seriesId)) bad(`${at}(${b.id}) 引用了未知系列: ${b.seriesId}`);
+      seriesId = b.seriesId;
+    }
+    const rec: BookingRec = {
       id: b.id,
       resourceIds: [...(ids as string[])].sort(),
       start: b.start,
       end: b.end,
       status: b.status,
-    });
+    };
+    if (seriesId !== undefined) rec.seriesId = seriesId;
+    store.bookings.push(rec);
     const n = Number(b.id.slice(1));
     if (n > store.bookingSeq) store.bookingSeq = n;
   });
 
   store.resources.sort((a, b) => a.id.localeCompare(b.id));
   store.bookings.sort((a, b) => a.id.localeCompare(b.id));
+  store.series.sort((a, b) => a.id.localeCompare(b.id));
   return store;
 }
 
@@ -347,11 +429,21 @@ function openSegmentsOf(r: ResourceRec): Array<[number, number]> {
   );
 }
 
-// 校验每个资源的开放区间都能完整覆盖 [startMin, endMin)
-function assertOpenCoverage(store: Store, ids: string[], startMin: number, endMin: number): void {
-  const failing = ids
+// 找出开放区间不能完整覆盖 [startMin, endMin) 的资源
+function findCoverageGaps(
+  store: Store,
+  ids: string[],
+  startMin: number,
+  endMin: number,
+): Array<{id: string; r: ResourceRec}> {
+  return ids
     .map((id) => ({id, r: store.resources.find((x) => x.id === id)!}))
     .filter(({r}) => !isFullyCovered(openSegmentsOf(r), startMin, endMin));
+}
+
+// 校验每个资源的开放区间都能完整覆盖 [startMin, endMin)
+function assertOpenCoverage(store: Store, ids: string[], startMin: number, endMin: number): void {
+  const failing = findCoverageGaps(store, ids, startMin, endMin);
   if (failing.length > 0) {
     throw new BizError(
       '开放时间不足，以下资源的开放区间不能完整覆盖预约区间：\n' +
@@ -519,7 +611,14 @@ async function cmdAddResource(args: string[]): Promise<void> {
   console.log(`已添加资源 ${id}（${RESOURCE_TYPE_LABEL[type]}｜${name}）`);
 }
 
-async function cmdListResources(): Promise<void> {
+async function cmdListResources(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(`list-resources 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`);
+  }
+  if (positionals.length > 0) {
+    throw new UsageError(`list-resources 不接受位置参数: ${positionals.join(' ')}`);
+  }
   const store = await loadStore(activeDataFile);
   if (store.resources.length === 0) {
     console.log('暂无资源。可使用 add-resource 登记场地、设备或人员。');
@@ -605,12 +704,14 @@ async function cmdRescheduleBooking(args: string[]): Promise<void> {
   // 改期检查排除自身
   assertNoConflicts(findConflicts(store, ids, startMin, endMin, id), store);
 
-  // 全部可用后整体替换旧安排并落盘；失败则本进程内存与磁盘上的原安排都不变
+  // 全部可用后整体替换旧安排并落盘；失败则本进程内存与磁盘上的原安排都不变。
+  // seriesId 不随改期变化：改期后仍属原系列。
   booking.start = startRaw;
   booking.end = endRaw;
   booking.resourceIds = ids;
   await saveStore(file, store);
   console.log(`已改期预约 ${id}（标识保持不变）`);
+  if (booking.seriesId) console.log(`  所属系列: ${booking.seriesId}（改期后仍属该系列）`);
   console.log(`  时间: ${startRaw} → ${endRaw}`);
   console.log(`  资源: ${formatResourceIds(store, ids)}`);
 }
@@ -634,7 +735,8 @@ async function cmdCancelBooking(args: string[]): Promise<void> {
   }
   booking.status = 'cancelled'; // 已取消记录保留，但不再参与冲突检查
   await saveStore(file, store);
-  console.log(`已取消预约 ${id}，其全部资源已释放。`);
+  const seriesNote = booking.seriesId ? `（系列 ${booking.seriesId} 的成员，仅取消该项）` : '';
+  console.log(`已取消预约 ${id}${seriesNote}，其全部资源已释放。`);
 }
 
 async function cmdListBookings(args: string[]): Promise<void> {
@@ -663,15 +765,230 @@ async function cmdListBookings(args: string[]): Promise<void> {
   for (const {b} of hits) {
     const status = b.status === 'active' ? '已预约' : '已取消';
     console.log(`- ${b.id} [${status}] ${b.start} → ${b.end}`);
+    if (b.seriesId) console.log(`    所属系列: ${b.seriesId}`);
     console.log(`    资源: ${formatResourceIds(store, b.resourceIds)}`);
   }
+}
+
+// 解析正整数次数（不接受 0、负数、小数与前导零）
+function parseOccurrences(raw: string): number {
+  if (!/^[1-9]\d*$/.test(raw)) {
+    throw new BizError(`次数非法: “${raw}”，必须是正整数（含首项）`);
+  }
+  const n = Number(raw);
+  if (n > MAX_OCCURRENCES) {
+    throw new BizError(`次数过大: “${raw}”，最大为 ${MAX_OCCURRENCES}`);
+  }
+  return n;
+}
+
+interface PlannedMember {
+  startRaw: string;
+  endRaw: string;
+  startMin: number;
+  endMin: number;
+}
+
+// 按周展开系列：每项相对前一项将起止时间同时后移 7 个营业地日历日，
+// 时刻与跨日长度保持不变。任何一项超出四位年份范围即整体拒绝。
+function planWeeklyMembers(startMin: number, endMin: number, count: number): PlannedMember[] {
+  const members: PlannedMember[] = [];
+  for (let i = 0; i < count; i++) {
+    const s = startMin + i * 7 * 1440;
+    const e = endMin + i * 7 * 1440;
+    const startRaw = formatDateTime(s);
+    const endRaw = formatDateTime(e);
+    if (startRaw === null || endRaw === null) {
+      const nth = i + 1;
+      throw new BizError(
+        `系列第 ${nth} 项（约第 ${nth} 周）的时间超出四位年份范围（${MIN_YEAR}-${MAX_YEAR}），无法创建：` +
+          '请缩短次数或改选更早的首项时间',
+      );
+    }
+    members.push({startRaw, endRaw, startMin: s, endMin: e});
+  }
+  return members;
+}
+
+// 系列成员校验失败的聚合结构
+interface MemberFailure {
+  index: number; // 0 基
+  startRaw: string;
+  endRaw: string;
+  gaps: Array<{id: string; r: ResourceRec}>;
+  conflicts: Conflict[]; // 与既有有效预约的冲突
+  internal: Array<{other: PlannedMember; otherIndex: number}>; // 与系列内其他成员的冲突
+}
+
+async function cmdCreateSeries(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, ['resource', 'start', 'end', 'count'], ['resource']);
+  if (positionals.length > 0) throw new UsageError(`create-series 不接受位置参数: ${positionals.join(' ')}`);
+
+  const resourceArgs = values.get('resource');
+  if (!resourceArgs || resourceArgs.length === 0) throw new UsageError('至少需要一个 --resource');
+  const startRaw = requireFlag(values, 'start');
+  const endRaw = requireFlag(values, 'end');
+  const count = parseOccurrences(requireFlag(values, 'count'));
+
+  const file = activeDataFile;
+  const store = await loadStore(file);
+
+  const ids = resolveResourceIds(store, resourceArgs);
+  const startMin = parseDateTime(startRaw, '首项开始时间');
+  const endMin = parseDateTime(endRaw, '首项结束时间');
+  if (endMin <= startMin) {
+    throw new BizError(`首项结束时间必须晚于开始时间（开始: ${startRaw}，结束: ${endRaw}），允许跨日`);
+  }
+
+  // 先展开全部成员时间（含跨月、闰日、跨年、年份范围校验）
+  const members = planWeeklyMembers(startMin, endMin, count);
+
+  // 逐项校验：开放覆盖、与既有有效预约冲突、与系列内其他成员冲突
+  const failures: MemberFailure[] = [];
+  for (let i = 0; i < members.length; i++) {
+    const m = members[i];
+    const gaps = findCoverageGaps(store, ids, m.startMin, m.endMin);
+    const conflicts = findConflicts(store, ids, m.startMin, m.endMin);
+    const internal: Array<{other: PlannedMember; otherIndex: number}> = [];
+    for (let j = 0; j < members.length; j++) {
+      if (j === i) continue;
+      const o = members[j];
+      if (o.startMin < m.endMin && m.startMin < o.endMin) {
+        internal.push({other: o, otherIndex: j});
+      }
+    }
+    if (gaps.length > 0 || conflicts.length > 0 || internal.length > 0) {
+      failures.push({index: i, startRaw: m.startRaw, endRaw: m.endRaw, gaps, conflicts, internal});
+    }
+  }
+
+  if (failures.length > 0) {
+    // 按发生顺序报告所有失败项；任一项不满足则整批失败，不分配任何标识、不写文件
+    const blocks = failures.map((f) => {
+      const lines = [`第 ${f.index + 1} 项 ${f.startRaw} → ${f.endRaw}：`];
+      if (f.gaps.length > 0) {
+        lines.push('  开放不足资源:');
+        for (const {id, r} of f.gaps) lines.push(`    - ${id}（${r.name}）`);
+      }
+      if (f.conflicts.length > 0) {
+        lines.push('  与以下既有预约冲突:');
+        for (const c of f.conflicts) {
+          lines.push(
+            `    - ${c.booking.id}（${c.booking.start} → ${c.booking.end}）` +
+              `：共同资源 ${formatResourceIds(store, c.shared)}`,
+          );
+        }
+      }
+      if (f.internal.length > 0) {
+        lines.push('  与系列内其他成员冲突:');
+        for (const x of f.internal) {
+          lines.push(
+            `    - 第 ${x.otherIndex + 1} 项（${x.other.startRaw} → ${x.other.endRaw}）：双方时间重叠`,
+          );
+        }
+      }
+      return lines.join('\n');
+    });
+    throw new BizError(
+      `系列创建失败：共 ${failures.length} 项不满足条件（按发生顺序），整批未创建：\n${blocks.join('\n')}`,
+    );
+  }
+
+  // 全部验证通过：分配一个系列标识与每项预约标识，一次性落盘。
+  // 标识在此刻才生成，任何失败都不会推进计数。
+  store.seriesSeq += 1;
+  const seriesId = `S${String(store.seriesSeq).padStart(4, '0')}`;
+  const assigned: Array<{id: string; m: PlannedMember}> = [];
+  for (const m of members) {
+    store.bookingSeq += 1;
+    const id = `B${String(store.bookingSeq).padStart(4, '0')}`;
+    store.bookings.push({
+      id,
+      resourceIds: ids,
+      start: m.startRaw,
+      end: m.endRaw,
+      status: 'active',
+      seriesId,
+    });
+    assigned.push({id, m});
+  }
+  store.series.push({id: seriesId});
+  store.bookings.sort((a, b) => a.id.localeCompare(b.id));
+  store.series.sort((a, b) => a.id.localeCompare(b.id));
+  await saveStore(file, store);
+
+  console.log(`已创建按周重复系列 ${seriesId}（共 ${count} 项，每周一次，全部成员使用相同资源）`);
+  console.log(`  资源: ${formatResourceIds(store, ids)}`);
+  assigned.forEach(({id, m}, i) => {
+    console.log(`  第 ${i + 1} 项 ${id}: ${m.startRaw} → ${m.endRaw}`);
+  });
+}
+
+async function cmdListSeries(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(`list-series 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`);
+  }
+  if (positionals.length > 0) throw new UsageError(`list-series 不接受位置参数: ${positionals.join(' ')}`);
+
+  const store = await loadStore(activeDataFile);
+  if (store.series.length === 0) {
+    console.log('暂无预约系列。可使用 create-series 创建按周重复的多资源预约系列。');
+    return;
+  }
+  console.log(`预约系列（共 ${store.series.length} 个）：`);
+  for (const s of store.series) {
+    const members = store.bookings
+      .filter((b) => b.seriesId === s.id)
+      .map((b) => ({b, startMin: parseDateTime(b.start, '预约开始时间')}))
+      .sort((x, y) => x.startMin - y.startMin || x.b.id.localeCompare(y.b.id));
+    const activeCount = members.filter((m) => m.b.status === 'active').length;
+    console.log(`- 系列 ${s.id}（${members.length} 项，有效 ${activeCount} 项）`);
+    for (const {b} of members) {
+      const status = b.status === 'active' ? '有效' : '已取消';
+      console.log(`    ${b.id} [${status}] ${b.start} → ${b.end}`);
+      console.log(`      资源: ${formatResourceIds(store, b.resourceIds)}`);
+    }
+  }
+}
+
+async function cmdCancelSeries(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(`cancel-series 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`);
+  }
+  if (positionals.length !== 1) throw new UsageError('用法: cancel-series <系列标识>');
+  const seriesId = positionals[0];
+  if (!/^S\d{4,}$/.test(seriesId)) throw new BizError(`系列标识非法: ${seriesId}`);
+
+  const file = activeDataFile;
+  const store = await loadStore(file);
+  const series = store.series.find((x) => x.id === seriesId);
+  if (!series) throw new BizError(`未知系列标识: ${seriesId}`);
+
+  // 仅取消仍有效的成员（含单独改期者）；已取消成员保持不变；无关预约不受影响
+  const members = store.bookings
+    .filter((b) => b.seriesId === seriesId)
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const toCancel = members.filter((b) => b.status === 'active');
+  if (toCancel.length === 0) {
+    // 幂等：重复整体取消成功且不变
+    console.log(`系列 ${seriesId} 已无可取消的有效成员，未做改动（共 ${members.length} 项，均已取消）。`);
+    return;
+  }
+  for (const b of toCancel) b.status = 'cancelled';
+  await saveStore(file, store);
+  console.log(`已整体取消系列 ${seriesId}：本次取消 ${toCancel.length} 项，其全部资源已释放，记录均保留。`);
+  for (const b of toCancel) console.log(`  - ${b.id}（${b.start} → ${b.end}）`);
+  const already = members.length - toCancel.length;
+  if (already > 0) console.log(`另有 ${already} 项此前已取消，保持不变。`);
 }
 
 // ---------------------------------------------------------------------------
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `shiftbook —— 本地多资源单次预约
+const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列）
 
 用法:
   node app.ts [--data <数据文件>] <命令> [选项]
@@ -694,32 +1011,51 @@ const HELP_TEXT = `shiftbook —— 本地多资源单次预约
       一次占用全部所选资源，返回稳定标识，如 B0001
   reschedule-booking <预约标识> [--start <时间>] [--end <时间>] \\
       [--resource <标识> ...]
-      修改时间和/或资源（出现 --resource 即整体替换资源集合），标识保持不变
+      修改时间和/或资源（出现 --resource 即整体替换资源集合），标识保持不变；
+      系列成员改期后仍属原系列，已取消项不能改期
   cancel-booking <预约标识>
-      取消预约并释放全部资源；对已取消记录再次取消成功且无变化
+      取消单项预约并释放全部资源；系列成员只取消该项；重复取消成功且无变化
   list-bookings --date <YYYY-MM-DD>
-      列出与该日相交的预约（含跨日、已取消），按开始时间再按标识排序
+      列出与该日相交的预约（含跨日、已取消、系列成员），按开始时间再按标识排序
+
+系列命令（按周重复，成员即普通预约）:
+  create-series --resource <标识> [--resource <标识> ...] \\
+      --start <首项开始> --end <首项结束> --count <正整数次数>
+      自首项起每项相对前一项后移 7 个营业地日历日（时刻、跨日长度不变），
+      次数含首项，全部成员使用相同资源；返回稳定系列标识（如 S0001）及
+      按发生顺序关联的各项预约标识（如 B0001…）。任一项开放不足或冲突则整批失败
+  list-series
+      列出全部系列及其全部成员（按当前开始时间、预约标识排序）、资源、时间与状态，
+      包括单独改期或取消的成员
+  cancel-series <系列标识>
+      整体取消该系列仍有效的成员（含单独改期者）并释放资源，记录保留；
+      已取消成员与无关预约不受影响；重复取消成功且不变，未知系列失败
 
 时间规则:
   日期时间格式 YYYY-MM-DDTHH:mm，查询日期 YYYY-MM-DD；
   为与机器时区无关的营业地时间，日期必须真实有效，结束晚于开始，允许跨日；
+  按周移动按营业地日历日计算，跨月、闰日、跨年均准确，结果须落在 0001-9999 年内；
   区间左闭右开：一个预约的结束恰为另一预约的开始不算冲突；
   开放区间重叠或相接视为连续开放，预约须被每个所选资源的开放区间完整覆盖；
   仅当存在共同资源且时间重叠时预约才冲突。
 
 退出码:
   0  成功
-  1  业务失败（名称为空、未知/重复资源、时间非法、开放不足、冲突、数据文件损坏等）
-  2  用法错误（未知参数、缺少必需选项等）
+  1  业务失败（名称为空、未知/重复资源、时间非法、开放不足、冲突、
+     非法次数、超出四位年份、未知系列、数据文件损坏等）
+  2  用法错误（未知参数、缺少必需选项、多余位置参数等）
 
 示例:
   node app.ts add-resource --type 场地 --name 一号会议室 \\
-      --open 2026-10-05T09:00/2026-10-05T18:00
+      --open 2026-01-01T00:00/2027-01-01T00:00
   node app.ts create-booking --resource R0001 \\
       --start 2026-10-05T10:00 --end 2026-10-05T11:00
-  node app.ts reschedule-booking B0001 --start 2026-10-05T14:00 --end 2026-10-05T15:00
-  node app.ts list-bookings --date 2026-10-05
-  node app.ts cancel-booking B0001
+  node app.ts create-series --resource R0001 \\
+      --start 2026-10-05T10:00 --end 2026-10-05T11:00 --count 4
+  node app.ts list-series
+  node app.ts reschedule-booking B0002 --start 2026-10-12T14:00 --end 2026-10-12T15:00
+  node app.ts list-bookings --date 2026-10-12
+  node app.ts cancel-series S0001
 `;
 
 let activeDataFile = DEFAULT_DATA_FILE;
@@ -739,7 +1075,7 @@ async function main(): Promise<void> {
       await cmdAddResource(commandArgs);
       break;
     case 'list-resources':
-      await cmdListResources();
+      await cmdListResources(commandArgs);
       break;
     case 'create-booking':
       await cmdCreateBooking(commandArgs);
@@ -752,6 +1088,15 @@ async function main(): Promise<void> {
       break;
     case 'list-bookings':
       await cmdListBookings(commandArgs);
+      break;
+    case 'create-series':
+      await cmdCreateSeries(commandArgs);
+      break;
+    case 'list-series':
+      await cmdListSeries(commandArgs);
+      break;
+    case 'cancel-series':
+      await cmdCancelSeries(commandArgs);
       break;
     default:
       throw new UsageError(`未知命令: ${command}`);
