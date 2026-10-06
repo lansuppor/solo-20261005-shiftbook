@@ -26,8 +26,17 @@
 // 多项预约目标（系列成员、批量改期目标、撤销恢复安排、导入新事件）的可行性
 // 校验统一由 validateBatchTargets 完成（无写入副作用），各入口只负责展开
 // 目标、给出需排除的当前占用，并按各自业务定位与顺序渲染诊断。
+//
+// 多进程写入保护：所有修改入口以同一数据文件为单位互斥（保护文件
+// <数据文件>.lock，O_EXCL 创建），取得保护后才读取数据，业务校验、分配标识
+// 与原子保存全程持有；相对/绝对/含 ./.. 的等价路径共享同一保护。竞争最多
+// 等待 5 秒，超时以退出码 1 报告占用；查询不等待保护。进程异常退出留下的
+// 残留保护由 recover-lock 在确认原写入进程已退出后解除。
 
-import {readFile, writeFile, rename, unlink} from 'node:fs/promises';
+import {readFileSync, unlinkSync} from 'node:fs';
+import {open, readFile, writeFile, rename, unlink} from 'node:fs/promises';
+import {createHash, randomUUID} from 'node:crypto';
+import {basename, dirname, join, resolve} from 'node:path';
 
 const APP = 'shiftbook';
 const DEFAULT_DATA_FILE = 'shiftbook-data.json';
@@ -990,6 +999,135 @@ async function saveStore(file: string, store: Store): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// 多进程写入保护（同一数据文件互斥）
+//
+// 保护文件为 <数据文件解析路径>.lock，以 O_EXCL 原子创建：存在即被占用。
+// 路径先 resolve 再派生，因此相对路径、绝对路径及含 ./.. 的等价路径共享同一
+// 保护；不同数据文件的保护文件不同，互不阻挡；数据文件尚不存在时同样受保护。
+// 修改入口在读取数据之前取得保护，业务校验、分配标识与原子保存全程持有，
+// 正常结束、校验失败或保存失败都释放本次保护。竞争可等待，但最多
+// LOCK_WAIT_TIMEOUT_MS 毫秒，超时以业务失败（退出码 1）报告占用，可重试。
+// 查询入口不取得保护：保存先写临时文件再原子改名，查询只可能读到提交前或
+// 提交后的完整快照。进程异常退出留下的残留保护不被抢占（不按持有时长），
+// 仅 recover-lock 在确认原写入进程已退出后解除。
+// ---------------------------------------------------------------------------
+
+const LOCK_WAIT_TIMEOUT_MS = 5000; // 取得写入保护的最长等待（含重试）
+const LOCK_RETRY_INTERVAL_MS = 40; // 占用重试间隔
+
+// 数据文件 -> 保护文件路径；同一解析路径恒得同一保护文件
+function lockPathFor(dataFile: string): string {
+  const resolved = resolve(dataFile);
+  const normal = `${resolved}.lock`;
+  // 文件名长度受限时（如 255 字节的数据文件名，追加 .lock 会超限），
+  // 改用解析路径散列命名，同一数据文件仍共享同一保护
+  if (Buffer.byteLength(basename(normal)) <= 250) return normal;
+  const hash = createHash('sha256').update(resolved).digest('hex').slice(0, 32);
+  return join(dirname(resolved), `.shiftbook-${hash}.lock`);
+}
+
+interface HeldLock {
+  path: string;
+  token: string; // 本次取得的唯一标记，释放时据此确认仍归本进程持有
+}
+
+let heldLock: HeldLock | null = null;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// 取得当前数据文件的写入保护（幂等：同一进程重复调用直接返回）。
+// 占用时等待重试，超过 5 秒仍未取得则抛出 BizError（退出码 1），可重试。
+async function acquireDataLock(dataFile: string): Promise<void> {
+  const lockPath = lockPathFor(dataFile);
+  if (heldLock !== null) {
+    if (heldLock.path === lockPath) return;
+    throw new Error('内部错误：一个进程一次只保护一个数据文件');
+  }
+  const token = `${process.pid}-${randomUUID()}`;
+  const content =
+    JSON.stringify({
+      pid: process.pid,
+      token,
+      dataFile: resolve(dataFile),
+      acquiredAt: new Date().toISOString(),
+    }) + '\n';
+  const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+  for (;;) {
+    try {
+      const handle = await open(lockPath, 'wx');
+      try {
+        await handle.writeFile(content);
+      } finally {
+        await handle.close();
+      }
+      heldLock = {path: lockPath, token};
+      break;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST') {
+        if (Date.now() >= deadline) {
+          throw new BizError(
+            `数据文件 ${dataFile} 正被其他进程占用` +
+              `（等待 ${LOCK_WAIT_TIMEOUT_MS / 1000} 秒仍未取得写入保护），本次未做任何改动；` +
+              '请稍后重试。若确认原写入进程已退出，可使用 recover-lock 解除残留保护。',
+          );
+        }
+        await sleep(LOCK_RETRY_INTERVAL_MS);
+        continue;
+      }
+      throw new BizError(
+        `无法取得数据文件 ${dataFile} 的写入保护：${(err as Error).message}（本次未做任何改动）`,
+      );
+    }
+  }
+  // 测试钩子（SHIFTBOOK_LOCK_HOLD_MS）：取得保护后停留指定毫秒，
+  // 用于回归测试可重复地制造多进程竞争与“持有者被异常终止”的现场
+  const holdMs = Number(process.env.SHIFTBOOK_LOCK_HOLD_MS ?? '0');
+  if (Number.isFinite(holdMs) && holdMs > 0) await sleep(holdMs);
+}
+
+// 释放本次取得的保护。只删除确认仍由本进程持有的保护文件（标记一致），
+// 绝不误删其他进程后来取得的保护；保护已不存在或内容无法辨认时保守不动。
+function releaseDataLock(): void {
+  const held = heldLock;
+  if (held === null) return;
+  heldLock = null;
+  let current: string;
+  try {
+    current = readFileSync(held.path, 'utf8');
+  } catch {
+    return; // 已不存在或不可读：不归本次清理
+  }
+  try {
+    const info = JSON.parse(current) as {token?: unknown};
+    if (info.token !== held.token) return; // 已被他人取得，不得删除
+  } catch {
+    return; // 内容无法辨认：可能已被替换，保守不删
+  }
+  try {
+    unlinkSync(held.path);
+  } catch {
+    // 已被他人清理：忽略
+  }
+}
+
+// 正常退出（含 main 的 finally 之后）兜底释放；异常信号终止不触发，
+// 残留保护由 recover-lock 处理
+process.on('exit', releaseDataLock);
+
+// 进程是否仍存活；EPERM 表示存在但无权发信号，同样视为存活（无法确认已退出）
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 业务校验
 // ---------------------------------------------------------------------------
 
@@ -1328,6 +1466,7 @@ async function cmdAddResource(args: string[]): Promise<void> {
   });
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
   // 全部校验通过后才生成标识、改内存、落盘
   store.resourceSeq += 1;
@@ -1370,6 +1509,7 @@ async function cmdCreateBooking(args: string[]): Promise<void> {
   const endRaw = requireFlag(values, 'end');
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(activeDataFile);
 
   const ids = resolveResourceIds(store, resourceArgs);
@@ -1400,6 +1540,7 @@ async function cmdRescheduleBooking(args: string[]): Promise<void> {
   const id = positionals[0];
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
   const booking = store.bookings.find((b) => b.id === id);
   if (!booking) throw new BizError(`未知预约标识: ${id}`);
@@ -1542,6 +1683,7 @@ async function cmdRescheduleBatch(args: string[]): Promise<void> {
   const manifestFile = positionals[0];
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
   const records = parseManifestShape(await loadManifest(manifestFile), manifestFile);
 
@@ -1802,6 +1944,7 @@ async function cmdUndoBatchOp(args: string[]): Promise<void> {
   if (!/^O\d{4,}$/.test(opId)) throw new BizError(`批量改期操作标识非法: ${opId}`);
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
   const op = store.batchOps.find((x) => x.id === opId);
   if (!op) throw new BizError(`未知批量改期操作标识: ${opId}`);
@@ -1932,6 +2075,7 @@ async function cmdCancelBooking(args: string[]): Promise<void> {
   const id = positionals[0];
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
   const booking = store.bookings.find((b) => b.id === id);
   if (!booking) throw new BizError(`未知预约标识: ${id}`);
@@ -2028,6 +2172,7 @@ async function cmdCreateSeries(args: string[]): Promise<void> {
   const count = parseOccurrences(requireFlag(values, 'count'));
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
 
   const ids = resolveResourceIds(store, resourceArgs);
@@ -2147,6 +2292,7 @@ async function cmdCancelSeries(args: string[]): Promise<void> {
   if (!/^S\d{4,}$/.test(seriesId)) throw new BizError(`系列标识非法: ${seriesId}`);
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
   const series = store.series.find((x) => x.id === seriesId);
   if (!series) throw new BizError(`未知系列标识: ${seriesId}`);
@@ -2203,6 +2349,7 @@ async function cmdAddWaitlist(args: string[]): Promise<void> {
   const endRaw = requireFlag(values, 'end');
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
 
   const ids = resolveResourceIds(store, resourceArgs);
@@ -2284,6 +2431,7 @@ async function cmdAddFlexWaitlist(args: string[]): Promise<void> {
   const durationRaw = requireFlag(values, 'duration');
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
 
   const ids = resolveResourceIds(store, resourceArgs);
@@ -2379,6 +2527,7 @@ async function cmdCancelWaitlist(args: string[]): Promise<void> {
   if (!/^W\d{4,}$/.test(id)) throw new BizError(`候补标识非法: ${id}`);
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
   const w = store.waitlist.find((x) => x.id === id);
   if (!w) throw new BizError(`未知候补标识: ${id}`);
@@ -2439,6 +2588,7 @@ async function cmdProcessWaitlist(args: string[]): Promise<void> {
   }
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
 
   // 已兑现/已取消项永不重新处理；两种候补只按共同的登记顺序遍历等待项
@@ -2614,6 +2764,7 @@ async function cmdAddClosure(args: string[]): Promise<void> {
   const endRaw = requireFlag(values, 'end');
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
 
   const resource = store.resources.find((r) => r.id === resourceId);
@@ -2691,6 +2842,7 @@ async function cmdCancelClosure(args: string[]): Promise<void> {
   if (!/^C\d{4,}$/.test(id)) throw new BizError(`停用标识非法: ${id}`);
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
   const closure = store.closures.find((c) => c.id === id);
   if (!closure) throw new BizError(`未知停用标识: ${id}`);
@@ -3089,6 +3241,7 @@ async function cmdImportIcal(args: string[]): Promise<void> {
   const icalFile = positionals[0];
 
   const file = activeDataFile;
+  await acquireDataLock(file); // 修改入口：先取得互斥保护，再依据最新数据决策
   const store = await loadStore(file);
   // 新事件统一使用该资源集合（至少一个不同的已登记资源，按标识排序）
   const ids = resolveResourceIds(store, resourceArgs);
@@ -3341,6 +3494,88 @@ async function cmdImportIcal(args: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// 本地恢复入口（recover-lock）
+// 仅解除“原写入进程已退出”留下的残留写入保护：持有者仍存活或无法确认时
+// 明确拒绝，不按保护存在时长抢占。解除前重新核对保护内容未变，避免误删
+// 其他进程后来取得的保护。不重放旧命令、不改动业务数据或标识计数。
+// ---------------------------------------------------------------------------
+
+async function cmdRecoverLock(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(
+      `recover-lock 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`,
+    );
+  }
+  if (positionals.length > 0) {
+    throw new UsageError(`recover-lock 不接受位置参数: ${positionals.join(' ')}`);
+  }
+
+  const file = activeDataFile;
+  const lockPath = lockPathFor(file);
+  let text: string;
+  try {
+    text = await readFile(lockPath, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      console.log(`数据文件 ${file} 当前没有写入保护，无需恢复。`);
+      return;
+    }
+    throw new BizError(`无法读取写入保护文件 ${lockPath}: ${(err as Error).message}`);
+  }
+
+  let info: {pid?: unknown};
+  try {
+    info = JSON.parse(text) as {pid?: unknown};
+  } catch {
+    throw new BizError(
+      `写入保护文件 ${lockPath} 内容无法辨认，无法确认原写入进程，拒绝解除（请人工检查该文件）`,
+    );
+  }
+  const pid = info.pid;
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
+    throw new BizError(
+      `写入保护文件 ${lockPath} 缺少有效的持有者进程号，无法确认原写入进程，拒绝解除（请人工检查该文件）`,
+    );
+  }
+  if (processAlive(pid)) {
+    throw new BizError(
+      `数据文件 ${file} 的写入保护由进程 ${pid} 持有且该进程仍存活，拒绝解除` +
+        '（不按保护存在时长抢占）；请等待其结束后重试',
+    );
+  }
+
+  // 原写入进程已退出：解除前重新读取并核对保护内容未变，
+  // 避免误删他人在此期间新取得的保护
+  let again: string;
+  try {
+    again = await readFile(lockPath, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      console.log(`数据文件 ${file} 的写入保护已被解除，无需恢复。`);
+      return;
+    }
+    throw new BizError(`无法读取写入保护文件 ${lockPath}: ${(err as Error).message}`);
+  }
+  if (again !== text) {
+    throw new BizError(`写入保护在检查期间已被更换，无法确认仍为残留保护，拒绝解除；请稍后重试`);
+  }
+  try {
+    await unlink(lockPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      console.log(`数据文件 ${file} 的写入保护已被解除，无需恢复。`);
+      return;
+    }
+    throw new BizError(`解除数据文件 ${file} 的写入保护失败：${(err as Error).message}`);
+  }
+  console.log(
+    `已解除数据文件 ${file} 的残留写入保护（原写入进程 ${pid} 已退出）；` +
+      '未重放任何命令，业务数据与标识计数不变。',
+  );
+}
+
+// ---------------------------------------------------------------------------
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
@@ -3499,6 +3734,21 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
         END:VEVENT
         END:VCALENDAR
 
+并发与恢复:
+  recover-lock
+      本地恢复入口：仅当确认原写入进程已退出时，解除该数据文件残留的写入
+      保护；持有者仍存活或无法确认时明确拒绝（不按保护存在时长抢占）；
+      不重放旧命令，不改动业务数据或标识计数
+
+多进程写入保护:
+  所有修改入口以同一数据文件为单位互斥：取得保护后才读取数据，业务校验、
+  分配标识与原子保存全程持有保护，正常结束、校验失败或保存失败均释放。
+  相对路径、绝对路径及含 ./.. 的等价路径共享同一保护；不同数据文件互不
+  阻挡；数据文件尚不存在时同样受保护。竞争时最多等待 5 秒，超时以退出码
+  1 报告文件正被占用（未做任何改动，可重试）。查询命令不等待保护，只读取
+  提交前或提交后的完整快照。进程异常退出可能留下残留保护：确认原写入进程
+  已退出后用 recover-lock 解除。
+
 实际可用时间:
   资源的实际可用时间 = 原开放区间合并后扣除全部有效停用区间的并集（原开放
   记录保留）。创建预约、单项及批量改期、创建系列、登记及处理候补均按实际
@@ -3551,7 +3801,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
      不一致或恢复安排受阻、iCalendar 文件不可读/结构非法（含重复规则或
      EXDATE 非法、无规则带 EXDATE、全部排除、展开超出四位年份）、UID 与
      首次导入不一致、新事件开放不足或冲突、数据文件损坏（含候补、停用、
-     批量改期或导入记录结构、引用或快照非法）或保存失败等）
+     批量改期或导入记录结构、引用或快照非法）、数据文件正被其他进程占用
+     （5 秒内未取得写入保护）、活跃写入保护的恢复被拒绝或保存失败等）
   2  用法错误（未知参数、缺少必需选项、多余位置参数等）
 
 示例:
@@ -3580,6 +3831,7 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   node app.ts list-closures
   node app.ts cancel-closure C0001
   node app.ts import-ical ./events.ics --resource R0001 --resource R0002
+  node app.ts recover-lock
 `;
 
 let activeDataFile = DEFAULT_DATA_FILE;
@@ -3658,17 +3910,27 @@ async function main(): Promise<void> {
     case 'import-ical':
       await cmdImportIcal(commandArgs);
       break;
+    case 'recover-lock':
+      await cmdRecoverLock(commandArgs);
+      break;
     default:
       throw new UsageError(`未知命令: ${command}`);
   }
 }
 
-main().catch((err: unknown) => {
-  if (err instanceof UsageError) {
-    process.stderr.write(`${APP}: ${err.message}\n使用 --help 查看用法。\n`);
-    process.exit(2);
-  }
-  const message = err instanceof BizError ? err.message : (err as Error).stack ?? String(err);
-  process.stderr.write(`${APP}: ${message}\n`);
-  process.exit(1);
-});
+main()
+  .catch((err: unknown) => {
+    if (err instanceof UsageError) {
+      process.stderr.write(`${APP}: ${err.message}\n使用 --help 查看用法。\n`);
+      process.exitCode = 2;
+      return;
+    }
+    const message = err instanceof BizError ? err.message : (err as Error).stack ?? String(err);
+    process.stderr.write(`${APP}: ${message}\n`);
+    process.exitCode = 1;
+  })
+  .finally(() => {
+    // 正常结束、校验失败与保存失败都在此释放本次写入保护；
+    // 进程被异常终止（不经过此处）留下的残留保护由 recover-lock 处理
+    releaseDataLock();
+  });
