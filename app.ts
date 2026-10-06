@@ -19,6 +19,11 @@
 // 可任选其一的候选资源）寻找能同时满足全部需求的最早连续时段——每组恰选一
 // 个候选，全部所选资源互不相同并全程保持同一组合；只读快照，不写数据文件。
 //
+// 使用率统计：usage-stats 在营业地时间窗口内统计所选资源（缺省为全部已登记
+// 资源）的实际可用、占用与空闲分钟及使用率（逐日明细、整窗汇总与全部所选
+// 合计），并给出窗口内同时被占用的所选资源数量峰值及全部达到峰值的最大
+// 连续区间；只读一份完整快照，不写数据文件、不推进计数。
+//
 // iCalendar 导入：import-ical 读取本地 UTF-8 的 VCALENDAR（VERSION:2.0），
 // 为每个新 VEVENT 创建预约（统一使用命令行给定的资源集合，不自动处理候补）：
 // 无 RRULE 的独立事件创建一项普通预约；带 RRULE:FREQ=WEEKLY;COUNT=n 的事件创建
@@ -3148,6 +3153,148 @@ async function cmdFindSlot(args: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// 资源使用率与繁忙时段统计（usage-stats，只读）
+//
+// 在营业地时间窗口内统计所选资源（缺省为全部已登记资源）的实际使用情况：
+// 每个资源的实际可用 = 开放区间合并重叠或相接后扣除有效停用并集，再裁剪到
+// 窗口；占用只计有效预约的当前时间与当前资源，并取其与实际可用区间的交集
+// （普通预约、系列成员、导入预约与候补兑现预约同口径；已取消预约/停用、
+// 未兑现候补、导入首次请求快照与改期历史快照均不计入），同一资源的重叠
+// 占用合并后一分钟只计一次，多资源预约在每个所选资源分别计时。逐日明细
+// 覆盖与窗口有正长度交集的全部营业日期（按营业地午夜拆分，首尾不足一天
+// 只计窗口内部分，含零可用或零占用的所选资源），按日期再按资源标识排序；
+// 整窗按资源汇总，并汇总全部所选资源的资源分钟（使用率 = 总占用/总可用，
+// 不平均各项百分比）。另给出窗口内同时被占用的所选资源数量峰值及全部
+// 达到峰值的最大连续区间（资源而非预约计数，端点交接不制造瞬时重叠，
+// 相接的峰值段合并，无占用时峰值为零且不列区间）。本命令只读一份完整
+// 快照：不取写入保护、不写数据文件、不推进任何计数。
+// ---------------------------------------------------------------------------
+
+// 使用率文本：占用/可用的百分比四舍五入至两位小数；分母为零显示“不适用”
+function formatUsageRate(occupied: number, available: number): string {
+  if (available === 0) return '不适用';
+  return `${(Math.round((occupied * 10000) / available) / 100).toFixed(2)}%`;
+}
+
+function totalMinutes(segments: Array<[number, number]>): number {
+  return segments.reduce((acc, [s, e]) => acc + (e - s), 0);
+}
+
+async function cmdUsageStats(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, ['window', 'resource'], ['resource']);
+  if (positionals.length > 0) throw new UsageError(`usage-stats 不接受位置参数: ${positionals.join(' ')}`);
+  const windowRaw = requireFlag(values, 'window');
+  const resourceArgs = values.get('resource') ?? [];
+
+  // 统计只读一份完整快照：不取写入保护、不写数据文件、不推进任何计数
+  const store = await loadStore(activeDataFile);
+  const win = parseFlexWindow(windowRaw, '统计窗口');
+
+  let ids: string[];
+  if (resourceArgs.length === 0) {
+    // 未选择时统计全部已登记资源；名册为空明确提示并退出 0
+    if (store.resources.length === 0) {
+      console.log('当前没有任何已登记资源，无可统计对象。可使用 add-resource 登记场地、设备或人员。');
+      return;
+    }
+    ids = store.resources.map((r) => r.id);
+  } else {
+    ids = resolveResourceIds(store, resourceArgs); // 未知或重复资源拒绝
+  }
+
+  // 每个所选资源：实际可用区间（裁进窗口）与占用区间（有效预约 ∩ 实际可用，合并）
+  const perResource = ids.map((id) => {
+    const r = store.resources.find((x) => x.id === id)!;
+    const available = clipSegments(availableSegmentsOf(store, r), win.startMin, win.endMin);
+    const busy: Array<[number, number]> = [];
+    for (const b of store.bookings) {
+      if (b.status !== 'active') continue;
+      if (!b.resourceIds.includes(id)) continue;
+      const bStart = parseDateTime(b.start, '预约开始时间');
+      const bEnd = parseDateTime(b.end, '预约结束时间');
+      const a = Math.max(bStart, win.startMin);
+      const c = Math.min(bEnd, win.endMin);
+      if (a < c) busy.push([a, c]);
+    }
+    const occupied = intersectSegments(available, mergeIntervals(busy));
+    return {r, available, occupied};
+  });
+
+  // 与窗口有正长度交集的全部营业日期（按午夜拆分，首尾不足一天只计窗口内部分）
+  const days: Array<{date: string; start: number; end: number}> = [];
+  for (let d = Math.floor(win.startMin / 1440) * 1440; d < win.endMin; d += 1440) {
+    const s = Math.max(d, win.startMin);
+    const e = Math.min(d + 1440, win.endMin);
+    if (s < e) days.push({date: formatDateTime(d)!.slice(0, 10), start: s, end: e});
+  }
+
+  console.log(`资源使用率与繁忙时段统计（窗口 ${win.start} → ${win.end}，共 ${ids.length} 个所选资源）：`);
+
+  console.log('逐日明细（按日期、资源标识排序；按营业地午夜拆分，首尾不足一天只计窗口内部分）：');
+  for (const day of days) {
+    for (const {r, available, occupied} of perResource) {
+      const av = totalMinutes(intersectSegments(available, [[day.start, day.end]]));
+      const oc = totalMinutes(intersectSegments(occupied, [[day.start, day.end]]));
+      console.log(
+        `- ${day.date} ${r.id}（${r.name}，${RESOURCE_TYPE_LABEL[r.type]}）：` +
+          `可用 ${av} 分钟，占用 ${oc} 分钟，空闲 ${av - oc} 分钟，使用率 ${formatUsageRate(oc, av)}`,
+      );
+    }
+  }
+
+  console.log('整窗汇总（按资源标识排序）：');
+  let totalAvailable = 0;
+  let totalOccupied = 0;
+  for (const {r, available, occupied} of perResource) {
+    const av = totalMinutes(available);
+    const oc = totalMinutes(occupied);
+    totalAvailable += av;
+    totalOccupied += oc;
+    console.log(
+      `- ${r.id}（${r.name}，${RESOURCE_TYPE_LABEL[r.type]}）：` +
+        `可用 ${av} 分钟，占用 ${oc} 分钟，空闲 ${av - oc} 分钟，使用率 ${formatUsageRate(oc, av)}`,
+    );
+  }
+  console.log(
+    `全部所选资源合计：可用 ${totalAvailable} 资源分钟，占用 ${totalOccupied} 资源分钟，` +
+      `空闲 ${totalAvailable - totalOccupied} 资源分钟，` +
+      `使用率 ${formatUsageRate(totalOccupied, totalAvailable)}（总占用/总可用，不平均各项百分比）`,
+  );
+
+  // 同时被占用的所选资源数量峰值：扫描线计数（资源而非预约；区间左闭右开，
+  // 端点交接不制造瞬时重叠）；达到峰值的相邻段合并为最大连续区间
+  const events = new Map<number, number>();
+  for (const {occupied} of perResource) {
+    for (const [s, e] of occupied) {
+      events.set(s, (events.get(s) ?? 0) + 1);
+      events.set(e, (events.get(e) ?? 0) - 1);
+    }
+  }
+  const times = [...events.keys()].sort((a, b) => a - b);
+  let count = 0;
+  let peak = 0;
+  for (let i = 0; i + 1 < times.length; i++) {
+    count += events.get(times[i])!;
+    if (count > peak) peak = count;
+  }
+  if (peak === 0) {
+    console.log('繁忙峰值：窗口内所选资源没有任何占用（峰值为 0，无峰值区间）。');
+    return;
+  }
+  count = 0;
+  const peakSegs: Array<[number, number]> = [];
+  for (let i = 0; i + 1 < times.length; i++) {
+    count += events.get(times[i])!;
+    if (count === peak) peakSegs.push([times[i], times[i + 1]]);
+  }
+  console.log(`繁忙峰值：窗口内同时被占用的所选资源数量峰值为 ${peak}`);
+  console.log('达到峰值的全部最大连续区间（按开始时间排序）：');
+  for (const [s, e] of mergeIntervals(peakSegs)) {
+    console.log(`- ${formatDateTime(s)} → ${formatDateTime(e)}（${e - s} 分钟）`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 资源临时停用：场地维护、设备检修、人员休息
 // 实际可用时间 = 原开放区间合并后扣除全部有效停用区间的并集（原开放记录保留）
 // ---------------------------------------------------------------------------
@@ -3896,7 +4043,7 @@ async function cmdImportIcal(args: string[]): Promise<void> {
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用、批量改期记录与安全撤销、iCalendar 导入，以及候选资源组合的最早可行时段查询）
+const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用、批量改期记录与安全撤销、iCalendar 导入、候选资源组合的最早可行时段查询，以及资源使用率与繁忙时段统计）
 
 用法:
   node app.ts [--data <数据文件>] <命令> [选项]
@@ -4009,6 +4156,27 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       时长的方案。本命令只读一份完整数据快照：不等待写入保护、不创建预约
       或任何记录、不写数据文件或推进计数；方案不保留位置，后续创建预约仍
       检查最新状态
+
+统计命令（资源使用率与繁忙时段，只读不写）:
+  usage-stats --window <开始/结束> [--resource <标识> [--resource <标识> ...]]
+      统计窗口（YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm，真实有效、结束晚于开始、
+      允许跨日、与机器时区无关，左闭右开）内所选资源的实际使用情况；未指定
+      --resource 时统计全部已登记资源（名册为空明确提示并退出 0），未知或
+      重复资源拒绝。每个资源的实际可用 = 开放区间合并重叠或相接后扣除有效
+      停用并集，再裁剪到窗口；占用只计有效预约的当前时间与当前资源，并取
+      其与实际可用区间的交集，同一资源的重叠占用合并后一分钟只计一次
+      （普通预约、系列成员、导入预约与候补兑现预约同口径；已取消预约/停用、
+      未兑现候补、导入首次请求快照与改期历史快照不计入；多资源预约在每个
+      所选资源分别计时）。逐日明细覆盖与窗口有正长度交集的全部营业日期
+      （按营业地午夜拆分，首尾不足一天只计窗口内部分，含零可用或零占用的
+      所选资源），按日期再按资源标识排序，逐行显示标识、名称、类型及可用/
+      占用/空闲分钟与使用率（空闲 = 可用 - 占用；使用率 = 占用/可用，百分比
+      四舍五入至两位小数，分母为零显示不适用）；整窗按资源汇总，并汇总全部
+      所选资源的资源分钟（使用率 = 总占用/总可用，不平均各项百分比）。另
+      显示窗口内同时被占用的所选资源数量峰值及全部达到峰值的最大连续区间
+      （按开始时间排序；资源而非预约计数，端点交接不制造瞬时重叠，相接的
+      峰值段合并，无占用时峰值为零且不列区间）。本命令只读一份完整数据
+      快照：不等待或改动写入保护，不写数据文件或推进计数
 
 停用命令（场地维护、设备检修、人员休息）:
   add-closure --resource <标识> --start <YYYY-MM-DDTHH:mm> --end <YYYY-MM-DDTHH:mm>
@@ -4244,6 +4412,9 @@ async function main(): Promise<void> {
         break;
       case 'find-slot':
         await cmdFindSlot(commandArgs);
+        break;
+      case 'usage-stats':
+        await cmdUsageStats(commandArgs);
         break;
       case 'add-closure':
         await cmdAddClosure(commandArgs);
