@@ -5,13 +5,16 @@
 // - 使用 Node.js 24 内置测试运行器（node:test），无外部依赖、不访问网络；
 // - 全部经命令行入口（node app.ts --data <临时文件>）操作，不读取用户默认数据文件；
 // - 并发场景由真实并行子进程竞争同一数据文件（不以连续调用代替竞争）；
+// - 交接场景（取得/释放/恢复）用真实子进程加明确同步点（SHIFTBOOK_TEST_SYNC_DIR
+//   测试钩子）控制交错时序，并真正终止持有保护的业务进程与协调中的恢复进程
+//   （不以构造已退出 PID 或随机延时代替）；
 // - 每个场景使用独立临时数据目录，最终安排与关联由新进程查询并核对文件与计数；
 // - 任一断言失败即非零退出，输出中标注场景与步骤；结束后自动清理临时文件。
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {spawn, spawnSync, type ChildProcess} from 'node:child_process';
-import {mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync, realpathSync} from 'node:fs';
+import {mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync, realpathSync} from 'node:fs';
 import {tmpdir, hostname} from 'node:os';
 import {join, dirname, basename, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -51,6 +54,46 @@ function runCliAsync(dataFile: string, args: string[], cwd?: string): Promise<Cl
   });
 }
 
+// 可中途终止的真实子进程：返回句柄与结果 Promise；env 用于注入测试同步点目录
+// （SHIFTBOOK_TEST_SYNC_DIR，应用内测试钩子在指定交接点写 ready 标记并等待 go 标记）
+function spawnCli(
+  dataFile: string,
+  args: string[],
+  env?: Record<string, string>,
+): {child: ChildProcess; result: Promise<CliResult>} {
+  const child = spawn(process.execPath, [APP, '--data', dataFile, ...args], {
+    encoding: 'utf8',
+    env: {...process.env, ...env},
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (d) => (stdout += d));
+  child.stderr.on('data', (d) => (stderr += d));
+  const result = new Promise<CliResult>((resolveP, reject) => {
+    child.on('error', reject);
+    child.on('close', (status) => resolveP({status: status ?? -1, stdout, stderr}));
+  });
+  return {child, result};
+}
+
+// 明确同步点：等待子进程在交接点写下的 ready 标记出现（非随机延时）
+async function waitForSyncPoint(path: string, ctx: string, timeoutMs = 15000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() > deadline) throw new Error(`等待同步点超时: ${ctx}（${path}）`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+// 真正终止子进程（SIGKILL）并等待其退出；进程结束时来不及执行任何释放逻辑
+function killAndWait(child: ChildProcess): Promise<void> {
+  return new Promise((resolveP) => {
+    if (child.exitCode !== null || child.signalCode !== null) return resolveP();
+    child.once('close', () => resolveP());
+    child.kill('SIGKILL');
+  });
+}
+
 function ok(df: string, args: string[], ctx: string): CliResult {
   const r = runCli(df, args);
   assert.equal(
@@ -87,6 +130,11 @@ function lockPathOf(df: string, cwd?: string): string {
     canonical = join(realpathSync(dirname(abs)), basename(abs));
   }
   return `${canonical}.lock`;
+}
+
+// 与应用一致的恢复协调文件路径：<锁文件>.recover
+function recoveryPathOf(df: string, cwd?: string): string {
+  return `${lockPathOf(df, cwd)}.recover`;
 }
 
 // 用一个真实存活进程持有指定数据文件的写入保护；release 结束该进程并等待其退出
@@ -134,7 +182,9 @@ function deadPid(): Promise<number> {
 }
 
 function leftoverLocks(dir: string): string[] {
-  return readdirSync(dir).filter((n) => n.endsWith('.lock') || n.startsWith('.shiftbook-'));
+  return readdirSync(dir).filter(
+    (n) => n.endsWith('.lock') || n.endsWith('.recover') || n.startsWith('.shiftbook-'),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -518,4 +568,222 @@ test('进程终止后的恢复：残留保护可解除，数据为提交前或�
   assert.equal(store.bookings.length, 1);
   assert.equal(store.bookingSeq, 1);
   assert.deepEqual(leftoverLocks(dir), [], '不残留锁文件');
+});
+
+// ---------------------------------------------------------------------------
+// 10. 正常释放交接：释放只解除本次取得的保护，等待者随后取得并提交
+// ---------------------------------------------------------------------------
+
+test('正常释放交接：释放只作用于本次取得的保护，等待中的写入者随后取得并提交', async (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '甲'); // R0001
+  const sync1 = join(dir, 'sync1');
+  const sync2 = join(dir, 'sync2');
+  mkdirSync(sync1);
+  mkdirSync(sync2);
+
+  // W1 取得保护后停在同步点（真实持锁的修改进程）
+  const w1 = spawnCli(
+    df,
+    ['create-booking', '--resource', 'R0001', '--start', '2026-10-12T09:00', '--end', '2026-10-12T10:00'],
+    {SHIFTBOOK_TEST_SYNC_DIR: sync1},
+  );
+  t.after(() => {
+    w1.child.kill('SIGKILL');
+  });
+  await waitForSyncPoint(join(sync1, 'write-lock-acquired.ready'), 'W1 取得保护');
+
+  // W2 真实并行竞争同一数据文件：在 W1 持锁期间等待
+  const w2 = spawnCli(
+    df,
+    ['create-booking', '--resource', 'R0001', '--start', '2026-10-12T10:00', '--end', '2026-10-12T11:00'],
+    {SHIFTBOOK_TEST_SYNC_DIR: sync2},
+  );
+  t.after(() => {
+    w2.child.kill('SIGKILL');
+  });
+
+  // W1 正常结束：提交并释放本次保护；W2 随后取得保护并停在自己的同步点
+  writeFileSync(join(sync1, 'write-lock-acquired.go'), 'go');
+  const r1 = await w1.result;
+  assert.equal(r1.status, 0, `[释放交接] W1 应成功\nstderr:\n${r1.stderr}`);
+  await waitForSyncPoint(join(sync2, 'write-lock-acquired.ready'), 'W2 取得保护');
+  // W1 的释放没有误删 W2 取得的保护：锁文件内容属于 W2
+  const held = JSON.parse(readFileSync(lockPathOf(df), 'utf8'));
+  assert.equal(held.pid, w2.child.pid, 'W1 释放后保护应属于 W2（释放只删除自己取得的那份）');
+
+  // W2 继续提交成功，两项预约都保留
+  writeFileSync(join(sync2, 'write-lock-acquired.go'), 'go');
+  const r2 = await w2.result;
+  assert.equal(r2.status, 0, `[释放交接] W2 应成功\nstderr:\n${r2.stderr}`);
+  const store = readStore(df);
+  assert.equal(store.bookings.length, 2, '两次提交都保留');
+  assert.equal(store.bookingSeq, 2, '预约计数与记录一致');
+  // 由新进程查询最终安排
+  const day = ok(df, ['list-bookings', '--date', '2026-10-12'], '释放交接后按日查询');
+  assert.match(day.stdout, /共 2 条/);
+  assert.deepEqual(leftoverLocks(dir), [], '不残留锁或协调文件');
+});
+
+// ---------------------------------------------------------------------------
+// 11. 恢复交接竞态：两个恢复请求与新写入者交错，恢复只解除确认的那次保护
+// ---------------------------------------------------------------------------
+
+test('恢复交接：交错的两个恢复与新写入者，恢复不误删新保护，第三写入者不能越过', async (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '甲'); // R0001
+  ok(df, ['create-booking', '--resource', 'R0001', '--start', '2026-10-12T09:00', '--end', '2026-10-12T10:00'], '预约 B0001');
+  const bytesBefore = readFileSync(df);
+  const lockPath = lockPathOf(df);
+  const recoveryPath = recoveryPathOf(df);
+
+  // 真实业务修改进程 W0 取得保护后被真正终止（非构造的已退出 PID）→ 残留保护
+  const sync0 = join(dir, 'sync0');
+  mkdirSync(sync0);
+  const w0 = spawnCli(
+    df,
+    ['create-booking', '--resource', 'R0001', '--start', '2026-10-12T10:00', '--end', '2026-10-12T11:00'],
+    {SHIFTBOOK_TEST_SYNC_DIR: sync0},
+  );
+  t.after(() => {
+    w0.child.kill('SIGKILL');
+  });
+  await waitForSyncPoint(join(sync0, 'write-lock-acquired.ready'), 'W0 取得保护');
+  await killAndWait(w0.child);
+  assert.ok(existsSync(lockPath), 'W0 被终止后留下残留保护');
+  assert.ok(bytesBefore.equals(readFileSync(df)), 'W0 被终止时数据保持提交前的完整快照');
+
+  // 恢复 R1：确认 W0 退出、持有恢复互斥后，在删除前停在同步点
+  const syncR1 = join(dir, 'syncR1');
+  mkdirSync(syncR1);
+  const r1 = spawnCli(df, ['recover-lock'], {SHIFTBOOK_TEST_SYNC_DIR: syncR1});
+  t.after(() => {
+    r1.child.kill('SIGKILL');
+  });
+  await waitForSyncPoint(join(syncR1, 'recover-before-unlock.ready'), 'R1 删除前同步点');
+  assert.ok(existsSync(recoveryPath), 'R1 持有恢复协调文件');
+
+  // 交错的恢复 R2：恢复互斥被占用 → 退出 1，锁与协调文件都保持
+  const r2 = runCli(df, ['recover-lock']);
+  assert.equal(r2.status, 1, `[恢复交错] R2 不应重复解除\nstdout:\n${r2.stdout}`);
+  assert.match(r2.stderr, /另一恢复进程/);
+  assert.ok(existsSync(lockPath), 'R2 不得删除残留保护');
+  assert.ok(existsSync(recoveryPath), 'R2 不得删除他人的恢复协调文件');
+
+  // R1 继续：解除 W0 的残留保护并正常释放恢复互斥
+  writeFileSync(join(syncR1, 'recover-before-unlock.go'), 'go');
+  const r1r = await r1.result;
+  assert.equal(r1r.status, 0, `[恢复交接] R1 应成功\nstderr:\n${r1r.stderr}`);
+  assert.match(r1r.stdout, /已解除/);
+  assert.ok(!existsSync(lockPath), 'R1 解除了确认的那次残留保护');
+  assert.ok(!existsSync(recoveryPath), 'R1 正常结束释放恢复互斥');
+  assert.ok(bytesBefore.equals(readFileSync(df)), '恢复不改业务数据');
+
+  // 新写入者 W1 取得保护（停在同步点持锁）
+  const syncW1 = join(dir, 'syncW1');
+  mkdirSync(syncW1);
+  const w1 = spawnCli(
+    df,
+    ['create-booking', '--resource', 'R0001', '--start', '2026-10-12T10:00', '--end', '2026-10-12T11:00'],
+    {SHIFTBOOK_TEST_SYNC_DIR: syncW1},
+  );
+  t.after(() => {
+    w1.child.kill('SIGKILL');
+  });
+  await waitForSyncPoint(join(syncW1, 'write-lock-acquired.ready'), 'W1 取得新保护');
+  const held = JSON.parse(readFileSync(lockPath, 'utf8'));
+  assert.equal(held.pid, w1.child.pid, '新保护属于 W1');
+
+  // 较早的恢复请求不得删除新保护：发现目标更替（新写入者存活）→ 退出 1 说明原因
+  const r3 = runCli(df, ['recover-lock']);
+  assert.equal(r3.status, 1, `[目标更替] 新写入者存活时恢复应拒绝\nstdout:\n${r3.stdout}`);
+  assert.match(r3.stderr, /拒绝解除/);
+  assert.ok(existsSync(lockPath), '新写入者的保护不得被误删');
+  assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')).pid, w1.child.pid, '新保护仍属于 W1');
+
+  // 第三写入者不能越过新保护：5 秒内未取得即失败，不产生记录、不消耗标识
+  const w3 = runCli(df, [
+    'create-booking', '--resource', 'R0001', '--start', '2026-10-12T11:00', '--end', '2026-10-12T12:00',
+  ]);
+  assert.equal(w3.status, 1, `[第三写入者] 不应越过新保护\nstdout:\n${w3.stdout}`);
+  assert.match(w3.stderr, /正被其他进程占用/);
+
+  // W1 继续提交：已保存预约不丢失，第三写入者未留下任何记录
+  writeFileSync(join(syncW1, 'write-lock-acquired.go'), 'go');
+  const w1r = await w1.result;
+  assert.equal(w1r.status, 0, `[恢复后继续提交] W1 应成功\nstderr:\n${w1r.stderr}`);
+  const store = readStore(df);
+  assert.equal(store.bookings.length, 2, 'B0001 与 W1 的预约都保留');
+  assert.equal(store.bookingSeq, 2, '被终止的 W0 与被阻挡的 W3 都未消耗标识');
+  // 由新进程查询最终安排并核对
+  const day = ok(df, ['list-bookings', '--date', '2026-10-12'], '恢复交接后按日查询');
+  assert.match(day.stdout, /共 2 条/);
+  assert.match(day.stdout, /B0001 \[已预约\] 2026-10-12T09:00 → 2026-10-12T10:00/);
+  assert.match(day.stdout, /B0002 \[已预约\] 2026-10-12T10:00 → 2026-10-12T11:00/);
+  assert.deepEqual(leftoverLocks(dir), [], '不残留锁或协调文件');
+});
+
+// ---------------------------------------------------------------------------
+// 12. 真正终止协调中的恢复进程：残留协调文件由后续恢复安全清理
+// ---------------------------------------------------------------------------
+
+test('恢复者异常退出：残留协调文件由后续恢复入口确认退出后清理，无需人工删文件', async (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '甲'); // R0001
+  ok(df, ['create-booking', '--resource', 'R0001', '--start', '2026-10-12T09:00', '--end', '2026-10-12T10:00'], '预约 B0001');
+  const bytesBefore = readFileSync(df);
+  const lockPath = lockPathOf(df);
+  const recoveryPath = recoveryPathOf(df);
+
+  // 真实业务修改进程持锁后被真正终止 → 残留保护
+  const sync0 = join(dir, 'sync0');
+  mkdirSync(sync0);
+  const w0 = spawnCli(
+    df,
+    ['create-booking', '--resource', 'R0001', '--start', '2026-10-12T10:00', '--end', '2026-10-12T11:00'],
+    {SHIFTBOOK_TEST_SYNC_DIR: sync0},
+  );
+  t.after(() => {
+    w0.child.kill('SIGKILL');
+  });
+  await waitForSyncPoint(join(sync0, 'write-lock-acquired.ready'), 'W0 取得保护');
+  await killAndWait(w0.child);
+  assert.ok(existsSync(lockPath), 'W0 被终止后留下残留保护');
+
+  // 恢复 R1 持有恢复互斥、在删除前被真正终止 → 残留协调文件与残留保护都留下
+  const syncR1 = join(dir, 'syncR1');
+  mkdirSync(syncR1);
+  const r1 = spawnCli(df, ['recover-lock'], {SHIFTBOOK_TEST_SYNC_DIR: syncR1});
+  t.after(() => {
+    r1.child.kill('SIGKILL');
+  });
+  await waitForSyncPoint(join(syncR1, 'recover-before-unlock.ready'), 'R1 删除前同步点');
+  // R1 存活持有互斥时，另一恢复请求退出 1 且不动任何文件
+  const rx = runCli(df, ['recover-lock']);
+  assert.equal(rx.status, 1, `[恢复者存活] 另一恢复不应重复解除\nstdout:\n${rx.stdout}`);
+  assert.match(rx.stderr, /另一恢复进程/);
+  await killAndWait(r1.child);
+  assert.ok(existsSync(lockPath), 'R1 被终止后残留保护仍在');
+  assert.ok(existsSync(recoveryPath), 'R1 被终止后残留协调文件仍在');
+
+  // 后续恢复入口：确认 R1 已退出后自动清理残留协调文件并完成恢复
+  const r2 = runCli(df, ['recover-lock']);
+  assert.equal(r2.status, 0, `[清理残留协调] 后续恢复应成功\nstderr:\n${r2.stderr}`);
+  assert.match(r2.stdout, /已解除/);
+  assert.ok(!existsSync(lockPath), '残留保护已解除');
+  assert.ok(!existsSync(recoveryPath), '残留协调文件已清理');
+  assert.ok(bytesBefore.equals(readFileSync(df)), '恢复不改业务数据与计数');
+
+  // 恢复后写入立即可用，数据为完整快照
+  const ok2 = await runCliAsync(df, [
+    'create-booking', '--resource', 'R0001', '--start', '2026-10-12T10:00', '--end', '2026-10-12T11:00',
+  ]);
+  assert.equal(ok2.status, 0, `[清理后继续写入] 应成功\nstderr:\n${ok2.stderr}`);
+  const store = readStore(df);
+  assert.equal(store.bookings.length, 2);
+  assert.equal(store.bookingSeq, 2);
+  assert.deepEqual(leftoverLocks(dir), [], '不残留锁或协调文件');
 });

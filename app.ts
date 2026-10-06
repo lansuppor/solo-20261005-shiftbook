@@ -31,10 +31,11 @@
 // 读取决策所需状态、业务校验、分配标识与原子保存全过程；取得保护后据最新数据
 // 决策。相对/绝对/含 ./.. 的等价路径共享同一把锁，不同数据文件互不影响。
 // 竞争可等待，5 秒内未取得即以退出码 1 报告占用；进程异常退出留下的残留保护
-// 由 recover-lock 在确认原写入进程已退出后解除。查询不取锁，保存为原子替换，
-// 只读到提交前或提交后的完整快照。
+// 由 recover-lock 在确认原写入进程已退出后解除。恢复入口之间以恢复协调文件
+// 互斥，在互斥内重新核对目标后才删除，绝不误删新写入者已取得的保护。
+// 查询不取锁，保存为原子替换，只读到提交前或提交后的完整快照。
 
-import {lstat, readFile, writeFile, rename, unlink} from 'node:fs/promises';
+import {readFile, writeFile, rename, unlink} from 'node:fs/promises';
 import {realpathSync} from 'node:fs';
 import {hostname} from 'node:os';
 import {basename, dirname, join, resolve} from 'node:path';
@@ -1009,8 +1010,17 @@ async function saveStore(file: string, store: Store): Promise<void> {
 // 命名：相对路径、绝对路径与含 ./.. 的等价写法共享同一把锁；不同数据文件
 // 互不影响；数据文件尚不存在时同样受保护。竞争可等待，但 5 秒内未取得即以
 // 退出码 1 报告占用（可重试）。进程异常退出会留下残留锁：recover-lock 仅在
-// 确认原写入进程已退出后解除，存活或无法确认一律拒绝，不按保护存在时长抢占；
-// 释放与恢复都只删除自己确认的那一份，绝不误删其他进程后来取得的保护。
+// 确认原写入进程已退出后解除，存活或无法确认一律拒绝，不按保护存在时长抢占。
+//
+// 交接互斥：取得（wx 独占创建）、释放（仅删自己取得的那份）、恢复三者都不得
+// 误删他人的保护。恢复入口之间以恢复协调文件（<锁文件>.recover，wx 独占创建）
+// 互斥：任一时刻至多一个恢复者持有协调文件，持有者在互斥内重新核对目标后才
+// 删除锁文件——持有协调文件期间，原持有者已确认退出（不会再释放）、其他恢复者
+// 进不了互斥、新写入者只能在锁文件不存在时取得（wx），因此互斥内的删除恰好
+// 删除本次确认的那一份残留保护，绝不误删新写入者已取得的保护；发现目标更替
+// （锁已易主或已消失）则以退出码 1 说明原因或按无操作退出 0，不宣称解除新保护。
+// 恢复者异常退出会留下残留协调文件：下一恢复入口在确认其持有者已退出后清理
+// 并重试，无需人工删文件。
 // ---------------------------------------------------------------------------
 
 const LOCK_TIMEOUT_MS = 5000; // 取得写入保护的最长等待时间
@@ -1041,6 +1051,17 @@ function lockPathFor(file: string): string {
   return join(dirname(canonical), `.shiftbook-${hash}.lock`);
 }
 
+// 恢复协调文件路径：恢复入口之间的互斥（<锁文件>.recover），与锁文件同样
+// 按规范路径命名并受文件名长度限制（超限时同样退化为同目录散列名）
+function recoveryPathFor(file: string): string {
+  const lockPath = lockPathFor(file);
+  const primary = `${lockPath}.recover`;
+  if (Buffer.byteLength(basename(primary), 'utf8') <= 250) return primary;
+  const canonical = canonicalDataPath(file);
+  const hash = createHash('sha256').update(`${canonical}recover`).digest('hex').slice(0, 24);
+  return join(dirname(canonical), `.shiftbook-${hash}.recover`);
+}
+
 interface LockInfo {
   pid: number; // 取得保护的进程
   host: string; // 取得保护的主机（恢复时只能确认本机进程）
@@ -1055,6 +1076,74 @@ function currentLockInfo(file: string): LockInfo {
     dataFile: canonicalDataPath(file),
     acquiredAt: new Date().toISOString(),
   };
+}
+
+// 解析锁/协调文件内容；无法辨认（非 JSON、缺字段或字段非法）返回 null
+function parseLockInfo(text: string): LockInfo | null {
+  try {
+    const parsed = JSON.parse(text) as LockInfo;
+    if (!Number.isInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.host !== 'string') {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+// 确认 info 所指保护的原持有进程已退出：存活、非本机、内容无法辨认或查询异常
+// 均抛出 BizError 拒绝，不按保护存在时长抢占；确认退出后返回该 info
+function assertLockStale(info: LockInfo | null, lockPath: string): LockInfo {
+  if (info === null) {
+    throw new BizError(
+      `写入保护文件 ${lockPath} 内容无法辨认，无法确认原写入进程，拒绝解除（请人工核查后自行处理该文件）`,
+    );
+  }
+  if (info.host !== hostname()) {
+    throw new BizError(
+      `写入保护由另一台主机（${info.host}）的进程 ${info.pid} 取得，本机无法确认其是否已退出，拒绝解除`,
+    );
+  }
+  let alive = false;
+  try {
+    process.kill(info.pid, 0);
+    alive = true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
+      throw new BizError(`无法确认原写入进程 ${info.pid} 是否已退出（无权限查询），拒绝解除写入保护`);
+    }
+  }
+  if (alive) {
+    throw new BizError(
+      `写入保护仍由运行中的进程 ${info.pid} 持有（始于 ${info.acquiredAt}），拒绝解除；` +
+        '不按保护存在时长抢占，请等待其结束，或确认其已退出后重试',
+    );
+  }
+  return info;
+}
+
+// 测试同步点（仅当环境变量 SHIFTBOOK_TEST_SYNC_DIR 指向某目录时启用）：
+// 到达指定步骤时写入 <dir>/<name>.ready（内容为进程标识），并等待 <dir>/<name>.go
+// 出现后继续，供回归测试以真实子进程精确控制取得/恢复交接的时序（明确同步点，
+// 而非随机延时）。正常使用不设置该变量，完全无开销。
+async function testSyncPoint(name: string): Promise<void> {
+  const dir = process.env.SHIFTBOOK_TEST_SYNC_DIR;
+  if (!dir) return;
+  const go = join(dir, `${name}.go`);
+  await writeFile(join(dir, `${name}.ready`), `${process.pid}\n`, 'utf8');
+  const deadline = Date.now() + 30000;
+  for (;;) {
+    try {
+      await readFile(go, 'utf8');
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new BizError(`测试同步点 ${name} 无法读取: ${(err as Error).message}`);
+      }
+      if (Date.now() >= deadline) throw new BizError(`测试同步点 ${name} 等待超时`);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
 }
 
 // 本进程当前持有的锁（一次命令至多一把；main 统一释放）
@@ -1110,11 +1199,21 @@ async function releaseWriteLock(): Promise<void> {
 // 保护一直持有到命令结束（main 统一释放），覆盖业务校验、标识分配与原子保存。
 async function loadStoreForWrite(file: string): Promise<Store> {
   await acquireWriteLock(file);
+  await testSyncPoint('write-lock-acquired'); // 测试钩子：取得保护后的交接观察点
   return loadStore(file);
 }
 
 // 本地恢复入口：仅确认原写入进程已退出时才解除残留保护；存活或无法确认一律
 // 明确拒绝，不按保护存在时长抢占。不重放旧命令，不改业务数据或标识计数。
+//
+// 交接安全：恢复者之间以恢复协调文件互斥（wx 独占创建，任一时刻至多一个
+// 恢复者），持有者在互斥内重新核对目标后才删除锁文件。持有协调文件期间：
+// 原持有进程已确认退出（不会再释放该锁）、其他恢复者进不了互斥、新写入者
+// 只能在锁文件不存在时取得（wx 独占创建）——因此互斥内的 unlink 恰好删除
+// 本次确认的那一份残留保护，绝不误删新写入者后来取得的保护；发现目标更替
+// （锁已易主或已消失）以退出码 1 说明原因或按无操作退出 0，不宣称解除新保护。
+// 恢复者异常退出留下的残留协调文件，由下一恢复入口在确认其持有者退出后清理，
+// 无需人工删文件。
 async function cmdRecoverLock(args: string[]): Promise<void> {
   const {values, positionals} = parseFlags(args, []);
   if (values.size > 0) {
@@ -1126,77 +1225,107 @@ async function cmdRecoverLock(args: string[]): Promise<void> {
 
   const file = activeDataFile;
   const lockPath = lockPathFor(file);
-  const readLock = async (): Promise<{dev: number; ino: number; text: string}> => {
-    const st = await lstat(lockPath);
-    return {dev: st.dev, ino: st.ino, text: await readFile(lockPath, 'utf8')};
+  const recoveryPath = recoveryPathFor(file);
+
+  // 读取锁文件：undefined = 不存在；null = 内容无法辨认
+  const readLockInfo = async (): Promise<LockInfo | null | undefined> => {
+    let text: string;
+    try {
+      text = await readFile(lockPath, 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw new BizError(`无法读取写入保护文件 ${lockPath}: ${(err as Error).message}`);
+    }
+    return parseLockInfo(text);
   };
 
-  let first: {dev: number; ino: number; text: string};
-  try {
-    first = await readLock();
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      console.log(`数据文件 ${file} 没有残留写入保护，无需恢复。`);
-      return;
+  // 第一次检查（不创建任何协调状态）：无保护直接退出 0 且无操作；
+  // 明显不可恢复（存活、非本机、无法辨认、查询异常）直接拒绝
+  const first = await readLockInfo();
+  if (first === undefined) {
+    console.log(`数据文件 ${file} 没有残留写入保护，无需恢复。`);
+    return;
+  }
+  assertLockStale(first, lockPath);
+
+  // 取得恢复互斥（协调文件，wx 独占创建）：保证“核对目标”与“解除保护”之间
+  // 没有其他恢复者插入。已有协调文件时：持有者存活则退出 1（不重复解除）；
+  // 确认持有者已退出则清理其残留协调文件后重试（恢复者异常退出的交接清理）。
+  const myInfo = JSON.stringify(currentLockInfo(file)) + '\n';
+  for (;;) {
+    try {
+      await writeFile(recoveryPath, myInfo, {encoding: 'utf8', flag: 'wx'});
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw new BizError(`无法取得恢复互斥（协调文件 ${recoveryPath}）：${(err as Error).message}`);
+      }
+      let otherText: string;
+      try {
+        otherText = await readFile(recoveryPath, 'utf8');
+      } catch (readErr) {
+        if ((readErr as NodeJS.ErrnoException).code === 'ENOENT') continue; // 刚好被清理，重试
+        throw new BizError(`无法读取恢复协调文件 ${recoveryPath}: ${(readErr as Error).message}`);
+      }
+      const other = parseLockInfo(otherText);
+      if (other === null) {
+        throw new BizError(
+          `恢复协调文件 ${recoveryPath} 内容无法辨认，无法确认另一恢复进程是否存活，拒绝继续（请人工核查后自行处理该文件）`,
+        );
+      }
+      if (other.host !== hostname()) {
+        throw new BizError(
+          `恢复协调文件由另一台主机（${other.host}）的进程 ${other.pid} 取得，本机无法确认其是否已退出，拒绝继续`,
+        );
+      }
+      let otherAlive = false;
+      try {
+        process.kill(other.pid, 0);
+        otherAlive = true;
+      } catch (killErr) {
+        if ((killErr as NodeJS.ErrnoException).code !== 'ESRCH') {
+          throw new BizError(`无法确认另一恢复进程 ${other.pid} 是否已退出（无权限查询），拒绝继续`);
+        }
+      }
+      if (otherAlive) {
+        throw new BizError(
+          `另一恢复进程 ${other.pid} 正在处理本数据文件的写入保护，本次不重复解除；请等待其结束后重试`,
+        );
+      }
+      // 另一恢复者已确认退出：清理其残留协调文件（可能刚好被他人清理，忽略失败）
+      await unlink(recoveryPath).catch(() => {});
     }
-    throw new BizError(`无法读取写入保护文件 ${lockPath}: ${(err as Error).message}`);
   }
 
-  let info: LockInfo;
+  // 持有恢复互斥：此刻起其他恢复者进不了互斥；原持有进程已确认退出不会再释放；
+  // 新写入者只能在锁文件不存在时取得（wx）。因此在互斥内重新核对目标后的删除，
+  // 恰好删除本次确认的那一份残留保护。
   try {
-    const parsed = JSON.parse(first.text) as LockInfo;
-    if (!Number.isInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.host !== 'string') {
-      throw new Error('invalid lock content');
-    }
-    info = parsed;
-  } catch {
-    throw new BizError(
-      `写入保护文件 ${lockPath} 内容无法辨认，无法确认原写入进程，拒绝解除（请人工核查后自行处理该文件）`,
-    );
-  }
-
-  if (info.host !== hostname()) {
-    throw new BizError(
-      `写入保护由另一台主机（${info.host}）的进程 ${info.pid} 取得，本机无法确认其是否已退出，拒绝解除`,
-    );
-  }
-
-  let alive = false;
-  try {
-    process.kill(info.pid, 0);
-    alive = true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
-      throw new BizError(`无法确认原写入进程 ${info.pid} 是否已退出（无权限查询），拒绝解除写入保护`);
-    }
-  }
-  if (alive) {
-    throw new BizError(
-      `写入保护仍由运行中的进程 ${info.pid} 持有（始于 ${info.acquiredAt}），拒绝解除；` +
-        '不按保护存在时长抢占，请等待其结束，或确认其已退出后重试',
-    );
-  }
-
-  // 删除前再次核对：锁文件未被替换（inode 与内容均一致），
-  // 绝不误删其他进程在核对期间重新取得的保护
-  let second: {dev: number; ino: number; text: string};
-  try {
-    second = await readLock();
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+    const second = await readLockInfo();
+    if (second === undefined) {
       console.log('残留写入保护已被解除（可能由另一恢复入口处理），无需重复操作。');
       return;
     }
-    throw new BizError(`无法读取写入保护文件 ${lockPath}: ${(err as Error).message}`);
+    // 目标更替（旧保护已被解除、新写入者取得保护）在此拒绝：存活即退出 1，
+    // 绝不删除新写入者的保护，也不宣称解除
+    const info = assertLockStale(second, lockPath);
+    await testSyncPoint('recover-before-unlock'); // 测试钩子：删除前的交接观察点
+    await unlink(lockPath);
+    console.log(
+      `已解除数据文件 ${file} 的残留写入保护（原写入进程 ${info.pid} 已确认退出）。` +
+        '未重放任何旧命令，数据文件、业务记录与标识计数均未改动。',
+    );
+  } finally {
+    // 释放恢复互斥：仅删除自己取得的那一份协调文件（内容核对为本进程）
+    try {
+      const info = parseLockInfo(await readFile(recoveryPath, 'utf8'));
+      if (info !== null && info.pid === process.pid && info.host === hostname()) {
+        await unlink(recoveryPath);
+      }
+    } catch {
+      // 协调文件已不存在或不可读：不影响本次恢复的结果
+    }
   }
-  if (second.dev !== first.dev || second.ino !== first.ino || second.text !== first.text) {
-    throw new BizError('写入保护在核对期间已变化（可能已有新的写入者取得保护），拒绝解除');
-  }
-  await unlink(lockPath);
-  console.log(
-    `已解除数据文件 ${file} 的残留写入保护（原写入进程 ${info.pid} 已确认退出）。` +
-      '未重放任何旧命令，数据文件、业务记录与标识计数均未改动。',
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -3763,8 +3892,13 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   recover-lock
       本地恢复入口：进程异常退出可能留下残留保护（锁文件），导致修改入口
       一直报告占用。本命令仅在确认原写入进程已退出时解除残留保护；进程仍
-      存活或无法确认时明确拒绝，不按保护存在时长抢占。不重放旧命令，不改
-      业务数据或标识计数；没有残留保护时明确提示且不改动。
+      存活或无法确认时明确拒绝，不按保护存在时长抢占。恢复入口之间以恢复
+      协调文件互斥，在互斥内重新核对目标后才删除：多个恢复请求交错时只
+      解除已确认原持有者退出的那次保护，绝不误删新写入者已取得的保护；
+      发现目标更替（锁已易主或已消失）以退出码 1 说明原因或按无操作处理，
+      不宣称解除新保护。恢复者异常退出留下的残留协调文件，由后续恢复
+      入口在确认其持有者退出后自动清理，无需人工删文件。不重放旧命令，
+      不改业务数据或标识计数；没有残留保护时明确提示且不改动。
 
 退出码:
   0  成功
