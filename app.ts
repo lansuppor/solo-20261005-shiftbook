@@ -19,6 +19,13 @@
 // 可任选其一的候选资源）寻找能同时满足全部需求的最早连续时段——每组恰选一
 // 个候选，全部所选资源互不相同并全程保持同一组合；只读快照，不写数据文件。
 //
+// 联合排程：schedule-flex 读取本地 JSON 清单（多项“窗口 + 连续时长 + 有顺序
+// 需求组”的弹性预约请求），为整份清单寻找同时可行的安排（不逐项贪选最早，
+// 候选开始分钟取基础空闲段起点与其他项占用结束的闭包，按清单顺序深度优先
+// 试探，首个完整方案即“逐项先比开始分钟、再按组序比资源标识字典序”的最小
+// 方案），有解时按清单顺序各创建一项普通预约并一次原子保存；无整体解明确
+// 提示并退出 1，不保存部分方案。
+//
 // 使用统计：usage-stats 统计窗口内所选资源的实际可用、占用、空闲分钟与
 // 使用率（逐日 + 整窗 + 全部资源合计），并给出同时被占用的所选资源数量
 // 峰值及全部达到峰值的最大连续区间；只读快照，不写数据文件。
@@ -3152,6 +3159,362 @@ async function cmdFindSlot(args: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// 多项弹性预约的联合排程与原子创建（schedule-flex）
+//
+// 读取本地 JSON 清单（{"items": [...]}，非空、有顺序），每项给出营业地时间窗口、
+// 所需连续分钟数与有顺序的需求组（每组列出一个可任选其一的候选资源数组）。
+// 为整份清单寻找同时可行的安排：每项完整落在自身窗口内，每组恰选一个候选，
+// 一项所选资源互不相同并全程固定（不换资源、不拼接间断）；新项之间仅共同资源
+// 的左闭右开时间重叠才冲突，端点相接可行。多个完整方案按清单顺序逐项比较：
+// 先比该项开始分钟，再按需求组顺序以字符串字典序比资源标识，第一处差异取
+// 较小者，随后才比较下一项（清单顺序只用于取舍，不限定活动发生先后）。
+// 有解时按清单顺序各创建一项普通预约（稳定、不复用标识，不加入系列、不改动
+// 既有预约与候补、不自动处理候补），原子保存全部预约后才报告成功；无整体解
+// 明确提示并退出 1，不保存部分方案。每次提交都是新的创建请求，不按清单路径
+// 或内容去重。
+//
+// 求解不逐项贪选最早：项 i 的开始分钟若被项 j 的占用“顶住”，则 s_i = s_j + d_j，
+// 故候选开始分钟取“基础空闲段起点”与“其他项占用结束（s_j + d_j）”的闭包
+// （仅候选资源集合有交集的项之间传播；按开始分钟归纳，最小方案的每个开始都
+// 落在该闭包内）。随后按清单顺序深度优先逐项试探：开始分钟升序、同一开始的
+// 资源序列按字典序升序枚举，首个完整方案即按上述比较的最小方案——不会因为
+// 逐项固定最早选择而漏掉须调整前项时间或资源的解，也不跳过受阻项。
+// ---------------------------------------------------------------------------
+
+interface FlexPlanItem {
+  index: number; // 1 基清单序号
+  startRaw: string; // 窗口开始（YYYY-MM-DDTHH:mm）
+  endRaw: string; // 窗口结束
+  startMin: number;
+  endMin: number;
+  duration: number; // 所需连续分钟数（正整数，不超过窗口长度）
+  groups: RequirementGroup[]; // 有顺序的需求组，每组恰选一个候选
+}
+
+interface FlexPlacement {
+  startMin: number;
+  endMin: number;
+  picks: string[]; // 按需求组顺序的所选资源
+}
+
+// 读取预约清单文件：不可读、不是合法 JSON 均明确失败（绝不按空清单处理）
+async function loadFlexManifest(file: string): Promise<unknown> {
+  let text: string;
+  try {
+    text = await readFile(file, 'utf8');
+  } catch (err) {
+    throw new BizError(`无法读取预约清单 ${file}: ${(err as Error).message}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw new BizError(`预约清单 ${file} 已损坏，不是合法 JSON：${(err as Error).message}`);
+  }
+}
+
+// 清单结构（与业务数据无关的纯类型校验）；返回逐项原始记录
+function parseFlexPlanShape(raw: unknown, file: string): Array<Record<string, unknown>> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new BizError(`预约清单 ${file} 内容非法：顶层必须是对象，形如 {"items": [...]}`);
+  }
+  const o = raw as Record<string, unknown>;
+  for (const k of Object.keys(o)) {
+    if (k !== 'items') throw new BizError(`预约清单 ${file} 内容非法：存在未知字段 “${k}”，只允许 items`);
+  }
+  if (!Array.isArray(o.items)) {
+    throw new BizError(`预约清单 ${file} 内容非法：items 必须是非空数组`);
+  }
+  const items = o.items as unknown[];
+  if (items.length === 0) throw new BizError(`预约清单 ${file} 为空：items 至少包含一项预约请求`);
+
+  const problems: string[] = [];
+  const records: Array<Record<string, unknown> | null> = [];
+  items.forEach((it, idx) => {
+    const at = `第 ${idx + 1} 项`;
+    if (typeof it !== 'object' || it === null || Array.isArray(it)) {
+      problems.push(`${at} 必须是对象`);
+      records.push(null);
+      return;
+    }
+    const rec = it as Record<string, unknown>;
+    for (const k of Object.keys(rec)) {
+      if (k !== 'window' && k !== 'duration' && k !== 'groups') {
+        problems.push(`${at} 存在未知字段 “${k}”（只允许 window、duration、groups）`);
+      }
+    }
+    if (typeof rec.window !== 'string' || rec.window === '') {
+      problems.push(`${at} 的 window 必须是 窗口开始/窗口结束 形式的非空字符串`);
+    }
+    if (typeof rec.duration !== 'number' || !Number.isInteger(rec.duration) || rec.duration <= 0) {
+      problems.push(`${at} 的 duration 必须是正整数分钟（不超过窗口长度）`);
+    }
+    if (!Array.isArray(rec.groups) || rec.groups.length === 0) {
+      problems.push(`${at} 的 groups 必须是非空数组（至少一个有顺序的需求组）`);
+    } else {
+      rec.groups.forEach((g, gi) => {
+        if (!Array.isArray(g) || g.length === 0) {
+          problems.push(`${at} 第 ${gi + 1} 需求组必须是非空数组（可任选其一的候选资源标识）`);
+        } else {
+          g.forEach((id) => {
+            if (typeof id !== 'string' || id === '') {
+              problems.push(`${at} 第 ${gi + 1} 需求组含非法候选：候选资源标识必须是非空字符串`);
+            }
+          });
+        }
+      });
+    }
+    records.push(rec);
+  });
+  if (problems.length > 0) {
+    throw new BizError(`预约清单 ${file} 内容非法，整单拒绝：\n${problems.map((p) => `- ${p}`).join('\n')}`);
+  }
+  return records as Array<Record<string, unknown>>;
+}
+
+// 逐项做与业务数据相关的校验（窗口真实有效、时长不超过窗口、组内重复与未知资源），
+// 收集全部问题后一次性拒绝整单；通过则返回排程项
+function parseFlexPlanItems(store: Store, records: Array<Record<string, unknown>>, file: string): FlexPlanItem[] {
+  const problems: string[] = [];
+  const items: Array<FlexPlanItem | null> = records.map((rec, idx) => {
+    const at = `第 ${idx + 1} 项`;
+    let ok = true;
+
+    let win: {start: string; end: string; startMin: number; endMin: number} | null = null;
+    try {
+      win = parseFlexWindow(rec.window as string, `${at}窗口`);
+    } catch (err) {
+      if (err instanceof BizError) {
+        problems.push(err.message);
+        ok = false;
+      } else {
+        throw err;
+      }
+    }
+
+    const duration = rec.duration as number; // 结构校验已保证正整数
+    if (win !== null && duration > win.endMin - win.startMin) {
+      problems.push(
+        `${at} 所需连续时长 ${duration} 分钟超过窗口长度 ${win.endMin - win.startMin} 分钟` +
+          `（窗口: ${win.start} → ${win.end}）`,
+      );
+      ok = false;
+    }
+
+    const groups: RequirementGroup[] = [];
+    (rec.groups as string[][]).forEach((ids, gi) => {
+      const glabel = `${at} 第 ${gi + 1} 需求组`;
+      const seen = new Set<string>();
+      const dupes: string[] = [];
+      for (const id of ids) {
+        if (seen.has(id) && !dupes.includes(id)) dupes.push(id);
+        seen.add(id);
+      }
+      if (dupes.length > 0) {
+        problems.push(`${glabel}内候选资源重复: ${dupes.join('、')}`);
+        ok = false;
+      }
+      const unknown = [...seen].filter((id) => !store.resources.some((r) => r.id === id)).sort();
+      if (unknown.length > 0) {
+        problems.push(`${glabel}含未知资源标识: ${unknown.join('、')}`);
+        ok = false;
+      }
+      groups.push({index: gi + 1, candidates: [...seen].sort()});
+    });
+
+    if (!ok || win === null) return null;
+    return {
+      index: idx + 1,
+      startRaw: win.start,
+      endRaw: win.end,
+      startMin: win.startMin,
+      endMin: win.endMin,
+      duration,
+      groups,
+    };
+  });
+  if (problems.length > 0) {
+    throw new BizError(`预约清单 ${file} 内容非法，整单拒绝：\n${problems.map((p) => `- ${p}`).join('\n')}`);
+  }
+  return items as FlexPlanItem[];
+}
+
+// 固定开始分钟上，按需求组顺序字典序升序枚举全部可行资源序列
+// （每组恰选一个候选，全部所选互不相同；候选已按标识排序）
+function* assignmentsInLexOrder(
+  groups: RequirementGroup[],
+  usable: (id: string) => boolean,
+): Generator<string[], void, undefined> {
+  const used = new Set<string>();
+  const acc: string[] = [];
+  function* rec(g: number): Generator<string[], void, undefined> {
+    if (g === groups.length) {
+      yield [...acc];
+      return;
+    }
+    for (const id of groups[g].candidates) {
+      if (used.has(id) || !usable(id)) continue;
+      used.add(id);
+      acc.push(id);
+      yield* rec(g + 1);
+      acc.pop();
+      used.delete(id);
+    }
+  }
+  yield* rec(0);
+}
+
+// 联合求解：找到即返回按清单顺序的各项安排（开始分钟 + 各组所选资源），无整体解返回 null。
+// 逐项（清单顺序）深度优先：开始分钟升序、同一开始的资源序列字典序升序，
+// 首个完整方案即“逐项先比开始分钟、再比资源序列”的最小方案。
+function solveFlexPlan(store: Store, items: FlexPlanItem[]): FlexPlacement[] | null {
+  // 每项各候选资源的基础空闲段：实际可用时间（开放合并后扣除有效停用并集）
+  // 裁进自身窗口，再扣除当前有效预约占用（已取消预约/停用与未兑现候补不阻挡）
+  const baseFree: Array<Map<string, Array<[number, number]>>> = items.map((it) => {
+    const m = new Map<string, Array<[number, number]>>();
+    for (const g of it.groups) {
+      for (const id of g.candidates) {
+        if (!m.has(id)) m.set(id, resourceFreeSegments(store, id, it.startMin, it.endMin));
+      }
+    }
+    return m;
+  });
+
+  // 候选开始分钟闭包：基础空闲段起点，加上“被其他项占用结束顶住”的起点
+  // s_i = s_j + d_j（仅候选资源集合有交集的项之间传播；值域有限，必收敛）
+  const candidateIds = items.map((it) => {
+    const set = new Set<string>();
+    for (const g of it.groups) for (const id of g.candidates) set.add(id);
+    return set;
+  });
+  const sharesCandidate = (a: number, b: number): boolean => {
+    for (const id of candidateIds[a]) if (candidateIds[b].has(id)) return true;
+    return false;
+  };
+  const candStarts: Array<Set<number>> = items.map((it, i) => {
+    const set = new Set<number>();
+    for (const segs of baseFree[i].values()) {
+      for (const [s] of segs) {
+        if (s + it.duration <= it.endMin) set.add(s);
+      }
+    }
+    return set;
+  });
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let j = 0; j < items.length; j++) {
+      for (let i = 0; i < items.length; i++) {
+        if (i === j || !sharesCandidate(i, j)) continue;
+        for (const s of candStarts[j]) {
+          const t = s + items[j].duration;
+          if (
+            t >= items[i].startMin &&
+            t + items[i].duration <= items[i].endMin &&
+            !candStarts[i].has(t)
+          ) {
+            candStarts[i].add(t);
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+
+  // 已放置项对各资源的占用（随试探入栈/出栈增减）
+  const occById = new Map<string, Array<[number, number]>>();
+
+  const search = (idx: number): FlexPlacement[] | null => {
+    if (idx === items.length) return [];
+    const it = items[idx];
+    // 当前空闲段 = 基础空闲段扣除已放置项占用
+    const freeById = new Map<string, Array<[number, number]>>();
+    for (const [id, segs] of baseFree[idx]) {
+      const occ = occById.get(id);
+      freeById.set(id, occ !== undefined && occ.length > 0 ? subtractSegments(segs, occ) : segs);
+    }
+    for (const s of [...candStarts[idx]].sort((a, b) => a - b)) {
+      const e = s + it.duration;
+      const cache = new Map<string, boolean>();
+      const usable = (id: string): boolean => {
+        let v = cache.get(id);
+        if (v === undefined) {
+          v = isFullyCovered(freeById.get(id)!, s, e);
+          cache.set(id, v);
+        }
+        return v;
+      };
+      for (const picks of assignmentsInLexOrder(it.groups, usable)) {
+        for (const id of picks) {
+          const occ = occById.get(id) ?? [];
+          occ.push([s, e]);
+          occById.set(id, occ);
+        }
+        const rest = search(idx + 1);
+        if (rest !== null) return [{startMin: s, endMin: e, picks}, ...rest];
+        for (const id of picks) occById.get(id)!.pop();
+      }
+    }
+    return null;
+  };
+
+  return search(0);
+}
+
+async function cmdScheduleFlex(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(
+      `schedule-flex 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`,
+    );
+  }
+  if (positionals.length !== 1) {
+    throw new UsageError('用法: schedule-flex <预约清单文件>');
+  }
+  const manifestFile = positionals[0];
+
+  // 修改入口：先取得写入保护再读最新数据，排程至保存全程受保护
+  const file = activeDataFile;
+  const store = await loadStoreForWrite(file);
+  const records = parseFlexPlanShape(await loadFlexManifest(manifestFile), manifestFile);
+  const items = parseFlexPlanItems(store, records, manifestFile);
+
+  const plan = solveFlexPlan(store, items);
+  if (plan === null) {
+    throw new BizError(
+      `无整体解：清单 ${manifestFile} 的 ${items.length} 项预约不存在同时可行的安排` +
+        '（每项须完整落在自身窗口内，各组所选资源互不相同并全程固定，' +
+        '新项之间共同资源时间不得重叠）。未创建任何预约，数据文件未改动。',
+    );
+  }
+
+  // 全部校验与求解通过：按清单顺序分配稳定且不复用的预约标识，一次原子保存
+  const created: Array<{id: string; start: string; end: string; picks: string[]}> = [];
+  plan.forEach((p) => {
+    const start = formatDateTime(p.startMin);
+    const end = formatDateTime(p.endMin);
+    if (start === null || end === null) {
+      // 理论不可达：窗口已校验在 0001-9999 内，时段不超出窗口
+      throw new BizError('可行时段超出四位年份范围');
+    }
+    store.bookingSeq += 1;
+    const id = `B${String(store.bookingSeq).padStart(4, '0')}`;
+    store.bookings.push({id, resourceIds: [...p.picks].sort(), start, end, status: 'active'});
+    created.push({id, start, end, picks: p.picks});
+  });
+  store.bookings.sort((a, b) => a.id.localeCompare(b.id));
+  await saveStore(file, store);
+
+  console.log(`联合排程成功：已按清单顺序原子创建 ${created.length} 项预约`);
+  created.forEach((c, i) => {
+    console.log(`- 第 ${i + 1} 项 -> ${c.id}: ${c.start} → ${c.end}（${items[i].duration} 分钟）`);
+    c.picks.forEach((id, g) => {
+      const r = store.resources.find((x) => x.id === id)!;
+      console.log(`    第 ${g + 1} 组: ${id}（${r.name}，${RESOURCE_TYPE_LABEL[r.type]}）`);
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // 资源使用率与繁忙时段统计（usage-stats，只读）
 //
 // 统计窗口内所选资源的实际可用、占用、空闲分钟与使用率（逐日 + 整窗），
@@ -4068,7 +4431,7 @@ async function cmdImportIcal(args: string[]): Promise<void> {
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用、批量改期记录与安全撤销、iCalendar 导入、候选资源组合的最早可行时段查询，以及资源使用率与繁忙时段统计）
+const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用、批量改期记录与安全撤销、iCalendar 导入、候选资源组合的最早可行时段查询、多项弹性预约的联合排程与原子创建，以及资源使用率与繁忙时段统计）
 
 用法:
   node app.ts [--data <数据文件>] <命令> [选项]
@@ -4181,6 +4544,38 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       时长的方案。本命令只读一份完整数据快照：不等待写入保护、不创建预约
       或任何记录、不写数据文件或推进计数；方案不保留位置，后续创建预约仍
       检查最新状态
+
+联合排程命令（多项弹性预约的联合排程与原子创建）:
+  schedule-flex <预约清单文件>
+      读取本地 JSON 清单（UTF-8，顶层 {"items": [...]}，非空、有顺序），
+      为整份清单寻找同时可行的安排并原子创建全部预约。每项字段：
+        "window":   时间窗口 "YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm"
+                    （真实有效、结束晚于开始、允许跨日、与机器时区无关）
+        "duration": 所需连续分钟数（不超过窗口长度的正整数）
+        "groups":   有顺序的需求组数组，每组是一个候选资源标识数组
+                    （如 [["R0001","R0002"],["R0003"]]）；至少一组、每组非空，
+                    未知或组内重复资源整单拒绝；资源可跨组、跨项出现
+      每项须完整落在自身窗口内：每组恰选一个候选，一项所选资源互不相同，
+      全部所选资源同时连续可用且全程固定（不换资源、不拼接间断）；开放重叠
+      或相接先合并，再扣除有效停用与全部有效预约的当前占用（取消记录及未
+      兑现候补不阻挡）；新项之间仅共同资源的左闭右开时间重叠才冲突，端点
+      相接可行。求解面向整单可行性：不会逐项固定最早选择后漏掉须调整前项
+      时间或资源的解，也不跳过受阻项。多个完整方案按清单顺序逐项比较：
+      先比该项开始分钟，再按需求组顺序以字符串字典序比资源标识，第一处
+      差异取较小者（候选书写顺序不影响结果；清单顺序只用于取舍，不限定
+      活动发生先后）。有解时按清单顺序各创建一项普通预约（稳定、不复用
+      标识，不加入系列、不改动既有预约或候补、不自动处理候补），原子保存
+      全部预约后才退出 0，并显示各项标识、起止时间与按组对应的资源；
+      每次提交都是新的创建请求，不按清单路径或内容去重。无整体解明确
+      提示并退出 1，不保存部分方案；清单不可读、损坏或内容非法同样整单
+      失败，不产生记录、占用或计数变化。
+      清单示例:
+        {
+          "items": [
+            {"window": "2026-10-12T08:00/2026-10-12T18:00", "duration": 60, "groups": [["R0001","R0002"], ["R0003"]]},
+            {"window": "2026-10-12T09:00/2026-10-12T12:00", "duration": 90, "groups": [["R0001"]]}
+          ]
+        }
 
 统计命令（资源使用率与繁忙时段，只读）:
   usage-stats --window <开始/结束> [--resource <标识> ...]
@@ -4331,7 +4726,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
      组内重复候选、已取消预约、时间非法、
      开放不足、冲突、非法次数、超出四位年份、未知系列、未知候补、取消已兑现
      候补、候补标识非法、停用区间与有效预约重叠、未知停用、停用标识非法、
-     改期清单不可读/损坏/内容非法、未知批量改期操作、撤销涉及预约与记录
+     改期清单不可读/损坏/内容非法、预约清单不可读/损坏/内容非法或整单无
+     可行方案、未知批量改期操作、撤销涉及预约与记录
      不一致或恢复安排受阻、iCalendar 文件不可读/结构非法（含重复规则或
      EXDATE 非法、无规则带 EXDATE、全部排除、展开超出四位年份）、UID 与
      首次导入不一致、新事件开放不足或冲突、数据文件损坏（含候补、停用、
@@ -4363,6 +4759,7 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   node app.ts cancel-waitlist W0001
   node app.ts find-slot --window 2026-10-12T08:00/2026-10-12T18:00 \\
       --duration 60 --group R0001,R0002 --group R0003,R0004
+  node app.ts schedule-flex ./flex-plan.json
   node app.ts usage-stats --window 2026-10-12T00:00/2026-10-14T00:00 \\
       --resource R0001 --resource R0002
   node app.ts add-closure --resource R0001 \\
@@ -4439,6 +4836,9 @@ async function main(): Promise<void> {
         break;
       case 'find-slot':
         await cmdFindSlot(commandArgs);
+        break;
+      case 'schedule-flex':
+        await cmdScheduleFlex(commandArgs);
         break;
       case 'usage-stats':
         await cmdUsageStats(commandArgs);
