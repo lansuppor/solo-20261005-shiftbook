@@ -2581,22 +2581,23 @@ function parseDurationMinutes(raw: string): number {
   return Number(raw);
 }
 
-// 解析弹性候补的“窗口开始/窗口结束”
+// 解析“窗口开始/窗口结束”（弹性候补与 find-slot 共用，label 为业务称呼）
 function parseFlexWindow(
   value: string,
+  label = '弹性窗口',
 ): {start: string; end: string; startMin: number; endMin: number} {
   const parts = String(value ?? '').split('/');
   if (parts.length !== 2 || parts[0] === '' || parts[1] === '') {
     throw new BizError(
-      `弹性窗口格式非法: “${value}”，应为 窗口开始/窗口结束（YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm）`,
+      `${label}格式非法: “${value}”，应为 窗口开始/窗口结束（YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm）`,
     );
   }
   const start = parts[0];
   const end = parts[1];
-  const startMin = parseDateTime(start, '弹性窗口开始时间');
-  const endMin = parseDateTime(end, '弹性窗口结束时间');
+  const startMin = parseDateTime(start, `${label}开始时间`);
+  const endMin = parseDateTime(end, `${label}结束时间`);
   if (endMin <= startMin) {
-    throw new BizError(`弹性窗口结束时间必须晚于开始时间: “${value}”，允许跨日`);
+    throw new BizError(`${label}结束时间必须晚于开始时间: “${value}”，允许跨日`);
   }
   return {start, end, startMin, endMin};
 }
@@ -3042,6 +3043,183 @@ async function cmdCancelClosure(args: string[]): Promise<void> {
   closure.status = 'cancelled';
   await saveStore(file, store);
   console.log(`已取消停用 ${id}（记录保留），该区间恢复可用（不超出原开放时间）。`);
+}
+
+// ---------------------------------------------------------------------------
+// 候选资源组合的最早可行时段查询（find-slot，只读）
+//
+// 给定营业地时间窗口、所需连续分钟数与有顺序的需求组（每组列出可任选其一的
+// 已登记资源），在窗口内寻找能同时满足全部需求的最早开始分钟：每组恰选一个
+// 候选，所选资源互不重复，且整个时段保持同一组合（不中途更换、不拼接间断
+// 时间）。同一最早开始有多个组合时，按需求组顺序的资源标识序列取字典序最
+// 小者（组内候选输入顺序不影响结果）。本命令只读一份完整快照：不取得也不
+// 等待写入保护，不创建预约、候补或任何记录，不写数据文件、不推进计数。
+// ---------------------------------------------------------------------------
+
+// 标识的字典序比较（不随运行环境语言环境变化）
+function compareIds(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+// 某候选资源在窗口内的空闲区间：实际可用时间（开放区间合并重叠或相接后扣除
+// 有效停用并集）裁进窗口，再扣除该资源当前有效预约的占用（普通预约、系列
+// 成员、导入预约与候补兑现预约均按当前安排占用；已取消预约不占用，已取消
+// 停用与未兑现候补本就不在实际可用时间与预约占用中）。区间左闭右开。
+function slotFreeSegments(
+  store: Store,
+  id: string,
+  wStart: number,
+  wEnd: number,
+): Array<[number, number]> {
+  const r = store.resources.find((x) => x.id === id)!;
+  const avail = clipSegments(availableSegmentsOf(store, r), wStart, wEnd);
+  const cuts: Array<[number, number]> = [];
+  for (const b of store.bookings) {
+    if (b.status !== 'active') continue;
+    if (!b.resourceIds.includes(id)) continue;
+    const bStart = parseDateTime(b.start, '预约开始时间');
+    const bEnd = parseDateTime(b.end, '预约结束时间');
+    const a = Math.max(bStart, wStart);
+    const c = Math.min(bEnd, wEnd);
+    if (a < c) cuts.push([a, c]);
+  }
+  return subtractSegments(avail, cuts);
+}
+
+// 需求组 -> 可用候选 的二分匹配：第 from 组起能否各自占到一个互不相同的
+// 资源（used 为前组已占定的资源）。增广路（Kuhn）算法；只读，不修改入参。
+function groupsMatchable(adj: ReadonlyArray<ReadonlyArray<string>>, used: ReadonlySet<string>, from: number): boolean {
+  const matchOf = new Map<string, number>(); // 资源 -> 占用它的需求组下标（>= from）
+  const augment = (g: number, seen: Set<string>): boolean => {
+    for (const r of adj[g]) {
+      if (used.has(r) || seen.has(r)) continue;
+      seen.add(r);
+      const occupant = matchOf.get(r);
+      if (occupant === undefined || augment(occupant, seen)) {
+        matchOf.set(r, g);
+        return true;
+      }
+    }
+    return false;
+  };
+  for (let g = from; g < adj.length; g++) {
+    if (!augment(g, new Set())) return false;
+  }
+  return true;
+}
+
+// 在可行起点上取字典序最小的选择序列：逐组按标识升序试选，选定后其余组
+// 仍须整体可匹配——不为逐组贪小而漏掉需要调整前组选择的可行组合
+function lexicographicAssignment(adj: ReadonlyArray<ReadonlyArray<string>>): string[] {
+  const chosen: string[] = [];
+  const used = new Set<string>();
+  for (let g = 0; g < adj.length; g++) {
+    let pick: string | undefined;
+    for (const r of adj[g]) {
+      if (used.has(r)) continue;
+      used.add(r);
+      if (groupsMatchable(adj, used, g + 1)) {
+        pick = r;
+        break;
+      }
+      used.delete(r);
+    }
+    // 进入本函数前已判定整体可匹配，故必然能选出
+    if (pick === undefined) throw new BizError('内部错误：可行起点上无法为需求组分配候选资源');
+    chosen.push(pick);
+  }
+  return chosen;
+}
+
+async function cmdFindSlot(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, ['window', 'duration', 'group'], ['group']);
+  if (positionals.length > 0) throw new UsageError(`find-slot 不接受位置参数: ${positionals.join(' ')}`);
+
+  const groupArgs = values.get('group');
+  if (!groupArgs || groupArgs.length === 0) {
+    throw new UsageError('至少需要一个 --group 需求组（逗号分隔的候选资源标识）');
+  }
+  const windowRaw = requireFlag(values, 'window');
+  const durationRaw = requireFlag(values, 'duration');
+
+  // 只读查询：读取一份完整快照，不取得也不等待写入保护，不写数据文件
+  const store = await loadStore(activeDataFile);
+
+  const win = parseFlexWindow(windowRaw, '查询窗口');
+  const durationMinutes = parseDurationMinutes(durationRaw);
+  const windowLength = win.endMin - win.startMin;
+  if (durationMinutes > windowLength) {
+    throw new BizError(
+      `所需连续时长 ${durationMinutes} 分钟超过窗口长度 ${windowLength} 分钟（窗口: ${win.start} → ${win.end}）`,
+    );
+  }
+
+  // 需求组解析：至少一组、每组非空；组内重复或未知资源拒绝；
+  // 同一资源可以出现在不同组（匹配时保证所选资源互不重复）
+  const groups: string[][] = groupArgs.map((raw, i) => {
+    const label = `第 ${i + 1} 个需求组`;
+    const ids = raw.split(',');
+    if (ids.some((id) => id === '')) {
+      throw new BizError(`${label}含有空的资源标识: “${raw}”，应为逗号分隔的候选资源标识`);
+    }
+    const dupes = [...new Set(ids.filter((id, j) => ids.indexOf(id) !== j))];
+    if (dupes.length > 0) throw new BizError(`${label}内资源重复指定: ${dupes.join('、')}`);
+    const unknown = [...new Set(ids.filter((id) => !store.resources.some((r) => r.id === id)))].sort(compareIds);
+    if (unknown.length > 0) throw new BizError(`${label}含未知资源标识: ${unknown.join('、')}`);
+    // 组内候选按标识字典序排序：输入顺序不影响结果
+    return [...ids].sort(compareIds);
+  });
+
+  // 各候选资源在窗口内的空闲区间（同一资源只计算一次）
+  const freeById = new Map<string, Array<[number, number]>>();
+  for (const id of new Set(groups.flat())) {
+    freeById.set(id, slotFreeSegments(store, id, win.startMin, win.endMin));
+  }
+
+  // 最早可行起点必为某候选资源某段空闲区间的起点：任一组合的共同空闲区间
+  // 是各资源空闲区间的交集，其起点来自其中某一资源的区间起点
+  const starts = new Set<number>();
+  for (const segs of freeById.values()) {
+    for (const [s] of segs) {
+      if (s + durationMinutes <= win.endMin) starts.add(s);
+    }
+  }
+  const sortedStarts = [...starts].sort((a, b) => a - b);
+
+  let answer: {startMin: number; assignment: string[]} | null = null;
+  for (const s of sortedStarts) {
+    const e = s + durationMinutes;
+    // 该起点上各组的可用候选：存在一段空闲区间完整覆盖 [s, e)（左闭右开）
+    const adj = groups.map((candidates) =>
+      candidates.filter((id) => freeById.get(id)!.some(([a, b]) => a <= s && e <= b)),
+    );
+    if (adj.some((list) => list.length === 0)) continue;
+    // 每组各自可行不代表整体可行：还须能选出互不重复的资源组合
+    if (!groupsMatchable(adj, new Set(), 0)) continue;
+    answer = {startMin: s, assignment: lexicographicAssignment(adj)};
+    break;
+  }
+
+  if (answer === null) {
+    // 无解明确提示（退出码 0）：不返回少组或缩短时长的方案
+    console.log(
+      `窗口 ${win.start} → ${win.end} 内没有能同时满足全部 ${groups.length} 个需求组的` +
+        `连续 ${durationMinutes} 分钟时段（每组恰选一个候选、所选资源互不重复且整段同时空闲）。`,
+    );
+    console.log('未创建预约、候补或任何记录，数据文件与标识计数不变。');
+    return;
+  }
+
+  // 起点与终点都不超出窗口，窗口本身已校验在 0001-9999 年内，格式化必然成功
+  const startRaw = formatDateTime(answer.startMin)!;
+  const endRaw = formatDateTime(answer.startMin + durationMinutes)!;
+  console.log(`最早可行时段: ${startRaw} → ${endRaw}（${durationMinutes} 分钟，窗口 ${win.start} → ${win.end} 内）`);
+  console.log('各需求组所选资源（按需求组顺序；同一最早开始取标识序列字典序最小者）:');
+  answer.assignment.forEach((id, i) => {
+    const r = store.resources.find((x) => x.id === id)!;
+    console.log(`- 需求组 ${i + 1}: ${id} [${RESOURCE_TYPE_LABEL[r.type]}] ${r.name}`);
+  });
+  console.log('（仅查询：未创建预约、候补或任何记录，数据文件与标识计数不变；方案不保留位置，后续创建预约仍检查最新状态。）');
 }
 
 // ---------------------------------------------------------------------------
@@ -3683,7 +3861,7 @@ async function cmdImportIcal(args: string[]): Promise<void> {
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用、批量改期记录与安全撤销，以及 iCalendar 导入）
+const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用、批量改期记录与安全撤销、iCalendar 导入，以及候选资源组合的最早可行时段查询）
 
 用法:
   node app.ts [--data <数据文件>] <命令> [选项]
@@ -3792,6 +3970,25 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       仅使指定停用记录失效并保留历史，该区间恢复可用（不超出原开放时间）；
       其他重叠停用仍有效；重复取消成功且无变化，未知标识失败；
       取消不自动创建预约或处理候补
+
+组合查询命令（候选资源组合的最早可行时段，只读）:
+  find-slot --window <开始/结束> --duration <正整数分钟> \\
+      --group <标识,标识,...> [--group <标识,标识,...> ...]
+      在营业地时间窗口（YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm，真实有效、
+      结束晚于开始、允许跨日、与机器时区无关）内，寻找能同时满足全部需求组
+      的最早连续时段：每组恰选一个候选资源，所有所选资源互不重复，且整个
+      时段保持同一组合（不中途更换资源、不拼接间断时间）。至少一个
+      --group，每组至少一个候选；组内重复或未知资源拒绝，同一资源可出现
+      在不同组。时长为不超过窗口长度的正整数分钟。资源空闲 = 开放区间合并
+      重叠或相接后扣除有效停用并集与当前有效预约占用（普通、系列成员、
+      导入与候补兑现预约均占用；已取消预约/停用与未兑现候补不阻挡），
+      区间左闭右开、端点相接可行，全部选定资源须同时连续空闲。同一最早
+      开始有多个组合时，按需求组顺序的资源标识序列取字典序最小者（组内
+      候选输入顺序不影响结果）。有解显示起止时间与各组所选资源的标识、
+      名称、类型；无解明确提示（退出码 0），不返回少组或缩短时长的方案。
+      本命令只读一份完整快照：不等待写入保护，不创建预约、候补或任何
+      记录，不写数据文件、不推进计数；方案不保留位置，后续创建预约仍
+      检查最新状态
 
 导入命令（本地 iCalendar 文件批量导入预约）:
   import-ical <iCalendar 文件> --resource <标识> [--resource <标识> ...]
@@ -3903,7 +4100,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
 退出码:
   0  成功
   1  业务或文件失败（名称为空、未知/重复资源或预约、已取消预约、时间非法、
-     开放不足、冲突、非法次数、超出四位年份、未知系列、未知候补、取消已兑现
+     开放不足、冲突、非法次数、超出四位年份、需求组为空或组内重复/未知资源、
+     所需时长超过窗口长度、未知系列、未知候补、取消已兑现
      候补、候补标识非法、停用区间与有效预约重叠、未知停用、停用标识非法、
      改期清单不可读/损坏/内容非法、未知批量改期操作、撤销涉及预约与记录
      不一致或恢复安排受阻、iCalendar 文件不可读/结构非法（含重复规则或
@@ -3939,6 +4137,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       --start 2026-10-06T00:00 --end 2026-10-07T00:00
   node app.ts list-closures
   node app.ts cancel-closure C0001
+  node app.ts find-slot --window 2026-10-12T08:00/2026-10-12T18:00 --duration 60 \
+      --group R0001,R0002 --group R0003
   node app.ts import-ical ./events.ics --resource R0001 --resource R0002
 `;
 
@@ -4015,6 +4215,9 @@ async function main(): Promise<void> {
         break;
       case 'cancel-closure':
         await cmdCancelClosure(commandArgs);
+        break;
+      case 'find-slot':
+        await cmdFindSlot(commandArgs);
         break;
       case 'import-ical':
         await cmdImportIcal(commandArgs);
