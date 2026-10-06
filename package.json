@@ -8,6 +8,6 @@
   },
   "scripts": {
     "start": "node app.ts",
-    "test": "node --test test/batch-ops.test.ts test/ical-import.test.ts test/batch-validate.test.ts"
+    "test": "node --test test/batch-ops.test.ts test/ical-import.test.ts test/batch-validate.test.ts test/write-lock.test.ts"
   }
 }

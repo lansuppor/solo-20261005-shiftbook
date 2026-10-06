@@ -26,8 +26,19 @@
 // 多项预约目标（系列成员、批量改期目标、撤销恢复安排、导入新事件）的可行性
 // 校验统一由 validateBatchTargets 完成（无写入副作用），各入口只负责展开
 // 目标、给出需排除的当前占用，并按各自业务定位与顺序渲染诊断。
+//
+// 多进程写入保护：所有修改入口以同一数据文件为单位互斥（锁文件），保护覆盖
+// 读取决策所需状态、业务校验、分配标识与原子保存全过程；取得保护后据最新数据
+// 决策。相对/绝对/含 ./.. 的等价路径共享同一把锁，不同数据文件互不影响。
+// 竞争可等待，5 秒内未取得即以退出码 1 报告占用；进程异常退出留下的残留保护
+// 由 recover-lock 在确认原写入进程已退出后解除。查询不取锁，保存为原子替换，
+// 只读到提交前或提交后的完整快照。
 
-import {readFile, writeFile, rename, unlink} from 'node:fs/promises';
+import {lstat, readFile, writeFile, rename, unlink} from 'node:fs/promises';
+import {realpathSync} from 'node:fs';
+import {hostname} from 'node:os';
+import {basename, dirname, join, resolve} from 'node:path';
+import {createHash} from 'node:crypto';
 
 const APP = 'shiftbook';
 const DEFAULT_DATA_FILE = 'shiftbook-data.json';
@@ -990,6 +1001,205 @@ async function saveStore(file: string, store: Store): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// 多进程写入保护（同一数据文件全局互斥）
+//
+// 所有修改入口在读取数据前先取得本数据文件的写入保护（锁文件，wx 独占创建），
+// 保护覆盖读取决策所需状态、业务校验、标识分配与原子保存全过程，命令结束时
+// 统一释放（正常结束、校验失败、保存失败均释放）。锁文件按数据文件的规范路径
+// 命名：相对路径、绝对路径与含 ./.. 的等价写法共享同一把锁；不同数据文件
+// 互不影响；数据文件尚不存在时同样受保护。竞争可等待，但 5 秒内未取得即以
+// 退出码 1 报告占用（可重试）。进程异常退出会留下残留锁：recover-lock 仅在
+// 确认原写入进程已退出后解除，存活或无法确认一律拒绝，不按保护存在时长抢占；
+// 释放与恢复都只删除自己确认的那一份，绝不误删其他进程后来取得的保护。
+// ---------------------------------------------------------------------------
+
+const LOCK_TIMEOUT_MS = 5000; // 取得写入保护的最长等待时间
+const LOCK_RETRY_MS = 40; // 竞争重试间隔（含随机抖动，避免齐步）
+
+// 数据文件的规范路径：解析相对路径与 ./..，并尽量解析符号链接
+// （文件尚不存在时解析其父目录，父目录也不可用时退化为绝对路径）
+function canonicalDataPath(file: string): string {
+  const abs = resolve(file);
+  try {
+    return realpathSync(abs);
+  } catch {
+    try {
+      return join(realpathSync(dirname(abs)), basename(abs));
+    } catch {
+      return abs;
+    }
+  }
+}
+
+// 锁文件路径：与数据文件同目录、按规范路径命名；文件名长度受限（如 255 字节）
+// 时退化为同目录下的散列锁名，同一数据文件的所有进程仍共享同一把锁
+function lockPathFor(file: string): string {
+  const canonical = canonicalDataPath(file);
+  const primary = `${canonical}.lock`;
+  if (Buffer.byteLength(basename(primary), 'utf8') <= 250) return primary;
+  const hash = createHash('sha256').update(canonical).digest('hex').slice(0, 24);
+  return join(dirname(canonical), `.shiftbook-${hash}.lock`);
+}
+
+interface LockInfo {
+  pid: number; // 取得保护的进程
+  host: string; // 取得保护的主机（恢复时只能确认本机进程）
+  dataFile: string; // 被保护数据文件的规范路径
+  acquiredAt: string; // 取得时间（ISO 文本，仅供诊断，不作为解除依据）
+}
+
+function currentLockInfo(file: string): LockInfo {
+  return {
+    pid: process.pid,
+    host: hostname(),
+    dataFile: canonicalDataPath(file),
+    acquiredAt: new Date().toISOString(),
+  };
+}
+
+// 本进程当前持有的锁（一次命令至多一把；main 统一释放）
+let heldLockPath: string | null = null;
+
+async function acquireWriteLock(file: string): Promise<void> {
+  if (heldLockPath !== null) return;
+  const lockPath = lockPathFor(file);
+  const content = JSON.stringify(currentLockInfo(file)) + '\n';
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      await writeFile(lockPath, content, {encoding: 'utf8', flag: 'wx'});
+      heldLockPath = lockPath;
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw new BizError(`无法取得数据文件写入保护（锁文件 ${lockPath}）：${(err as Error).message}`);
+      }
+      if (Date.now() >= deadline) {
+        let owner = '';
+        try {
+          const info = JSON.parse(await readFile(lockPath, 'utf8')) as LockInfo;
+          owner = `（当前由进程 ${info.pid} 持有，始于 ${info.acquiredAt}）`;
+        } catch {
+          // 占用信息不可读不影响“被占用”的结论
+        }
+        throw new BizError(
+          `数据文件 ${file} 正被其他进程占用${owner}：${LOCK_TIMEOUT_MS / 1000} 秒内未能取得写入保护，` +
+            '本次未做任何改动，可稍后重试；若确认原写入进程已异常退出，可使用 recover-lock 解除残留保护',
+        );
+      }
+      await new Promise((r) => setTimeout(r, LOCK_RETRY_MS + Math.floor(Math.random() * LOCK_RETRY_MS)));
+    }
+  }
+}
+
+// 释放本进程取得的保护；仅删除自己创建的锁文件，绝不动其他进程后来取得的保护
+async function releaseWriteLock(): Promise<void> {
+  const lockPath = heldLockPath;
+  if (lockPath === null) return;
+  heldLockPath = null;
+  try {
+    const info = JSON.parse(await readFile(lockPath, 'utf8')) as LockInfo;
+    if (info.pid !== process.pid || info.host !== hostname()) return;
+    await unlink(lockPath);
+  } catch {
+    // 锁文件已不存在或不可读：不影响本次命令的结果
+  }
+}
+
+// 修改入口专用读取：先取得本数据文件的写入保护，再据最新数据决策。
+// 保护一直持有到命令结束（main 统一释放），覆盖业务校验、标识分配与原子保存。
+async function loadStoreForWrite(file: string): Promise<Store> {
+  await acquireWriteLock(file);
+  return loadStore(file);
+}
+
+// 本地恢复入口：仅确认原写入进程已退出时才解除残留保护；存活或无法确认一律
+// 明确拒绝，不按保护存在时长抢占。不重放旧命令，不改业务数据或标识计数。
+async function cmdRecoverLock(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(`recover-lock 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`);
+  }
+  if (positionals.length > 0) {
+    throw new UsageError('用法: recover-lock（确认原写入进程已退出后，解除本数据文件的残留写入保护）');
+  }
+
+  const file = activeDataFile;
+  const lockPath = lockPathFor(file);
+  const readLock = async (): Promise<{dev: number; ino: number; text: string}> => {
+    const st = await lstat(lockPath);
+    return {dev: st.dev, ino: st.ino, text: await readFile(lockPath, 'utf8')};
+  };
+
+  let first: {dev: number; ino: number; text: string};
+  try {
+    first = await readLock();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      console.log(`数据文件 ${file} 没有残留写入保护，无需恢复。`);
+      return;
+    }
+    throw new BizError(`无法读取写入保护文件 ${lockPath}: ${(err as Error).message}`);
+  }
+
+  let info: LockInfo;
+  try {
+    const parsed = JSON.parse(first.text) as LockInfo;
+    if (!Number.isInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.host !== 'string') {
+      throw new Error('invalid lock content');
+    }
+    info = parsed;
+  } catch {
+    throw new BizError(
+      `写入保护文件 ${lockPath} 内容无法辨认，无法确认原写入进程，拒绝解除（请人工核查后自行处理该文件）`,
+    );
+  }
+
+  if (info.host !== hostname()) {
+    throw new BizError(
+      `写入保护由另一台主机（${info.host}）的进程 ${info.pid} 取得，本机无法确认其是否已退出，拒绝解除`,
+    );
+  }
+
+  let alive = false;
+  try {
+    process.kill(info.pid, 0);
+    alive = true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
+      throw new BizError(`无法确认原写入进程 ${info.pid} 是否已退出（无权限查询），拒绝解除写入保护`);
+    }
+  }
+  if (alive) {
+    throw new BizError(
+      `写入保护仍由运行中的进程 ${info.pid} 持有（始于 ${info.acquiredAt}），拒绝解除；` +
+        '不按保护存在时长抢占，请等待其结束，或确认其已退出后重试',
+    );
+  }
+
+  // 删除前再次核对：锁文件未被替换（inode 与内容均一致），
+  // 绝不误删其他进程在核对期间重新取得的保护
+  let second: {dev: number; ino: number; text: string};
+  try {
+    second = await readLock();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      console.log('残留写入保护已被解除（可能由另一恢复入口处理），无需重复操作。');
+      return;
+    }
+    throw new BizError(`无法读取写入保护文件 ${lockPath}: ${(err as Error).message}`);
+  }
+  if (second.dev !== first.dev || second.ino !== first.ino || second.text !== first.text) {
+    throw new BizError('写入保护在核对期间已变化（可能已有新的写入者取得保护），拒绝解除');
+  }
+  await unlink(lockPath);
+  console.log(
+    `已解除数据文件 ${file} 的残留写入保护（原写入进程 ${info.pid} 已确认退出）。` +
+      '未重放任何旧命令，数据文件、业务记录与标识计数均未改动。',
+  );
+}
+
+// ---------------------------------------------------------------------------
 // 业务校验
 // ---------------------------------------------------------------------------
 
@@ -1328,7 +1538,7 @@ async function cmdAddResource(args: string[]): Promise<void> {
   });
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
   // 全部校验通过后才生成标识、改内存、落盘
   store.resourceSeq += 1;
   const id = `R${String(store.resourceSeq).padStart(4, '0')}`;
@@ -1370,7 +1580,7 @@ async function cmdCreateBooking(args: string[]): Promise<void> {
   const endRaw = requireFlag(values, 'end');
 
   const file = activeDataFile;
-  const store = await loadStore(activeDataFile);
+  const store = await loadStoreForWrite(activeDataFile);
 
   const ids = resolveResourceIds(store, resourceArgs);
   const startMin = parseDateTime(startRaw, '预约开始时间');
@@ -1400,7 +1610,7 @@ async function cmdRescheduleBooking(args: string[]): Promise<void> {
   const id = positionals[0];
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
   const booking = store.bookings.find((b) => b.id === id);
   if (!booking) throw new BizError(`未知预约标识: ${id}`);
   if (booking.status === 'cancelled') {
@@ -1542,7 +1752,7 @@ async function cmdRescheduleBatch(args: string[]): Promise<void> {
   const manifestFile = positionals[0];
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
   const records = parseManifestShape(await loadManifest(manifestFile), manifestFile);
 
   // 第一阶段：逐项做与业务数据相关的基础校验，收集全部问题后一次性拒绝整批
@@ -1802,7 +2012,7 @@ async function cmdUndoBatchOp(args: string[]): Promise<void> {
   if (!/^O\d{4,}$/.test(opId)) throw new BizError(`批量改期操作标识非法: ${opId}`);
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
   const op = store.batchOps.find((x) => x.id === opId);
   if (!op) throw new BizError(`未知批量改期操作标识: ${opId}`);
 
@@ -1932,7 +2142,7 @@ async function cmdCancelBooking(args: string[]): Promise<void> {
   const id = positionals[0];
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
   const booking = store.bookings.find((b) => b.id === id);
   if (!booking) throw new BizError(`未知预约标识: ${id}`);
   if (booking.status === 'cancelled') {
@@ -2028,7 +2238,7 @@ async function cmdCreateSeries(args: string[]): Promise<void> {
   const count = parseOccurrences(requireFlag(values, 'count'));
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
 
   const ids = resolveResourceIds(store, resourceArgs);
   const startMin = parseDateTime(startRaw, '首项开始时间');
@@ -2147,7 +2357,7 @@ async function cmdCancelSeries(args: string[]): Promise<void> {
   if (!/^S\d{4,}$/.test(seriesId)) throw new BizError(`系列标识非法: ${seriesId}`);
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
   const series = store.series.find((x) => x.id === seriesId);
   if (!series) throw new BizError(`未知系列标识: ${seriesId}`);
 
@@ -2203,7 +2413,7 @@ async function cmdAddWaitlist(args: string[]): Promise<void> {
   const endRaw = requireFlag(values, 'end');
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
 
   const ids = resolveResourceIds(store, resourceArgs);
   const startMin = parseDateTime(startRaw, '候补开始时间');
@@ -2284,7 +2494,7 @@ async function cmdAddFlexWaitlist(args: string[]): Promise<void> {
   const durationRaw = requireFlag(values, 'duration');
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
 
   const ids = resolveResourceIds(store, resourceArgs);
   const win = parseFlexWindow(windowRaw);
@@ -2379,7 +2589,7 @@ async function cmdCancelWaitlist(args: string[]): Promise<void> {
   if (!/^W\d{4,}$/.test(id)) throw new BizError(`候补标识非法: ${id}`);
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
   const w = store.waitlist.find((x) => x.id === id);
   if (!w) throw new BizError(`未知候补标识: ${id}`);
   if (w.status === 'fulfilled') {
@@ -2439,7 +2649,7 @@ async function cmdProcessWaitlist(args: string[]): Promise<void> {
   }
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
 
   // 已兑现/已取消项永不重新处理；两种候补只按共同的登记顺序遍历等待项
   const waiting = store.waitlist.filter((w) => w.status === 'waiting');
@@ -2614,7 +2824,7 @@ async function cmdAddClosure(args: string[]): Promise<void> {
   const endRaw = requireFlag(values, 'end');
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
 
   const resource = store.resources.find((r) => r.id === resourceId);
   if (!resource) throw new BizError(`未知资源标识: ${resourceId}`);
@@ -2691,7 +2901,7 @@ async function cmdCancelClosure(args: string[]): Promise<void> {
   if (!/^C\d{4,}$/.test(id)) throw new BizError(`停用标识非法: ${id}`);
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
   const closure = store.closures.find((c) => c.id === id);
   if (!closure) throw new BizError(`未知停用标识: ${id}`);
   if (closure.status === 'cancelled') {
@@ -3089,7 +3299,7 @@ async function cmdImportIcal(args: string[]): Promise<void> {
   const icalFile = positionals[0];
 
   const file = activeDataFile;
-  const store = await loadStore(file);
+  const store = await loadStoreForWrite(file);
   // 新事件统一使用该资源集合（至少一个不同的已登记资源，按标识排序）
   const ids = resolveResourceIds(store, resourceArgs);
 
@@ -3542,6 +3752,20 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   （开放区间扣除有效停用）完整覆盖；
   仅当存在共同资源且时间重叠时预约才冲突。
 
+并发写入保护:
+  所有修改入口以同一数据文件为单位互斥：先取得写入保护（锁文件
+  <数据文件>.lock），再读取最新数据、校验、分配标识并原子保存，命令结束
+  统一释放（正常结束、校验失败、保存失败均释放）。相对路径、绝对路径与
+  含 ./.. 的等价写法共享同一把锁；不同数据文件互不影响；数据文件尚不存在
+  时也受保护。竞争可等待，5 秒内未取得保护即以退出码 1 报告占用（可重试，
+  失败不产生记录、不消耗标识）。查询命令不等待保护，只读到提交前或提交后
+  的完整快照；帮助与用法错误不依赖保护。
+  recover-lock
+      本地恢复入口：进程异常退出可能留下残留保护（锁文件），导致修改入口
+      一直报告占用。本命令仅在确认原写入进程已退出时解除残留保护；进程仍
+      存活或无法确认时明确拒绝，不按保护存在时长抢占。不重放旧命令，不改
+      业务数据或标识计数；没有残留保护时明确提示且不改动。
+
 退出码:
   0  成功
   1  业务或文件失败（名称为空、未知/重复资源或预约、已取消预约、时间非法、
@@ -3551,7 +3775,9 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
      不一致或恢复安排受阻、iCalendar 文件不可读/结构非法（含重复规则或
      EXDATE 非法、无规则带 EXDATE、全部排除、展开超出四位年份）、UID 与
      首次导入不一致、新事件开放不足或冲突、数据文件损坏（含候补、停用、
-     批量改期或导入记录结构、引用或快照非法）或保存失败等）
+     批量改期或导入记录结构、引用或快照非法）、保存失败、数据文件被其他
+     进程占用（5 秒内未取得写入保护）或恢复被拒绝（原写入进程存活或无法
+     确认已退出）等）
   2  用法错误（未知参数、缺少必需选项、多余位置参数等）
 
 示例:
@@ -3594,72 +3820,80 @@ async function main(): Promise<void> {
   }
 
   const [command, ...commandArgs] = globalArgs.rest;
-  switch (command) {
-    case 'add-resource':
-      await cmdAddResource(commandArgs);
-      break;
-    case 'list-resources':
-      await cmdListResources(commandArgs);
-      break;
-    case 'create-booking':
-      await cmdCreateBooking(commandArgs);
-      break;
-    case 'reschedule-booking':
-      await cmdRescheduleBooking(commandArgs);
-      break;
-    case 'reschedule-batch':
-      await cmdRescheduleBatch(commandArgs);
-      break;
-    case 'list-batch-ops':
-      await cmdListBatchOps(commandArgs);
-      break;
-    case 'undo-batch-op':
-      await cmdUndoBatchOp(commandArgs);
-      break;
-    case 'cancel-booking':
-      await cmdCancelBooking(commandArgs);
-      break;
-    case 'list-bookings':
-      await cmdListBookings(commandArgs);
-      break;
-    case 'create-series':
-      await cmdCreateSeries(commandArgs);
-      break;
-    case 'list-series':
-      await cmdListSeries(commandArgs);
-      break;
-    case 'cancel-series':
-      await cmdCancelSeries(commandArgs);
-      break;
-    case 'add-waitlist':
-      await cmdAddWaitlist(commandArgs);
-      break;
-    case 'add-flex-waitlist':
-      await cmdAddFlexWaitlist(commandArgs);
-      break;
-    case 'list-waitlist':
-      await cmdListWaitlist(commandArgs);
-      break;
-    case 'cancel-waitlist':
-      await cmdCancelWaitlist(commandArgs);
-      break;
-    case 'process-waitlist':
-      await cmdProcessWaitlist(commandArgs);
-      break;
-    case 'add-closure':
-      await cmdAddClosure(commandArgs);
-      break;
-    case 'list-closures':
-      await cmdListClosures(commandArgs);
-      break;
-    case 'cancel-closure':
-      await cmdCancelClosure(commandArgs);
-      break;
-    case 'import-ical':
-      await cmdImportIcal(commandArgs);
-      break;
-    default:
-      throw new UsageError(`未知命令: ${command}`);
+  try {
+    switch (command) {
+      case 'add-resource':
+        await cmdAddResource(commandArgs);
+        break;
+      case 'list-resources':
+        await cmdListResources(commandArgs);
+        break;
+      case 'create-booking':
+        await cmdCreateBooking(commandArgs);
+        break;
+      case 'reschedule-booking':
+        await cmdRescheduleBooking(commandArgs);
+        break;
+      case 'reschedule-batch':
+        await cmdRescheduleBatch(commandArgs);
+        break;
+      case 'list-batch-ops':
+        await cmdListBatchOps(commandArgs);
+        break;
+      case 'undo-batch-op':
+        await cmdUndoBatchOp(commandArgs);
+        break;
+      case 'cancel-booking':
+        await cmdCancelBooking(commandArgs);
+        break;
+      case 'list-bookings':
+        await cmdListBookings(commandArgs);
+        break;
+      case 'create-series':
+        await cmdCreateSeries(commandArgs);
+        break;
+      case 'list-series':
+        await cmdListSeries(commandArgs);
+        break;
+      case 'cancel-series':
+        await cmdCancelSeries(commandArgs);
+        break;
+      case 'add-waitlist':
+        await cmdAddWaitlist(commandArgs);
+        break;
+      case 'add-flex-waitlist':
+        await cmdAddFlexWaitlist(commandArgs);
+        break;
+      case 'list-waitlist':
+        await cmdListWaitlist(commandArgs);
+        break;
+      case 'cancel-waitlist':
+        await cmdCancelWaitlist(commandArgs);
+        break;
+      case 'process-waitlist':
+        await cmdProcessWaitlist(commandArgs);
+        break;
+      case 'add-closure':
+        await cmdAddClosure(commandArgs);
+        break;
+      case 'list-closures':
+        await cmdListClosures(commandArgs);
+        break;
+      case 'cancel-closure':
+        await cmdCancelClosure(commandArgs);
+        break;
+      case 'import-ical':
+        await cmdImportIcal(commandArgs);
+        break;
+      case 'recover-lock':
+        await cmdRecoverLock(commandArgs);
+        break;
+      default:
+        throw new UsageError(`未知命令: ${command}`);
+    }
+  } finally {
+    // 正常结束、校验失败与保存失败都走到这里：释放本次取得的写入保护
+    await releaseWriteLock();
   }
 }
 
