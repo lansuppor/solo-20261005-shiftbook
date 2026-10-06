@@ -15,6 +15,10 @@
 // 同一条登记顺序，process-waitlist 按登记顺序手动处理整个队列（弹性项取窗口内
 // 最早可行开始），为可兑现项各创建一项普通预约，受阻项继续等待且不影响后续项。
 //
+// 候选组合查询：find-slot 在营业地时间窗口内为一组有顺序的需求（每组列出
+// 可任选其一的候选资源）寻找能同时满足全部需求的最早连续时段——每组恰选一
+// 个候选，全部所选资源互不相同并全程保持同一组合；只读快照，不写数据文件。
+//
 // iCalendar 导入：import-ical 读取本地 UTF-8 的 VCALENDAR（VERSION:2.0），
 // 为每个新 VEVENT 创建预约（统一使用命令行给定的资源集合，不自动处理候补）：
 // 无 RRULE 的独立事件创建一项普通预约；带 RRULE:FREQ=WEEKLY;COUNT=n 的事件创建
@@ -2581,22 +2585,23 @@ function parseDurationMinutes(raw: string): number {
   return Number(raw);
 }
 
-// 解析弹性候补的“窗口开始/窗口结束”
+// 解析“窗口开始/窗口结束”（弹性候补窗口、候选组合查询窗口共用；label 用于报错定位）
 function parseFlexWindow(
   value: string,
+  label = '弹性窗口',
 ): {start: string; end: string; startMin: number; endMin: number} {
   const parts = String(value ?? '').split('/');
   if (parts.length !== 2 || parts[0] === '' || parts[1] === '') {
     throw new BizError(
-      `弹性窗口格式非法: “${value}”，应为 窗口开始/窗口结束（YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm）`,
+      `${label}格式非法: “${value}”，应为 窗口开始/窗口结束（YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm）`,
     );
   }
   const start = parts[0];
   const end = parts[1];
-  const startMin = parseDateTime(start, '弹性窗口开始时间');
-  const endMin = parseDateTime(end, '弹性窗口结束时间');
+  const startMin = parseDateTime(start, `${label}开始时间`);
+  const endMin = parseDateTime(end, `${label}结束时间`);
   if (endMin <= startMin) {
-    throw new BizError(`弹性窗口结束时间必须晚于开始时间: “${value}”，允许跨日`);
+    throw new BizError(`${label}结束时间必须晚于开始时间: “${value}”，允许跨日`);
   }
   return {start, end, startMin, endMin};
 }
@@ -2932,6 +2937,214 @@ function renderBlocked(
     lines.push(...renderMinuteSegments(free, '      '));
   }
   return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// 候选资源组合的最早可行时段查询（find-slot，只读）
+//
+// 给定营业地时间窗口、所需连续分钟数与有顺序的需求组（每组列出可任选其一的
+// 已登记资源），在窗口内寻找能同时满足全部需求的最早开始分钟：每组恰选一个
+// 候选，全部所选资源互不相同，并在整个时段保持同一组合（不中途更换资源、
+// 不拼接间断时间）。各资源空闲时间 = 开放区间合并重叠或相接后扣除有效停用
+// 并集与当前有效预约占用（取消的预约/停用与未兑现候补不阻挡），区间左闭
+// 右开、端点相接可行。同一最早开始有多个组合时，按组顺序的资源标识序列取
+// 字典序最小者。本命令只读一份完整快照：不取写入保护、不创建任何记录、
+// 不写数据文件或推进计数；方案不保留位置，后续创建预约仍检查最新状态。
+// ---------------------------------------------------------------------------
+
+interface RequirementGroup {
+  index: number; // 1 基，需求组顺序
+  candidates: string[]; // 已校验、按标识排序的候选资源（组内输入顺序不影响结果）
+}
+
+// 解析并校验需求组：至少一组（由调用方保证），每组非空；
+// 组内重复或未知资源拒绝；同一资源允许出现在不同组（求解时保证所选互不相同）
+function parseRequirementGroups(store: Store, rawGroups: string[]): RequirementGroup[] {
+  return rawGroups.map((raw, i) => {
+    const label = `第 ${i + 1} 需求组`;
+    const ids = raw.split(',').map((s) => s.trim());
+    if (ids.some((s) => s === '')) {
+      throw new BizError(
+        `${label}为空或含空项: “${raw}”，应为逗号分隔的已登记资源标识（如 R0001,R0002）`,
+      );
+    }
+    const seen = new Set<string>();
+    const dupes: string[] = [];
+    for (const id of ids) {
+      if (seen.has(id) && !dupes.includes(id)) dupes.push(id);
+      seen.add(id);
+    }
+    if (dupes.length > 0) throw new BizError(`${label}内候选资源重复: ${dupes.join('、')}`);
+    const unknown = [...seen].filter((id) => !store.resources.some((r) => r.id === id)).sort();
+    if (unknown.length > 0) throw new BizError(`${label}含未知资源标识: ${unknown.join('、')}`);
+    return {index: i + 1, candidates: [...seen].sort()};
+  });
+}
+
+// 单个资源在窗口内的空闲区间：实际可用时间（开放合并后扣除有效停用并集）
+// 裁进窗口，再扣除该资源当前有效预约的占用（普通预约、系列成员、导入预约与
+// 候补兑现预约均按当前安排占用；已取消不占用）
+function resourceFreeSegments(
+  store: Store,
+  id: string,
+  wStart: number,
+  wEnd: number,
+): Array<[number, number]> {
+  const r = store.resources.find((x) => x.id === id)!;
+  const available = clipSegments(availableSegmentsOf(store, r), wStart, wEnd);
+  const busy: Array<[number, number]> = [];
+  for (const b of store.bookings) {
+    if (b.status !== 'active') continue;
+    if (!b.resourceIds.includes(id)) continue;
+    const bStart = parseDateTime(b.start, '预约开始时间');
+    const bEnd = parseDateTime(b.end, '预约结束时间');
+    const a = Math.max(bStart, wStart);
+    const c = Math.min(bEnd, wEnd);
+    if (a < c) busy.push([a, c]);
+  }
+  return subtractSegments(available, busy);
+}
+
+// 固定开始分钟上的字典序最小可行资源序列：逐组按标识升序试探，
+// 选定前先用增广路匹配确认剩余组仍能各选一个互不相同的可用候选，
+// 因此不会因前组贪选较小标识而漏掉需要调整前组选择的可行组合，
+// 也不会把每组各自可行误当成整体可行
+function lexMinAssignment(
+  groups: RequirementGroup[],
+  usable: (id: string) => boolean,
+): string[] | null {
+  const chosen: string[] = [];
+  const used = new Set<string>();
+
+  // 第 from 组起（0 基）在 used 之外能否各选一个互不相同的可用候选
+  const restMatchable = (from: number): boolean => {
+    const match = new Map<string, number>(); // 资源 -> 组下标
+    const tryAssign = (g: number, seen: Set<string>): boolean => {
+      for (const id of groups[g].candidates) {
+        if (used.has(id) || seen.has(id) || !usable(id)) continue;
+        seen.add(id);
+        const owner = match.get(id);
+        if (owner === undefined || tryAssign(owner, seen)) {
+          match.set(id, g);
+          return true;
+        }
+      }
+      return false;
+    };
+    for (let g = from; g < groups.length; g++) {
+      if (!tryAssign(g, new Set())) return false;
+    }
+    return true;
+  };
+
+  for (let g = 0; g < groups.length; g++) {
+    let picked: string | null = null;
+    for (const id of groups[g].candidates) {
+      if (used.has(id) || !usable(id)) continue;
+      used.add(id);
+      if (restMatchable(g + 1)) {
+        picked = id;
+        break;
+      }
+      used.delete(id);
+    }
+    if (picked === null) return null;
+    chosen.push(picked);
+  }
+  return chosen;
+}
+
+// 窗口内能同时满足全部需求的最早开始分钟及该时刻字典序最小的组合；
+// 最早可行开始必为某候选资源某段空闲的起点（共同空闲段的起点即某资源空闲段起点），
+// 故逐一升序试探全部候选资源的空闲段起点即可
+function findEarliestSlot(
+  store: Store,
+  groups: RequirementGroup[],
+  wStart: number,
+  wEnd: number,
+  duration: number,
+): {startMin: number; endMin: number; picks: string[]} | null {
+  const freeById = new Map<string, Array<[number, number]>>();
+  const starts = new Set<number>();
+  for (const g of groups) {
+    for (const id of g.candidates) {
+      if (freeById.has(id)) continue;
+      const free = resourceFreeSegments(store, id, wStart, wEnd);
+      freeById.set(id, free);
+      for (const [s, e] of free) {
+        if (e - s >= duration) starts.add(s);
+      }
+    }
+  }
+
+  const usableAt = (s: number): ((id: string) => boolean) => {
+    const e = s + duration;
+    const cache = new Map<string, boolean>();
+    return (id: string): boolean => {
+      let v = cache.get(id);
+      if (v === undefined) {
+        v = isFullyCovered(freeById.get(id)!, s, e);
+        cache.set(id, v);
+      }
+      return v;
+    };
+  };
+
+  for (const s of [...starts].sort((a, b) => a - b)) {
+    if (s + duration > wEnd) continue; // 结束不得超出窗口
+    const picks = lexMinAssignment(groups, usableAt(s));
+    if (picks !== null) return {startMin: s, endMin: s + duration, picks};
+  }
+  return null;
+}
+
+async function cmdFindSlot(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, ['window', 'duration', 'group'], ['group']);
+  if (positionals.length > 0) {
+    throw new UsageError(`find-slot 不接受位置参数: ${positionals.join(' ')}`);
+  }
+  const windowRaw = requireFlag(values, 'window');
+  const durationRaw = requireFlag(values, 'duration');
+  const groupArgs = values.get('group');
+  if (!groupArgs || groupArgs.length === 0) {
+    throw new UsageError('至少需要一个 --group 需求组（逗号分隔的候选资源标识，如 --group R0001,R0002）');
+  }
+
+  // 查询只读一份完整快照：不取写入保护、不写数据文件、不推进任何计数
+  const store = await loadStore(activeDataFile);
+
+  const win = parseFlexWindow(windowRaw, '查询窗口');
+  const durationMinutes = parseDurationMinutes(durationRaw);
+  const windowLength = win.endMin - win.startMin;
+  if (durationMinutes > windowLength) {
+    throw new BizError(
+      `所需连续时长 ${durationMinutes} 分钟超过窗口长度 ${windowLength} 分钟（窗口: ${win.start} → ${win.end}）`,
+    );
+  }
+  const groups = parseRequirementGroups(store, groupArgs);
+
+  const found = findEarliestSlot(store, groups, win.startMin, win.endMin, durationMinutes);
+  if (found === null) {
+    // 无解明确提示，退出码仍为 0；绝不返回少组或缩短时长的方案
+    console.log(
+      `无解：窗口 ${win.start} → ${win.end} 内不存在能同时满足全部 ${groups.length} 个需求组的` +
+        `连续 ${durationMinutes} 分钟时段（每组须各选一个候选，全部所选资源互不相同并全程保持同一组合）。`,
+    );
+    return;
+  }
+
+  const startRaw = formatDateTime(found.startMin);
+  const endRaw = formatDateTime(found.endMin);
+  if (startRaw === null || endRaw === null) {
+    // 理论不可达：窗口已校验在 0001-9999 内，时段不超出窗口
+    throw new BizError('可行时段超出四位年份范围');
+  }
+  console.log(`最早可行时段: ${startRaw} → ${endRaw}（${durationMinutes} 分钟）`);
+  console.log('所选资源（按需求组顺序，全程保持同一组合）:');
+  found.picks.forEach((id, i) => {
+    const r = store.resources.find((x) => x.id === id)!;
+    console.log(`  第 ${i + 1} 组: ${id}（${r.name}，${RESOURCE_TYPE_LABEL[r.type]}）`);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -3683,7 +3896,7 @@ async function cmdImportIcal(args: string[]): Promise<void> {
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用、批量改期记录与安全撤销，以及 iCalendar 导入）
+const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用、批量改期记录与安全撤销、iCalendar 导入，以及候选资源组合的最早可行时段查询）
 
 用法:
   node app.ts [--data <数据文件>] <命令> [选项]
@@ -3777,6 +3990,25 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       全部阻挡含本轮后项产生的预约；弹性等待项按最终安排列出窗口内全部最大
       共同空闲区间及分钟数，按开始时间排序，空集明确提示）。没有可兑现项也
       成功且不改变记录或计数；预约或停用变更不自动处理候补
+
+查询命令（候选资源组合的最早可行时段，只读不写）:
+  find-slot --window <开始/结束> --duration <正整数分钟> \\
+      --group <候选资源,逗号分隔> [--group <候选资源,逗号分隔> ...]
+      在营业地时间窗口（YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm，真实有效、
+      结束晚于开始、允许跨日、与机器时区无关）内，为一组有顺序的需求寻找
+      能同时满足全部需求的最早连续时段：每个 --group 列出一组可任选其一的
+      已登记资源（至少一组，每组非空；组内重复或未知资源拒绝；同一资源可
+      出现在不同组，例如两名工作人员用两个需求组表达）。时长为不超过窗口
+      长度的正整数分钟。每组恰选一个候选，全部所选资源互不相同，并在整个
+      时段保持同一组合（不中途更换资源、不拼接间断时间）。各资源空闲时间
+      = 开放区间合并重叠或相接后扣除有效停用并集与当前有效预约占用（取消
+      的预约/停用与未兑现候补不阻挡），区间左闭右开、端点相接可行。有解时
+      显示起止时间与按需求组顺序的所选资源（标识、名称、类型）；同一最早
+      开始有多个组合时，按组顺序的资源标识序列取字典序最小者（组内候选
+      输入顺序不影响结果）。无解明确提示且退出码为 0，不返回少组或缩短
+      时长的方案。本命令只读一份完整数据快照：不等待写入保护、不创建预约
+      或任何记录、不写数据文件或推进计数；方案不保留位置，后续创建预约仍
+      检查最新状态
 
 停用命令（场地维护、设备检修、人员休息）:
   add-closure --resource <标识> --start <YYYY-MM-DDTHH:mm> --end <YYYY-MM-DDTHH:mm>
@@ -3902,7 +4134,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
 
 退出码:
   0  成功
-  1  业务或文件失败（名称为空、未知/重复资源或预约、已取消预约、时间非法、
+  1  业务或文件失败（名称为空、未知/重复资源或预约、需求组为空或含未知/
+     组内重复候选、已取消预约、时间非法、
      开放不足、冲突、非法次数、超出四位年份、未知系列、未知候补、取消已兑现
      候补、候补标识非法、停用区间与有效预约重叠、未知停用、停用标识非法、
      改期清单不可读/损坏/内容非法、未知批量改期操作、撤销涉及预约与记录
@@ -3935,6 +4168,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   node app.ts list-waitlist
   node app.ts process-waitlist
   node app.ts cancel-waitlist W0001
+  node app.ts find-slot --window 2026-10-12T08:00/2026-10-12T18:00 \\
+      --duration 60 --group R0001,R0002 --group R0003,R0004
   node app.ts add-closure --resource R0001 \\
       --start 2026-10-06T00:00 --end 2026-10-07T00:00
   node app.ts list-closures
@@ -4006,6 +4241,9 @@ async function main(): Promise<void> {
         break;
       case 'process-waitlist':
         await cmdProcessWaitlist(commandArgs);
+        break;
+      case 'find-slot':
+        await cmdFindSlot(commandArgs);
         break;
       case 'add-closure':
         await cmdAddClosure(commandArgs);
