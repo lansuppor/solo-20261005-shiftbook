@@ -290,7 +290,7 @@ test('新项校验：开放不足、相关停用、既有冲突与批内冲突',
     event('uid-batch-b', '20261012T163000', '20261012T173000'),
   ));
   const r = importBizFail(df, f, ['R0001'], '四类失败同时报告');
-  assert.match(r.stderr, /共 4 项新事件不满足条件/);
+  assert.match(r.stderr, /共 4 项新预约不满足条件/);
   assert.match(r.stderr, /uid-gap[\s\S]*相关有效停用: C0001（2026-10-13T09:00 → 2026-10-13T12:00）/);
   assert.match(r.stderr, /uid-conflict[\s\S]*B0001/);
   assert.match(r.stderr, /uid-batch-a[\s\S]*uid-batch-b/, '批内冲突列出对方 UID');
@@ -328,7 +328,9 @@ test('结构错误、关键属性重复、非法时间等一律整批失败', (t
     ['秒非 00', ical(event('a', '20261012T100001', '20261012T110000')), /秒必须为 00/],
     ['不存在的日期', ical(event('a', '20260230T100000', '20260230T110000')), /真实有效/],
     ['结束早于开始', ical(event('a', '20261012T110000', '20261012T100000')), /晚于开始/],
-    ['RRULE', ical(event('a', '20261012T100000', '20261012T110000', 'RRULE:FREQ=WEEKLY\n')), /重复相关属性/],
+    ['RRULE 缺少 COUNT', ical(event('a', '20261012T100000', '20261012T110000', 'RRULE:FREQ=WEEKLY\n')), /缺少 COUNT/],
+    ['RDATE', ical(event('a', '20261012T100000', '20261012T110000', 'RDATE:20261019T100000\n')), /重复相关属性/],
+    ['EXRULE', ical(event('a', '20261012T100000', '20261012T110000', 'EXRULE:FREQ=WEEKLY;COUNT=2\n')), /重复相关属性/],
     ['RECURRENCE-ID', ical(event('a', '20261012T100000', '20261012T110000', 'RECURRENCE-ID:20261012T100000\n')), /重复相关属性/],
     ['STATUS:CANCELLED', ical(event('a', '20261012T100000', '20261012T110000', 'STATUS:CANCELLED\n')), /取消事件/],
     ['METHOD:CANCEL', 'BEGIN:VCALENDAR\nVERSION:2.0\nMETHOD:CANCEL\n' + event('a', '20261012T100000', '20261012T110000') + 'END:VCALENDAR\n', /取消事件/],
@@ -471,4 +473,328 @@ test('身份不依赖文件路径：同一 UID 从不同路径导入仍为重放
   const r = importOk(df, f2, ['R0001'], '另一路径同一 UID');
   assert.match(r.stdout, /全部为重放/);
   assert.equal(readStore(df).bookings.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// 13. 按周重复事件：创建系列及全部未排除成员，一次原子落盘
+// ---------------------------------------------------------------------------
+
+test('按周重复事件：创建系列及未排除成员（EXDATE 多行/逗号/去重/大小写与顺序无关）', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+
+  // 部件大小写与顺序无关；EXDATE 多行 + 逗号列表 + 重复值去重 + 不匹配值不生效
+  const f = writeIcal(dir, 'w.ics', ical(
+    'BEGIN:VEVENT\n' +
+      'UID:weekly-review@example.com\n' +
+      'DTSTART:20261013T090000\n' +
+      'DTEND:20261013T093000\n' +
+      'rrule:count=4;freq=weekly\n' +
+      'EXDATE:20261027T090000,20261027T090000\n' +
+      'EXDATE:20261225T090000\n' + // 不匹配任何发生，自然不生效
+      'SUMMARY:每周评审\n' +
+      'END:VEVENT\n',
+    event('single@example.com', '20261012T100000', '20261012T110000'),
+  ));
+  const r = importOk(df, f, ['R0001'], '导入重复与独立混合文件');
+  assert.match(r.stdout, /新增 2 项，重放 0 项/);
+  assert.match(r.stdout, /weekly-review@example\.com.*新系列 S0001/);
+  assert.match(r.stdout, /按周重复共 4 次，排除 2026-10-27T09:00，生成 3 项成员/);
+  assert.match(r.stdout, /第 1 次发生 2026-10-13T09:00 → 2026-10-13T09:30 → 预约 B0001/);
+  assert.match(r.stdout, /第 2 次发生 2026-10-20T09:00 → 2026-10-20T09:30 → 预约 B0002/);
+  assert.match(r.stdout, /第 4 次发生 2026-11-03T09:00 → 2026-11-03T09:30 → 预约 B0003/);
+
+  const store = readStore(df);
+  assert.equal(store.seriesSeq, 1);
+  assert.equal(store.series.length, 1);
+  assert.equal(store.bookingSeq, 4);
+  const members = store.bookings.filter((b: any) => b.seriesId === 'S0001');
+  assert.equal(members.length, 3, '仅为未排除发生生成成员');
+  assert.deepEqual(members.map((b: any) => b.start), [
+    '2026-10-13T09:00',
+    '2026-10-20T09:00',
+    '2026-11-03T09:00',
+  ]);
+  assert.equal(store.bookings.find((b: any) => b.id === 'B0004').seriesId, undefined, '独立事件不加入系列');
+  const imp = store.imports.find((x: any) => x.uid === 'weekly-review@example.com');
+  assert.equal(imp.seriesId, 'S0001');
+  assert.equal(imp.count, 4);
+  assert.deepEqual(imp.excludes, ['2026-10-27T09:00'], '不匹配发生的排除值不进入快照');
+  assert.equal(imp.bookingId, undefined);
+  assert.deepEqual(
+    imp.members.map((m: any) => [m.start, m.end, m.bookingId]),
+    [
+      ['2026-10-13T09:00', '2026-10-13T09:30', 'B0001'],
+      ['2026-10-20T09:00', '2026-10-20T09:30', 'B0002'],
+      ['2026-11-03T09:00', '2026-11-03T09:30', 'B0003'],
+    ],
+  );
+  // 系列可通过现有入口查询
+  const ls = ok(df, ['list-series'], 'list-series 含导入系列');
+  assert.match(ls.stdout, /系列 S0001（3 项，有效 3 项）/);
+});
+
+// ---------------------------------------------------------------------------
+// 14. 重复事件重放：部件/排除值顺序、重复排除值、资源顺序不算变化；
+//     全重放不写文件；显示原系列、原发生时间与当前状态
+// ---------------------------------------------------------------------------
+
+test('重复事件重放：顺序与重复排除值不算变化，全重放不写文件', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+  addResource(df, '投影仪');
+
+  const f1 = writeIcal(dir, 'w1.ics', ical(
+    'BEGIN:VEVENT\n' +
+      'UID:w@example.com\n' +
+      'DTSTART:20261013T090000\n' +
+      'DTEND:20261013T093000\n' +
+      'RRULE:FREQ=WEEKLY;COUNT=4\n' +
+      'EXDATE:20261027T090000,20261103T090000\n' +
+      'END:VEVENT\n',
+  ));
+  importOk(df, f1, ['R0001', 'R0002'], '首次导入');
+  const before = readFileSync(df);
+
+  // 部件顺序颠倒、排除值顺序颠倒且重复、资源顺序颠倒 —— 仍是重放
+  const f2 = writeIcal(dir, 'w2.ics', ical(
+    'BEGIN:VEVENT\n' +
+      'UID:w@example.com\n' +
+      'DTSTART:20261013T090000\n' +
+      'DTEND:20261013T093000\n' +
+      'RRULE:COUNT=4;FREQ=WEEKLY\n' +
+      'EXDATE:20261103T090000\n' +
+      'EXDATE:20261027T090000,20261103T090000\n' +
+      'END:VEVENT\n',
+  ));
+  const r = importOk(df, f2, ['R0002', 'R0001'], '重放（顺序与重复值差异）');
+  assert.match(r.stdout, /全部为重放/);
+  assert.match(r.stdout, /系列 S0001（重放，未做改动）/);
+  assert.match(r.stdout, /原发生 2026-10-13T09:00 → 2026-10-13T09:30 → 预约 B0001 \[已预约\] 当前 2026-10-13T09:00 → 2026-10-13T09:30/);
+  assert.match(r.stdout, /原发生 2026-10-20T09:00 → 2026-10-20T09:30 → 预约 B0002 \[已预约\]/);
+  assert.ok(before.equals(readFileSync(df)), '全为重放时数据文件逐字节不变');
+  const store = readStore(df);
+  assert.equal(store.bookingSeq, 2, '计数不推进');
+  assert.equal(store.seriesSeq, 1);
+});
+
+// ---------------------------------------------------------------------------
+// 15. 重复身份不一致：COUNT、排除集合、重复与否、首项时间变化均整批拒绝
+// ---------------------------------------------------------------------------
+
+test('重复身份不一致：COUNT/排除集合/重复与否/首项时间变化均整批拒绝', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+
+  const base = (extra: string, start = '20261013T090000', end = '20261013T093000') =>
+    ical(
+      'BEGIN:VEVENT\n' +
+        `UID:w@example.com\nDTSTART:${start}\nDTEND:${end}\n${extra}` +
+        'END:VEVENT\n',
+    );
+  const f = writeIcal(dir, 'w.ics', base('RRULE:FREQ=WEEKLY;COUNT=3\nEXDATE:20261027T090000\n'));
+  importOk(df, f, ['R0001'], '首次导入');
+  const before = readFileSync(df);
+
+  const cases: Array<[string, string]> = [
+    ['COUNT 变化', base('RRULE:FREQ=WEEKLY;COUNT=4\nEXDATE:20261027T090000\n')],
+    ['排除集合变化', base('RRULE:FREQ=WEEKLY;COUNT=3\nEXDATE:20261020T090000\n')],
+    ['去掉排除', base('RRULE:FREQ=WEEKLY;COUNT=3\n')],
+    ['重复变独立', base('')],
+    ['首项时间变化', base('RRULE:FREQ=WEEKLY;COUNT=3\nEXDATE:20261027T100000\n', '20261013T100000', '20261013T103000')],
+  ];
+  for (const [name, content] of cases) {
+    const fc = writeIcal(dir, 'c.ics', content);
+    const r = importBizFail(df, fc, ['R0001'], `身份不一致：${name}`);
+    assert.match(r.stderr, /与首次导入不一致/, `身份不一致：${name}`);
+    assert.match(r.stderr, /w@example\.com/, `身份不一致：${name}`);
+  }
+  assert.ok(before.equals(readFileSync(df)), '整批拒绝后数据文件逐字节不变');
+
+  // 独立变重复同样拒绝
+  const fSingle = writeIcal(dir, 's.ics', ical(event('s@example.com', '20261012T100000', '20261012T110000')));
+  importOk(df, fSingle, ['R0001'], '导入独立事件');
+  const before2 = readFileSync(df);
+  const fToRec = writeIcal(dir, 's2.ics', ical(
+    'BEGIN:VEVENT\n' +
+      'UID:s@example.com\nDTSTART:20261012T100000\nDTEND:20261012T110000\n' +
+      'RRULE:FREQ=WEEKLY;COUNT=2\nEND:VEVENT\n',
+  ));
+  const r2 = importBizFail(df, fToRec, ['R0001'], '独立变重复');
+  assert.match(r2.stderr, /与首次导入不一致/);
+  assert.ok(before2.equals(readFileSync(df)), '独立变重复拒绝后数据文件逐字节不变');
+});
+
+// ---------------------------------------------------------------------------
+// 16. 重复事件成员支持现有单项及系列操作；重放不复活、不重建
+// ---------------------------------------------------------------------------
+
+test('重复事件成员支持单项/系列操作；重放不复活不重建', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+
+  const f = writeIcal(dir, 'w.ics', ical(
+    'BEGIN:VEVENT\n' +
+      'UID:w@example.com\nDTSTART:20261013T090000\nDTEND:20261013T093000\n' +
+      'RRULE:FREQ=WEEKLY;COUNT=3\nEND:VEVENT\n',
+  ));
+  importOk(df, f, ['R0001'], '首次导入');
+
+  // 单项改期、单项取消
+  ok(df, ['reschedule-booking', 'B0002', '--start', '2026-10-20T10:00', '--end', '2026-10-20T10:30'], '成员改期');
+  ok(df, ['cancel-booking', 'B0003'], '成员取消');
+  let r = importOk(df, f, ['R0001'], '重放（成员被改期/取消后）');
+  assert.match(r.stdout, /全部为重放/);
+  assert.match(r.stdout, /原发生 2026-10-20T09:00 → 2026-10-20T09:30 → 预约 B0002 \[已预约\] 当前 2026-10-20T10:00 → 2026-10-20T10:30/);
+  assert.match(r.stdout, /预约 B0003 \[已取消\]/);
+  let store = readStore(df);
+  assert.equal(store.bookings.length, 3, '不重建预约');
+  assert.equal(store.bookings.find((b: any) => b.id === 'B0003').status, 'cancelled', '不复活已取消成员');
+
+  // 整体取消系列后重放仍不复活
+  ok(df, ['cancel-series', 'S0001'], '整体取消系列');
+  r = importOk(df, f, ['R0001'], '重放（系列整体取消后）');
+  assert.match(r.stdout, /全部为重放/);
+  assert.match(r.stdout, /预约 B0001 \[已取消\]/);
+  store = readStore(df);
+  assert.equal(store.bookings.length, 3);
+  assert.ok(store.bookings.every((b: any) => b.status === 'cancelled'));
+  assert.equal(store.bookingSeq, 3, '计数不推进');
+});
+
+// ---------------------------------------------------------------------------
+// 17. RRULE/EXDATE 结构负例：整批失败
+// ---------------------------------------------------------------------------
+
+test('RRULE/EXDATE 结构负例一律整批失败', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室', [['0001-01-01T00:00', '9999-12-31T23:59']]);
+
+  const ev = (extra: string, start = '20261013T090000', end = '20261013T093000') =>
+    ical(`BEGIN:VEVENT\nUID:a\nDTSTART:${start}\nDTEND:${end}\n${extra}END:VEVENT\n`);
+  const cases: Array<[string, string, RegExp]> = [
+    ['无 RRULE 却有 EXDATE', ev('EXDATE:20261013T090000\n'), /EXDATE 但没有 RRULE/],
+    ['全部排除', ev('RRULE:FREQ=WEEKLY;COUNT=2\nEXDATE:20261013T090000,20261020T090000\n'), /均被 EXDATE 排除/],
+    ['RRULE 重复', ev('RRULE:FREQ=WEEKLY;COUNT=2\nRRULE:FREQ=WEEKLY;COUNT=3\n'), /RRULE 属性重复/],
+    ['部件重复', ev('RRULE:FREQ=WEEKLY;COUNT=2;count=3\n'), /部件重复/],
+    ['未知部件', ev('RRULE:FREQ=WEEKLY;COUNT=2;BYDAY=TU\n'), /不支持的部件/],
+    ['INTERVAL 部件', ev('RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=2\n'), /不支持的部件/],
+    ['非按周重复', ev('RRULE:FREQ=DAILY;COUNT=2\n'), /FREQ=WEEKLY/],
+    ['COUNT 为 0', ev('RRULE:FREQ=WEEKLY;COUNT=0\n'), /COUNT 非法/],
+    ['COUNT 前导零', ev('RRULE:FREQ=WEEKLY;COUNT=03\n'), /COUNT 非法/],
+    ['COUNT 超上限', ev('RRULE:FREQ=WEEKLY;COUNT=100001\n'), /COUNT 过大/],
+    ['缺少 FREQ', ev('RRULE:COUNT=2\n'), /缺少 FREQ/],
+    ['部件缺值', ev('RRULE:FREQ=WEEKLY;COUNT=\n'), /部件非法/],
+    ['空部件', ev('RRULE:FREQ=WEEKLY;;COUNT=2\n'), /部件非法/],
+    ['RRULE 带参数', ev('RRULE;X=1:FREQ=WEEKLY;COUNT=2\n'), /不支持的参数/],
+    ['EXDATE 全天', ev('RRULE:FREQ=WEEKLY;COUNT=2\nEXDATE;VALUE=DATE:20261013\n'), /全天/],
+    ['EXDATE 时区', ev('RRULE:FREQ=WEEKLY;COUNT=2\nEXDATE;TZID=Asia/Shanghai:20261013T090000\n'), /时区/],
+    ['EXDATE 秒非 00', ev('RRULE:FREQ=WEEKLY;COUNT=2\nEXDATE:20261013T090001\n'), /秒必须为 00/],
+    ['EXDATE 空值', ev('RRULE:FREQ=WEEKLY;COUNT=2\nEXDATE:20261013T090000,\n'), /空的排除值/],
+    ['展开越出年份', ev('RRULE:FREQ=WEEKLY;COUNT=100000\n', '99990101T090000', '99990101T093000'), /越出 1-9999 年/],
+  ];
+  for (const [name, content, pattern] of cases) {
+    const f = writeIcal(dir, 'bad.ics', content);
+    const r = importBizFail(df, f, ['R0001'], `重复结构负例：${name}`);
+    assert.match(r.stderr, pattern, `重复结构负例：${name} 的错误信息`);
+  }
+  const store = readStore(df);
+  assert.equal(store.bookings.length, 0, '全部负例均未产生预约');
+  assert.equal(store.seriesSeq, 0, '未产生系列');
+  assert.equal(store.bookingSeq, 0, '计数未推进');
+});
+
+// ---------------------------------------------------------------------------
+// 18. 重复事件校验失败：按文件及原发生顺序报告，批内冲突互列 UID 与原发生时间
+// ---------------------------------------------------------------------------
+
+test('重复事件校验失败：按文件及原发生顺序报告全部失败与批内冲突', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+  ok(df, ['add-closure', '--resource', 'R0001', '--start', '2026-10-20T00:00', '--end', '2026-10-21T00:00'], '停用');
+
+  // w1 第 2 次发生落在停用区间；w1 与 w2 各次发生互相冲突
+  const f = writeIcal(dir, 'w.ics', ical(
+    'BEGIN:VEVENT\nUID:w1\nDTSTART:20261013T100000\nDTEND:20261013T110000\nRRULE:FREQ=WEEKLY;COUNT=3\nEND:VEVENT\n',
+    'BEGIN:VEVENT\nUID:w2\nDTSTART:20261013T103000\nDTEND:20261013T113000\nRRULE:FREQ=WEEKLY;COUNT=2\nEND:VEVENT\n',
+  ));
+  const r = importBizFail(df, f, ['R0001'], '重复事件校验失败');
+  assert.match(r.stderr, /共 4 项新预约不满足条件（按文件及原发生顺序）/);
+  assert.match(r.stderr, /UID “w1” 第 2 次发生（2026-10-20T10:00 → 2026-10-20T11:00）：\n  开放不足资源:[\s\S]*相关有效停用: C0001（2026-10-20T00:00 → 2026-10-21T00:00）/);
+  assert.match(r.stderr, /UID “w1” 第 1 次发生[\s\S]*UID “w2” 第 1 次发生（2026-10-13T10:30 → 2026-10-13T11:30）/, '批内冲突列出对方 UID 与原发生时间');
+  assert.match(r.stderr, /UID “w2” 第 2 次发生[\s\S]*UID “w1” 第 2 次发生/, '批内冲突双方互列');
+  const store = readStore(df);
+  assert.equal(store.bookings.length, 0, '整批未导入');
+  assert.equal(store.seriesSeq, 0, '未产生系列');
+  assert.equal(store.imports.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// 19. 重复导入记录损坏检测：系列/预约引用非法、映射缺漏或重复均拒绝加载
+// ---------------------------------------------------------------------------
+
+test('重复导入记录损坏（引用非法、映射缺漏或重复）拒绝加载', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+
+  const f = writeIcal(dir, 'w.ics', ical(
+    'BEGIN:VEVENT\nUID:w\nDTSTART:20261013T090000\nDTEND:20261013T093000\n' +
+      'RRULE:FREQ=WEEKLY;COUNT=3\nEXDATE:20261027T090000\nEND:VEVENT\n',
+  ));
+  importOk(df, f, ['R0001'], '首次导入');
+  const good = readStore(df);
+  const restore = () => writeFileSync(df, JSON.stringify(good, null, 2) + '\n');
+
+  // 未知系列引用
+  let store = readStore(df);
+  store.imports[0].seriesId = 'S9999';
+  writeFileSync(df, JSON.stringify(store, null, 2) + '\n');
+  let r = bizFail(df, ['list-series'], '未知系列引用');
+  assert.match(r.stderr, /关联了未知系列/);
+  restore();
+
+  // 成员预约不属于该系列
+  store = readStore(df);
+  store.bookings.push({id: 'B0003', resourceIds: ['R0001'], start: '2026-10-14T09:00', end: '2026-10-14T09:30', status: 'active'});
+  store.bookingSeq = 3;
+  store.imports[0].members[1].bookingId = 'B0003';
+  writeFileSync(df, JSON.stringify(store, null, 2) + '\n');
+  r = bizFail(df, ['list-series'], '成员预约不属系列');
+  assert.match(r.stderr, /不属于系列 S0001/);
+  restore();
+
+  // 成员映射重复（同一预约被两个成员关联）
+  store = readStore(df);
+  store.imports[0].members[1].bookingId = 'B0001';
+  writeFileSync(df, JSON.stringify(store, null, 2) + '\n');
+  r = bizFail(df, ['list-series'], '成员映射重复');
+  assert.match(r.stderr, /已被另一条导入记录关联/);
+  restore();
+
+  // 成员映射缺漏（members 数量与 COUNT 减去排除不符）
+  store = readStore(df);
+  store.imports[0].members.pop();
+  writeFileSync(df, JSON.stringify(store, null, 2) + '\n');
+  r = bizFail(df, ['list-series'], '成员映射缺漏');
+  assert.match(r.stderr, /应有 2 项/);
+  restore();
+
+  // 排除值不匹配任何原发生
+  store = readStore(df);
+  store.imports[0].excludes = ['2026-10-14T09:00'];
+  writeFileSync(df, JSON.stringify(store, null, 2) + '\n');
+  r = bizFail(df, ['list-series'], '排除值不匹配');
+  assert.match(r.stderr, /不匹配任何原发生开始时间/);
+  restore();
+
+  // 修复后可正常重放
+  const r2 = importOk(df, f, ['R0001'], '修复后重放');
+  assert.match(r2.stdout, /全部为重放/);
 });

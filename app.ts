@@ -16,9 +16,12 @@
 // 最早可行开始），为可兑现项各创建一项普通预约，受阻项继续等待且不影响后续项。
 //
 // iCalendar 导入：import-ical 读取本地 UTF-8 的 VCALENDAR（VERSION:2.0），
-// 为每个新 VEVENT 创建一项普通预约（统一使用命令行给定的资源集合，不加入系列、
-// 不自动处理候补）；UID 永久关联首次生成的预约，相同 UID 且时间、资源集合一致
-// 为重放（不改动原预约），不一致则整批拒绝。
+// 为每个新独立 VEVENT 创建一项普通预约，为每个新重复 VEVENT
+// （RRULE:FREQ=WEEKLY;COUNT=n，可用 EXDATE 按原开始时间排除发生）创建一个
+// 按周重复系列及全部未排除成员（统一使用命令行给定的资源集合，不自动处理候补）；
+// UID 永久关联首次请求（独立事件的预约，或重复事件的系列及各发生预约），
+// 相同 UID 且重复与否、首项时间、COUNT、排除集合、资源集合一致为重放
+// （不改动原记录），不一致则整批拒绝。
 //
 // 多项预约目标（系列成员、批量改期目标、撤销恢复安排、导入新事件）的可行性
 // 校验统一由 validateBatchTargets 完成（无写入副作用），各入口只负责展开
@@ -285,15 +288,28 @@ interface BatchOpRec {
   items: BatchOpItem[]; // 按提交（清单）顺序
 }
 
-// 一次 iCalendar 导入建立的“UID -> 预约”永久关联：
-// 快照保留首次导入的时间与资源集合（之后预约被改期/取消/撤销也不变），
-// 重放按快照比对本次请求，身份不依赖导入文件路径
+// 一次 iCalendar 导入建立的“UID -> 预约/系列”永久关联：
+// 快照保留首次导入的请求（之后预约被改期/取消/撤销也不变），
+// 重放按快照比对本次请求，身份不依赖导入文件路径。
+// 独立事件：bookingId 关联首次生成的预约。
+// 重复事件（RRULE:FREQ=WEEKLY;COUNT=n + EXDATE）：seriesId 关联首次生成的系列，
+// members 按原发生顺序关联各未排除发生生成的预约。
+interface ImportMemberRec {
+  start: string; // 原发生开始时间 YYYY-MM-DDTHH:mm
+  end: string; // 原发生结束时间
+  bookingId: string; // 该发生生成的预约标识
+}
+
 interface ImportRec {
   uid: string; // 解码后的 UID（区分大小写），同一数据文件内唯一
-  bookingId: string; // 首次导入生成的预约标识
-  start: string; // 首次导入的开始时间快照 YYYY-MM-DDTHH:mm
-  end: string; // 首次导入的结束时间快照
+  bookingId?: string; // 独立事件：首次导入生成的预约标识
+  start: string; // 首次导入的首项开始时间快照 YYYY-MM-DDTHH:mm
+  end: string; // 首次导入的首项结束时间快照
   resourceIds: string[]; // 首次导入的资源集合快照（按标识排序）
+  seriesId?: string; // 重复事件：首次导入生成的系列标识
+  count?: number; // 重复事件：总次数（含首项与已排除发生）
+  excludes?: string[]; // 重复事件：生效的排除开始时间（按时间排序）
+  members?: ImportMemberRec[]; // 重复事件：未排除发生的关联（按原发生顺序）
 }
 
 interface Store {
@@ -775,11 +791,14 @@ function validateStore(raw: unknown, file: string): Store {
     if (!batchOpNums.has(i)) bad(`批量改期操作记录缺号：找不到标识序号 ${i} 的记录`);
   }
 
-  // iCalendar 导入身份记录：UID 唯一且非空；关联的预约必须真实存在且不被另一条
-  // 导入记录重复关联；快照自身须合法（真实时间、结束晚于开始、资源已知且不重复）。
+  // iCalendar 导入身份记录：UID 唯一且非空。独立事件关联一项预约；重复事件关联
+  // 一个系列及按原发生顺序的各未排除发生预约。关联的系列/预约必须真实存在且不被
+  // 其他导入记录重复关联；快照自身须合法（真实时间、结束晚于开始、资源已知且不
+  // 重复；重复记录的 COUNT、排除集合与成员关联须与首项时间推算出的发生一致）。
   // 快照与预约现状不同不算损坏（预约可能已被改期、取消或随批量改期撤销而变动）。
   const importUids = new Set<string>();
   const importLinkedBookings = new Set<string>();
+  const importLinkedSeries = new Set<string>();
   rawImports.forEach((item, idx) => {
     const at = `imports[${idx}]`;
     if (typeof item !== 'object' || item === null || Array.isArray(item)) bad(`${at} 必须是对象`);
@@ -787,16 +806,6 @@ function validateStore(raw: unknown, file: string): Store {
     if (typeof im.uid !== 'string' || im.uid === '') bad(`${at}.uid 必须是非空字符串`);
     if (importUids.has(im.uid)) bad(`导入记录 UID 重复: ${im.uid}`);
     importUids.add(im.uid);
-    if (typeof im.bookingId !== 'string' || !/^B\d{4,}$/.test(im.bookingId)) {
-      bad(`${at}(UID “${im.uid}”).bookingId 非法: ${String(im.bookingId)}`);
-    }
-    if (!bookingById.has(im.bookingId)) {
-      bad(`${at}(UID “${im.uid}”) 关联了未知预约: ${im.bookingId}`);
-    }
-    if (importLinkedBookings.has(im.bookingId)) {
-      bad(`${at}(UID “${im.uid}”) 预约 ${im.bookingId} 已被另一条导入记录关联（一项预约只能对应一个 UID）`);
-    }
-    importLinkedBookings.add(im.bookingId);
     if (typeof im.start !== 'string' || typeof im.end !== 'string') {
       bad(`${at}(UID “${im.uid}”) 快照起止时间必须是字符串`);
     }
@@ -815,9 +824,112 @@ function validateStore(raw: unknown, file: string): Store {
       if (rseen.has(rid)) bad(`${at}(UID “${im.uid}”) 快照资源重复: ${rid}`);
       rseen.add(rid);
     });
+    const linkBooking = (bid: unknown, label: string): string => {
+      if (typeof bid !== 'string' || !/^B\d{4,}$/.test(bid)) {
+        bad(`${at}(UID “${im.uid}”)${label}非法: ${String(bid)}`);
+      }
+      if (!bookingById.has(bid as string)) {
+        bad(`${at}(UID “${im.uid}”) 关联了未知预约: ${bid}`);
+      }
+      if (importLinkedBookings.has(bid as string)) {
+        bad(`${at}(UID “${im.uid}”) 预约 ${bid} 已被另一条导入记录关联（一项预约只能对应一个 UID）`);
+      }
+      importLinkedBookings.add(bid as string);
+      return bid as string;
+    };
+
+    if (im.seriesId !== undefined) {
+      // 重复事件导入记录：系列 + COUNT + 排除集合 + 各未排除发生的预约关联
+      if (typeof im.seriesId !== 'string' || !/^S\d{4,}$/.test(im.seriesId)) {
+        bad(`${at}(UID “${im.uid}”).seriesId 非法: ${String(im.seriesId)}`);
+      }
+      if (!seriesIds.has(im.seriesId)) {
+        bad(`${at}(UID “${im.uid}”) 关联了未知系列: ${im.seriesId}`);
+      }
+      if (importLinkedSeries.has(im.seriesId)) {
+        bad(`${at}(UID “${im.uid}”) 系列 ${im.seriesId} 已被另一条导入记录关联`);
+      }
+      importLinkedSeries.add(im.seriesId);
+      if (im.bookingId !== undefined) {
+        bad(`${at}(UID “${im.uid}”) 重复导入记录不应携带 bookingId（应使用 seriesId 与 members）`);
+      }
+      if (!isInt(im.count) || im.count < 1 || im.count > MAX_OCCURRENCES) {
+        bad(`${at}(UID “${im.uid}”).count 必须是 1 至 ${MAX_OCCURRENCES} 的整数`);
+      }
+      const count = im.count;
+      if (!Array.isArray(im.excludes)) {
+        bad(`${at}(UID “${im.uid}”).excludes 必须是数组`);
+      }
+      if (!Array.isArray(im.members) || im.members.length === 0) {
+        bad(`${at}(UID “${im.uid}”).members 必须是非空数组`);
+      }
+      // 由首项推算全部原发生；任一越出四位年份范围即首次请求非法
+      const occurrences: Array<{start: string; end: string}> = [];
+      for (let k = 0; k < count; k++) {
+        const os = formatDateTime(s + k * 7 * 1440);
+        const oe = formatDateTime(e + k * 7 * 1440);
+        if (os === null || oe === null) {
+          bad(`${at}(UID “${im.uid}”) 按 COUNT 展开的发生越出 ${MIN_YEAR}-${MAX_YEAR} 年（首次请求非法）`);
+        }
+        occurrences.push({start: os, end: oe});
+      }
+      const excludeSet = new Set<string>();
+      (im.excludes as unknown[]).forEach((x, j) => {
+        if (typeof x !== 'string') bad(`${at}(UID “${im.uid}”).excludes[${j}] 必须是字符串`);
+        parseDateTime(x, `${at}(UID “${im.uid}”).excludes[${j}]`);
+        if (excludeSet.has(x)) bad(`${at}(UID “${im.uid}”) 排除值重复: ${x}`);
+        if (!occurrences.some((o) => o.start === x)) {
+          bad(`${at}(UID “${im.uid}”) 排除值 ${x} 不匹配任何原发生开始时间`);
+        }
+        excludeSet.add(x);
+      });
+      const expected = occurrences.filter((o) => !excludeSet.has(o.start));
+      if (expected.length === 0) {
+        bad(`${at}(UID “${im.uid}”) 全部发生均被排除（首次请求非法）`);
+      }
+      const members = im.members as unknown[];
+      if (members.length !== expected.length) {
+        bad(
+          `${at}(UID “${im.uid}”).members 应有 ${expected.length} 项（COUNT 减去排除），实际 ${members.length} 项`,
+        );
+      }
+      const memberRecs: ImportMemberRec[] = members.map((mRaw, j) => {
+        const mat = `${at}(UID “${im.uid}”).members[${j}]`;
+        if (typeof mRaw !== 'object' || mRaw === null || Array.isArray(mRaw)) bad(`${mat} 必须是对象`);
+        const m = mRaw as Record<string, unknown>;
+        if (typeof m.start !== 'string' || typeof m.end !== 'string') {
+          bad(`${mat} 起止时间必须是字符串`);
+        }
+        if (m.start !== expected[j].start || m.end !== expected[j].end) {
+          bad(`${mat} 与原发生时间 ${expected[j].start} → ${expected[j].end} 不一致（首次请求非法）`);
+        }
+        const bookingId = linkBooking(m.bookingId, `.members[${j}].bookingId `);
+        if (bookingById.get(bookingId)!.seriesId !== im.seriesId) {
+          bad(`${mat} 预约 ${bookingId} 不属于系列 ${im.seriesId}（引用非法）`);
+        }
+        return {start: m.start, end: m.end, bookingId};
+      });
+      store.imports.push({
+        uid: im.uid,
+        start: im.start,
+        end: im.end,
+        resourceIds: [...rseen].sort(),
+        seriesId: im.seriesId,
+        count,
+        excludes: [...excludeSet].sort(),
+        members: memberRecs,
+      });
+      return;
+    }
+
+    // 独立事件导入记录
+    if (im.count !== undefined || im.excludes !== undefined || im.members !== undefined) {
+      bad(`${at}(UID “${im.uid}”) 非重复导入记录不应携带 count/excludes/members`);
+    }
+    const bookingId = linkBooking(im.bookingId, '.bookingId ');
     store.imports.push({
       uid: im.uid,
-      bookingId: im.bookingId,
+      bookingId,
       start: im.start,
       end: im.end,
       resourceIds: [...rseen].sort(),
@@ -2589,19 +2701,36 @@ async function cmdCancelClosure(args: string[]): Promise<void> {
 
 // ---------------------------------------------------------------------------
 // iCalendar 导入（import-ical）
-// 读取 UTF-8 的 VCALENDAR（VERSION:2.0，至少一个独立 VEVENT），为新事件各创建
-// 一项普通预约（不加入系列、不自动处理候补），全部使用命令行给定的同一资源集合。
-// UID 在同一数据文件中永久关联首次生成的预约；相同 UID 且时间、资源集合与首次
-// 导入一致为重放（返回原预约当前安排与状态，不做任何改动），不一致则整批拒绝。
+// 读取 UTF-8 的 VCALENDAR（VERSION:2.0，至少一个独立 VEVENT）。独立事件各创建
+// 一项普通预约；携带 RRULE:FREQ=WEEKLY;COUNT=n 的重复事件创建一个按周重复系列
+// 及全部未排除发生的成员（可用 EXDATE 按原开始时间排除），全部使用命令行给定
+// 的同一资源集合，不自动处理候补。UID 在同一数据文件中永久关联首次请求（独立
+// 事件的预约，或重复事件的系列及各发生预约）；相同 UID 且重复与否、首项时间、
+// COUNT、排除集合、资源集合与首次导入一致为重放（返回原关联与当前安排，不做
+// 任何改动），不一致则整批拒绝。
 // ---------------------------------------------------------------------------
 
-// 一个解析完成的 VEVENT（时间已换算为营业地分钟数与 YYYY-MM-DDTHH:mm 文本）
-interface IcalEvent {
-  uid: string; // 解码后的 UID（区分大小写）
+// 一次发生的展开结果（时间已换算为营业地分钟数与 YYYY-MM-DDTHH:mm 文本）
+interface IcalOccurrence {
+  occNo: number; // 1 基的原发生序号（含被排除发生在内的展开序号）
   startRaw: string;
   endRaw: string;
   startMin: number;
   endMin: number;
+}
+
+// 一个解析完成的 VEVENT（时间已换算为营业地分钟数与 YYYY-MM-DDTHH:mm 文本）
+interface IcalEvent {
+  uid: string; // 解码后的 UID（区分大小写）
+  startRaw: string; // 首项（DTSTART）
+  endRaw: string; // 首项（DTEND）
+  startMin: number;
+  endMin: number;
+  recurrence?: {
+    count: number; // 总次数（含首项与已排除发生）
+    excludes: string[]; // 生效的排除开始时间（按发生顺序，已去重）
+    occurrences: IcalOccurrence[]; // 未排除的全部发生，按原发生顺序
+  };
 }
 
 // 标准折行展开：以空格或制表符开头的行是上一行的延续（去掉首个空白字符拼接）。
@@ -2684,8 +2813,48 @@ function assertFloatingDateTimeParams(
   }
 }
 
-// 重复相关属性：出现即拒绝（不展开重复事件）
-const ICAL_RECURRENCE_PROPS = new Set(['RRULE', 'RDATE', 'EXDATE', 'EXRULE', 'RECURRENCE-ID']);
+// 解析 RRULE：仅支持 FREQ=WEEKLY;COUNT=n（COUNT 为 1..100000 的整数，含首项）；
+// 部件大小写与顺序无关；重复部件、未知部件、缺少部件或其他取值均拒绝
+function parseRrule(value: string, bad: (reason: string) => never): number {
+  const seen = new Set<string>();
+  let freq: string | undefined;
+  let countRaw: string | undefined;
+  for (const part of value.trim().split(';')) {
+    const eq = part.indexOf('=');
+    if (eq <= 0 || eq === part.length - 1) {
+      bad(`RRULE 部件非法: “${part}”（仅支持 RRULE:FREQ=WEEKLY;COUNT=n）`);
+    }
+    const key = part.slice(0, eq).toUpperCase();
+    const val = part.slice(eq + 1).toUpperCase();
+    if (seen.has(key)) bad(`RRULE 部件重复: “${part}”`);
+    seen.add(key);
+    if (key === 'FREQ') freq = val;
+    else if (key === 'COUNT') countRaw = val;
+    else bad(`RRULE 含有不支持的部件 “${part}”（仅支持 FREQ=WEEKLY;COUNT=n）`);
+  }
+  if (freq === undefined) bad('RRULE 缺少 FREQ 部件（仅支持 RRULE:FREQ=WEEKLY;COUNT=n）');
+  if (freq !== 'WEEKLY') bad(`RRULE 仅支持按周重复（FREQ=WEEKLY），实际为 FREQ=${freq}`);
+  if (countRaw === undefined) bad('RRULE 缺少 COUNT 部件（仅支持 RRULE:FREQ=WEEKLY;COUNT=n）');
+  if (!/^[1-9]\d*$/.test(countRaw)) {
+    bad(`RRULE 的 COUNT 非法: “${countRaw}”，必须是 1 至 ${MAX_OCCURRENCES} 的整数（含首项）`);
+  }
+  const count = Number(countRaw);
+  if (count > MAX_OCCURRENCES) {
+    bad(`RRULE 的 COUNT 过大: “${countRaw}”，最大为 ${MAX_OCCURRENCES}`);
+  }
+  return count;
+}
+
+// 解析 EXDATE 值：逗号分隔的浮动时间列表（多行 EXDATE 在事件内累积，之后集合去重）；
+// 参数限制与 DTSTART/DTEND 相同（仅浮动时间），返回规范化后的开始时间文本
+function parseExdateValues(value: string, bad: (reason: string) => never): string[] {
+  const parts = value.split(',').map((p) => p.trim());
+  if (parts.some((p) => p === '')) bad(`EXDATE 含有空的排除值: “${value}”`);
+  return parts.map((p) => parseIcalDateTime(p, 'EXDATE ', bad).raw);
+}
+
+// 重复相关属性：RRULE（仅 FREQ=WEEKLY;COUNT=n）与 EXDATE 支持，其余出现即拒绝
+const ICAL_RECURRENCE_PROPS = new Set(['RDATE', 'EXRULE', 'RECURRENCE-ID']);
 
 // 解析整个 iCalendar 文件；任何结构错误、关键属性重复或缺失都抛出 BizError（整批失败）
 function parseIcalFile(text: string, file: string): IcalEvent[] {
@@ -2704,6 +2873,8 @@ function parseIcalFile(text: string, file: string): IcalEvent[] {
   let curUid: string | undefined;
   let curStart: {raw: string; min: number} | undefined;
   let curEnd: {raw: string; min: number} | undefined;
+  let curRruleCount: number | undefined;
+  let curExdates: string[] = [];
 
   const closeEvent = (): void => {
     if (curUid === undefined) bad('VEVENT 缺少 UID 属性');
@@ -2714,17 +2885,51 @@ function parseIcalFile(text: string, file: string): IcalEvent[] {
     }
     if (seenUids.has(curUid)) bad(`文件内 UID 重复: “${curUid}”（解码后区分大小写）`);
     seenUids.add(curUid);
-    events.push({
+    const ev: IcalEvent = {
       uid: curUid,
       startRaw: curStart.raw,
       endRaw: curEnd.raw,
       startMin: curStart.min,
       endMin: curEnd.min,
-    });
+    };
+    if (curRruleCount !== undefined) {
+      // 按周展开：每项起止同时后移 7 个营业地日历日，保持时刻与跨日长度；
+      // EXDATE 集合去重后按原开始时间排除发生（不匹配任何发生的排除值自然不生效）
+      const count = curRruleCount;
+      const excludeSet = new Set(curExdates);
+      const excludes: string[] = [];
+      const occurrences: IcalOccurrence[] = [];
+      for (let k = 0; k < count; k++) {
+        const sMin = curStart.min + k * 7 * 1440;
+        const eMin = curEnd.min + k * 7 * 1440;
+        const sRaw = formatDateTime(sMin);
+        const eRaw = formatDateTime(eMin);
+        if (sRaw === null || eRaw === null) {
+          bad(
+            `VEVENT（UID “${curUid}”）按 COUNT=${count} 展开的第 ${k + 1} 次发生越出 ` +
+              `${MIN_YEAR}-${MAX_YEAR} 年范围：请减小 COUNT 或改选更早的首项时间`,
+          );
+        }
+        if (excludeSet.has(sRaw)) {
+          excludes.push(sRaw);
+        } else {
+          occurrences.push({occNo: k + 1, startRaw: sRaw, endRaw: eRaw, startMin: sMin, endMin: eMin});
+        }
+      }
+      if (occurrences.length === 0) {
+        bad(`VEVENT（UID “${curUid}”）的全部 ${count} 次发生均被 EXDATE 排除，没有可导入的发生`);
+      }
+      ev.recurrence = {count, excludes, occurrences};
+    } else if (curExdates.length > 0) {
+      bad(`VEVENT（UID “${curUid}”）含有 EXDATE 但没有 RRULE（排除日期仅用于按周重复事件）`);
+    }
+    events.push(ev);
     inEvent = false;
     curUid = undefined;
     curStart = undefined;
     curEnd = undefined;
+    curRruleCount = undefined;
+    curExdates = [];
   };
 
   for (const line of lines) {
@@ -2742,6 +2947,8 @@ function parseIcalFile(text: string, file: string): IcalEvent[] {
         curUid = undefined;
         curStart = undefined;
         curEnd = undefined;
+        curRruleCount = undefined;
+        curExdates = [];
       } else {
         bad(`事件内不允许嵌套组件 “${value.trim()}”（如 VALARM）`);
       }
@@ -2804,11 +3011,22 @@ function parseIcalFile(text: string, file: string): IcalEvent[] {
         }
         break;
       }
+      case 'RRULE': {
+        if (curRruleCount !== undefined) bad(`VEVENT（UID “${curUid ?? ''}”）内 RRULE 属性重复`);
+        if (params.length > 0) bad(`RRULE 携带不支持的参数 “${params[0]}”`);
+        curRruleCount = parseRrule(value, bad);
+        break;
+      }
+      case 'EXDATE': {
+        assertFloatingDateTimeParams(params, 'EXDATE ', bad);
+        curExdates.push(...parseExdateValues(value, bad));
+        break;
+      }
       case 'DESCRIPTION':
         break; // 描述属性忽略
       default:
         if (ICAL_RECURRENCE_PROPS.has(name)) {
-          bad(`不支持重复相关属性 ${name}（不导入重复事件）`);
+          bad(`不支持重复相关属性 ${name}（仅支持 RRULE:FREQ=WEEKLY;COUNT=n 与 EXDATE）`);
         }
         // 其余属性（SUMMARY、LOCATION、DTSTAMP、SEQUENCE 等）忽略
     }
@@ -2844,8 +3062,30 @@ async function cmdImportIcal(args: string[]): Promise<void> {
   }
   const events = parseIcalFile(text, icalFile);
 
-  // 区分重放与新增：UID 命中既有导入身份即重放候选；
-  // 时间与资源集合（顺序无关）须与首次导入快照一致，否则整批拒绝
+  // 首次导入快照 / 本次请求的统一描述（用于不一致诊断）
+  const describeSnapshot = (rec: ImportRec): string => {
+    if (rec.seriesId === undefined) {
+      return `独立事件 ${rec.start} → ${rec.end}（资源 ${rec.resourceIds.join('、')}）`;
+    }
+    const ex = rec.excludes!.length > 0 ? `，排除 ${rec.excludes!.join('、')}` : '';
+    return (
+      `按周重复系列（首项 ${rec.start} → ${rec.end}，共 ${rec.count} 次${ex}；` +
+      `资源 ${rec.resourceIds.join('、')}）`
+    );
+  };
+  const describeRequest = (ev: IcalEvent): string => {
+    if (ev.recurrence === undefined) {
+      return `独立事件 ${ev.startRaw} → ${ev.endRaw}（资源 ${ids.join('、')}）`;
+    }
+    const ex = ev.recurrence.excludes.length > 0 ? `，排除 ${ev.recurrence.excludes.join('、')}` : '';
+    return (
+      `按周重复系列（首项 ${ev.startRaw} → ${ev.endRaw}，共 ${ev.recurrence.count} 次${ex}；` +
+      `资源 ${ids.join('、')}）`
+    );
+  };
+
+  // 区分重放与新增：UID 命中既有导入身份即重放候选；重复与否、首项时间、COUNT、
+  // 排除集合与资源集合（顺序无关）须与首次导入快照一致，否则整批拒绝
   const importByUid = new Map(store.imports.map((r) => [r.uid, r]));
   interface ImportItem {
     ev: IcalEvent;
@@ -2856,44 +3096,79 @@ async function cmdImportIcal(args: string[]): Promise<void> {
   const items: ImportItem[] = events.map((ev, index) => {
     const rec = importByUid.get(ev.uid);
     if (rec === undefined) return {ev, index};
+    const recRecurring = rec.seriesId !== undefined;
+    const evRecurring = ev.recurrence !== undefined;
+    const sameKind = recRecurring === evRecurring;
     const sameTime = rec.start === ev.startRaw && rec.end === ev.endRaw;
     const sameResources =
       rec.resourceIds.length === ids.length && rec.resourceIds.every((x, j) => x === ids[j]);
-    if (!sameTime || !sameResources) {
+    let sameRule = true;
+    if (sameKind && recRecurring && ev.recurrence !== undefined) {
+      sameRule =
+        rec.count === ev.recurrence.count &&
+        rec.excludes!.length === ev.recurrence.excludes.length &&
+        rec.excludes!.every((x, j) => x === ev.recurrence!.excludes[j]);
+    }
+    if (!sameKind || !sameTime || !sameResources || !sameRule) {
       mismatches.push(
-        `第 ${index + 1} 项 UID “${ev.uid}”：首次导入为 ${rec.start} → ${rec.end}` +
-          `（资源 ${rec.resourceIds.join('、')}），本次为 ${ev.startRaw} → ${ev.endRaw}` +
-          `（资源 ${ids.join('、')}）`,
+        `第 ${index + 1} 项 UID “${ev.uid}”：首次导入为 ${describeSnapshot(rec)}，` +
+          `本次为 ${describeRequest(ev)}`,
       );
     }
     return {ev, index, replay: rec};
   });
   if (mismatches.length > 0) {
     throw new BizError(
-      `iCalendar 导入被拒绝：${mismatches.length} 个 UID 的时间或资源集合与首次导入不一致` +
+      `iCalendar 导入被拒绝：${mismatches.length} 个 UID 的请求与首次导入不一致` +
         '（相同 UID 不会覆盖本地安排，整批未导入）：\n' +
         mismatches.map((m) => `- ${m}`).join('\n'),
     );
   }
 
-  // 仅以新 UID 事件为目标做统一批次校验（无写入副作用）；
-  // 重放项关联的旧预约本就在 store.bookings 中，按当前状态与安排自然参与
-  // 既有占用（已取消不占用，改期后按新安排占用），不用首次导入快照代替现状
+  // 仅以新 UID 事件为目标做统一批次校验（无写入副作用）：独立事件各一个目标，
+  // 重复事件每个未排除发生各一个目标；重放项关联的旧预约本就在 store.bookings 中，
+  // 按当前状态与安排自然参与既有占用（已取消不占用，改期后按新安排占用），
+  // 不用首次导入快照代替现状
+  interface NewTarget {
+    item: ImportItem;
+    occ: IcalOccurrence;
+  }
   const newItems = items.filter((it) => it.replay === undefined);
-  const targets = newItems.map((it) => ({
-    startMin: it.ev.startMin,
-    endMin: it.ev.endMin,
+  const newTargets: NewTarget[] = [];
+  for (const it of newItems) {
+    if (it.ev.recurrence !== undefined) {
+      for (const occ of it.ev.recurrence.occurrences) newTargets.push({item: it, occ});
+    } else {
+      newTargets.push({
+        item: it,
+        occ: {
+          occNo: 1,
+          startRaw: it.ev.startRaw,
+          endRaw: it.ev.endRaw,
+          startMin: it.ev.startMin,
+          endMin: it.ev.endMin,
+        },
+      });
+    }
+  }
+  const targets = newTargets.map((t) => ({
+    startMin: t.occ.startMin,
+    endMin: t.occ.endMin,
     resourceIds: ids,
   }));
   const failures = validateBatchTargets(store, targets);
 
   if (failures.length > 0) {
-    // 按文件顺序报告全部失败 UID、时间、不足资源（含相关停用）与全部冲突；批内冲突双方互列
+    // 按文件及原发生顺序报告全部失败 UID、时间、不足资源（含相关停用）与全部冲突；
+    // 批内冲突双方互列 UID 及原发生时间
+    const labelOf = (t: NewTarget): string =>
+      t.item.ev.recurrence !== undefined
+        ? `第 ${t.item.index + 1} 项 UID “${t.item.ev.uid}” 第 ${t.occ.occNo} 次发生` +
+          `（${t.occ.startRaw} → ${t.occ.endRaw}）`
+        : `第 ${t.item.index + 1} 项 UID “${t.item.ev.uid}”（${t.occ.startRaw} → ${t.occ.endRaw}）`;
     const blocks = failures.map((f) => {
-      const item = newItems[f.index];
-      const lines = [
-        `第 ${item.index + 1} 项 UID “${item.ev.uid}”（${item.ev.startRaw} → ${item.ev.endRaw}）：`,
-      ];
+      const t = newTargets[f.index];
+      const lines = [`${labelOf(t)}：`];
       if (f.gaps.length > 0) {
         lines.push('  开放不足资源:');
         lines.push(...gapLines(f.gaps, '    '));
@@ -2910,39 +3185,77 @@ async function cmdImportIcal(args: string[]): Promise<void> {
       if (f.internal.length > 0) {
         lines.push('  批内冲突:');
         for (const x of f.internal) {
-          const o = newItems[x.otherIndex];
-          lines.push(
-            `    - 第 ${o.index + 1} 项 UID “${o.ev.uid}”` +
-              `（${o.ev.startRaw} → ${o.ev.endRaw}）` +
-              `：共同资源 ${formatResourceIds(store, x.shared)}`,
-          );
+          const o = newTargets[x.otherIndex];
+          lines.push(`    - ${labelOf(o)}：共同资源 ${formatResourceIds(store, x.shared)}`);
         }
       }
       return lines.join('\n');
     });
     throw new BizError(
-      `iCalendar 导入失败：共 ${failures.length} 项新事件不满足条件（按文件顺序），整批未导入：\n${blocks.join('\n')}`,
+      `iCalendar 导入失败：共 ${failures.length} 项新预约不满足条件（按文件及原发生顺序），整批未导入：\n${blocks.join('\n')}`,
     );
   }
 
   const replayCount = items.length - newItems.length;
-  const renderItem = (it: ImportItem, bookingId: string, isNew: boolean): string[] => {
-    if (isNew) {
+
+  // 新项的标识分配结果（落盘前填充）：独立事件一个成员，重复事件一个系列加全部成员
+  interface NewAssignment {
+    seriesId?: string;
+    members: Array<{occ: IcalOccurrence; bookingId: string}>;
+  }
+  const assigned = new Map<ImportItem, NewAssignment>();
+
+  // 渲染单项：新增显示完整关联与安排；重放显示原系列/原发生时间/预约及当前时间、
+  // 资源、状态，不做任何改动（已取消/被撤销也不复活、不重建）
+  const renderItem = (it: ImportItem, isNew: boolean): string[] => {
+    const ev = it.ev;
+    if (ev.recurrence === undefined) {
+      const bookingId = isNew ? assigned.get(it)!.members[0].bookingId : it.replay!.bookingId!;
+      if (isNew) {
+        return [
+          `- 第 ${it.index + 1} 项 UID “${ev.uid}” → 新预约 ${bookingId}（新增，普通预约，不属于任何系列）`,
+          `    时间: ${ev.startRaw} → ${ev.endRaw}`,
+          `    资源: ${formatResourceIds(store, ids)}`,
+        ];
+      }
+      const b = store.bookings.find((x) => x.id === bookingId)!;
+      const statusLabel = b.status === 'active' ? '已预约' : '已取消';
       return [
-        `- 第 ${it.index + 1} 项 UID “${it.ev.uid}” → 新预约 ${bookingId}（新增，普通预约，不属于任何系列）`,
-        `    时间: ${it.ev.startRaw} → ${it.ev.endRaw}`,
-        `    资源: ${formatResourceIds(store, ids)}`,
+        `- 第 ${it.index + 1} 项 UID “${ev.uid}” → 预约 ${bookingId}（重放，未做改动）`,
+        `    当前状态: ${statusLabel}`,
+        `    当前安排: ${b.start} → ${b.end}`,
+        `    当前资源: ${formatResourceIds(store, b.resourceIds)}`,
       ];
     }
-    // 重放：返回原预约的当前安排与状态，不做任何改动（已取消/被撤销也不复活）
-    const b = store.bookings.find((x) => x.id === bookingId)!;
-    const statusLabel = b.status === 'active' ? '已预约' : '已取消';
-    return [
-      `- 第 ${it.index + 1} 项 UID “${it.ev.uid}” → 预约 ${bookingId}（重放，未做改动）`,
-      `    当前状态: ${statusLabel}`,
-      `    当前安排: ${b.start} → ${b.end}`,
-      `    当前资源: ${formatResourceIds(store, b.resourceIds)}`,
+    // 重复事件
+    if (isNew) {
+      const a = assigned.get(it)!;
+      const lines = [
+        `- 第 ${it.index + 1} 项 UID “${ev.uid}” → 新系列 ${a.seriesId}（新增，按周重复共 ${ev.recurrence.count} 次` +
+          (ev.recurrence.excludes.length > 0 ? `，排除 ${ev.recurrence.excludes.join('、')}` : '') +
+          `，生成 ${a.members.length} 项成员）`,
+        `    资源: ${formatResourceIds(store, ids)}`,
+        '    成员（按原发生顺序）:',
+      ];
+      for (const m of a.members) {
+        lines.push(`      - 第 ${m.occ.occNo} 次发生 ${m.occ.startRaw} → ${m.occ.endRaw} → 预约 ${m.bookingId}`);
+      }
+      return lines;
+    }
+    const rec = it.replay!;
+    const lines = [
+      `- 第 ${it.index + 1} 项 UID “${ev.uid}” → 系列 ${rec.seriesId}（重放，未做改动）`,
+      '    成员（按原发生顺序）:',
     ];
+    for (const m of rec.members!) {
+      const b = store.bookings.find((x) => x.id === m.bookingId)!;
+      const statusLabel = b.status === 'active' ? '已预约' : '已取消';
+      lines.push(
+        `      - 原发生 ${m.start} → ${m.end} → 预约 ${m.bookingId} [${statusLabel}]` +
+          ` 当前 ${b.start} → ${b.end}；资源 ${formatResourceIds(store, b.resourceIds)}`,
+      );
+    }
+    return lines;
   };
 
   if (newItems.length === 0) {
@@ -2951,41 +3264,86 @@ async function cmdImportIcal(args: string[]): Promise<void> {
       `iCalendar 导入完成：共 ${items.length} 项，全部为重放（未写入数据文件，标识计数不变）`,
     );
     for (const it of items) {
-      console.log(renderItem(it, it.replay!.bookingId, false).join('\n'));
+      console.log(renderItem(it, false).join('\n'));
     }
     return;
   }
 
-  // 新预约与导入身份一次原子保存后才成功；标识在此刻才生成，任何失败都不推进计数
-  const assigned = new Map<ImportItem, string>();
+  // 新预约、新系列与导入身份一次原子保存后才成功；标识在此刻才生成，任何失败都不推进计数
   for (const it of newItems) {
-    store.bookingSeq += 1;
-    const bookingId = `B${String(store.bookingSeq).padStart(4, '0')}`;
-    store.bookings.push({
-      id: bookingId,
-      resourceIds: ids,
-      start: it.ev.startRaw,
-      end: it.ev.endRaw,
-      status: 'active',
-    });
-    store.imports.push({
-      uid: it.ev.uid,
-      bookingId,
-      start: it.ev.startRaw,
-      end: it.ev.endRaw,
-      resourceIds: [...ids],
-    });
-    assigned.set(it, bookingId);
+    const ev = it.ev;
+    if (ev.recurrence !== undefined) {
+      store.seriesSeq += 1;
+      const seriesId = `S${String(store.seriesSeq).padStart(4, '0')}`;
+      store.series.push({id: seriesId});
+      const members: Array<{occ: IcalOccurrence; bookingId: string}> = [];
+      const memberRecs: ImportMemberRec[] = [];
+      for (const occ of ev.recurrence.occurrences) {
+        store.bookingSeq += 1;
+        const bookingId = `B${String(store.bookingSeq).padStart(4, '0')}`;
+        store.bookings.push({
+          id: bookingId,
+          resourceIds: ids,
+          start: occ.startRaw,
+          end: occ.endRaw,
+          status: 'active',
+          seriesId,
+        });
+        members.push({occ, bookingId});
+        memberRecs.push({start: occ.startRaw, end: occ.endRaw, bookingId});
+      }
+      store.imports.push({
+        uid: ev.uid,
+        start: ev.startRaw,
+        end: ev.endRaw,
+        resourceIds: [...ids],
+        seriesId,
+        count: ev.recurrence.count,
+        excludes: [...ev.recurrence.excludes],
+        members: memberRecs,
+      });
+      assigned.set(it, {seriesId, members});
+    } else {
+      store.bookingSeq += 1;
+      const bookingId = `B${String(store.bookingSeq).padStart(4, '0')}`;
+      store.bookings.push({
+        id: bookingId,
+        resourceIds: ids,
+        start: ev.startRaw,
+        end: ev.endRaw,
+        status: 'active',
+      });
+      store.imports.push({
+        uid: ev.uid,
+        bookingId,
+        start: ev.startRaw,
+        end: ev.endRaw,
+        resourceIds: [...ids],
+      });
+      assigned.set(it, {
+        members: [
+          {
+            occ: {
+              occNo: 1,
+              startRaw: ev.startRaw,
+              endRaw: ev.endRaw,
+              startMin: ev.startMin,
+              endMin: ev.endMin,
+            },
+            bookingId,
+          },
+        ],
+      });
+    }
   }
   store.bookings.sort((a, b) => a.id.localeCompare(b.id));
+  store.series.sort((a, b) => a.id.localeCompare(b.id));
   store.imports.sort((a, b) => a.uid.localeCompare(b.uid));
   await saveStore(file, store);
 
   console.log(`iCalendar 导入完成：共 ${items.length} 项（新增 ${newItems.length} 项，重放 ${replayCount} 项）`);
   for (const it of items) {
-    const isNew = it.replay === undefined;
-    const bookingId = isNew ? assigned.get(it)! : it.replay!.bookingId;
-    console.log(renderItem(it, bookingId, isNew).join('\n'));
+    console.log(renderItem(it, it.replay === undefined).join('\n'));
   }
 }
 
@@ -3103,24 +3461,35 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       其他重叠停用仍有效；重复取消成功且无变化，未知标识失败；
       取消不自动创建预约或处理候补
 
-导入命令（本地 iCalendar 文件批量导入预约）:
+导入命令（本地 iCalendar 文件批量导入预约与按周重复系列）:
   import-ical <iCalendar 文件> --resource <标识> [--resource <标识> ...]
       读取 UTF-8 的 VCALENDAR（VERSION:2.0，至少一个独立 VEVENT；每项须有
       一个非空 UID、DTSTART 和 DTEND；时间仅支持浮动 YYYYMMDDTHHmmss，秒为
       00，年份 0001-9999，真实有效、结束晚于开始、允许跨日、不随机器时区
       变化；支持 CRLF 或 LF、标准折行与 UID 文本转义，属性名忽略大小写，
-      解码后 UID 区分大小写；描述属性忽略，全天、时区、重复相关属性、取消
-      事件及事件内嵌套组件拒绝；结构错误、关键属性重复或文件内 UID 重复
-      均整批失败），为每个新事件各创建一项普通预约（不加入系列、不自动
-      处理候补），全部新事件统一使用所给资源集合（至少一个不同的已登记
-      资源）。UID 在同一数据文件中永久关联首次生成的预约（身份不依赖文件
-      路径），并持久保留首次导入的时间与资源集合：相同 UID 且时间、资源
-      集合一致为重放（资源顺序、折行与转义写法差异不算变化），返回原预约
-      的当前安排与状态且不做任何改动（已改期、取消或撤销也不复活）；时间
-      或资源集合不同则整批拒绝，不覆盖本地安排。文件可混合新项与重放项，
-      仅新项校验开放覆盖与冲突（含批内冲突与全部既有有效预约）；全部为重
-      放时不写文件、不推进计数；新预约与导入身份一次原子保存后才成功，
-      按文件顺序显示 UID、预约标识、完整安排及新增或重放。
+      解码后 UID 区分大小写；描述属性忽略，全天、时区、取消事件及事件内
+      嵌套组件拒绝；结构错误、关键属性重复或文件内 UID 重复均整批失败）。
+      独立事件各创建一项普通预约；携带 RRULE:FREQ=WEEKLY;COUNT=n 的重复
+      事件创建一个按周重复系列：COUNT 为 1 至 100000 的整数且含首项，部件
+      大小写与顺序无关，首项由 DTSTART/DTEND 确定，每项起止同时后移 7 个
+      营业地日历日（时刻与跨日长度不变），展开越出 0001-9999 年整批拒绝；
+      可用 EXDATE（浮动时间，参数限制同 DTSTART，支持多行与逗号列表，集合
+      去重）按原开始时间排除发生；无 RRULE 却有 EXDATE、全部发生被排除、
+      RRULE 或其部件重复、未知部件均整批拒绝，RDATE/EXRULE/RECURRENCE-ID
+      等其他重复属性仍拒绝。全部新事件与成员统一使用所给资源集合（至少
+      一个不同的已登记资源），仅为未排除发生生成成员，不自动处理候补。
+      UID 在同一数据文件中永久关联首次请求（独立事件的预约，或重复事件
+      的系列及各发生预约，身份不依赖文件路径），并持久保留首次导入的
+      重复与否、首项时间、COUNT、排除集合与资源集合：相同 UID 且上述
+      一致为重放（部件与排除值顺序、重复排除值、资源顺序不算变化），
+      返回原系列、原发生时间、预约及当前时间、资源、状态且不做任何改动
+      （已改期、取消或撤销也不复活、不重建）；任一不同则整批拒绝，不覆盖
+      本地安排。文件可混合独立与重复事件、新项与重放项，仅新预约校验实际
+      可用覆盖与批内外冲突（重放成员按当前状态与安排参与占用）；受阻按
+      文件及原发生顺序报告全部 UID、时间、不足资源、相关停用与全部冲突，
+      批内冲突双方互列 UID 及原发生时间；全部为重放时不写文件、不推进
+      计数；新系列、成员与导入身份一次原子保存后才成功，按文件及原发生
+      顺序显示新增或重放、完整关联与安排。
       文件示例:
         BEGIN:VCALENDAR
         VERSION:2.0
@@ -3128,6 +3497,13 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
         UID:meeting-001@example.com
         DTSTART:20261012T100000
         DTEND:20261012T110000
+        END:VEVENT
+        BEGIN:VEVENT
+        UID:weekly-review@example.com
+        DTSTART:20261013T090000
+        DTEND:20261013T093000
+        RRULE:FREQ=WEEKLY;COUNT=4
+        EXDATE:20261027T090000
         END:VEVENT
         END:VCALENDAR
 
