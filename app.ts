@@ -31,10 +31,13 @@
 // 读取决策所需状态、业务校验、分配标识与原子保存全过程；取得保护后据最新数据
 // 决策。相对/绝对/含 ./.. 的等价路径共享同一把锁，不同数据文件互不影响。
 // 竞争可等待，5 秒内未取得即以退出码 1 报告占用；进程异常退出留下的残留保护
-// 由 recover-lock 在确认原写入进程已退出后解除。查询不取锁，保存为原子替换，
+// 由 recover-lock 在确认原写入进程已退出后解除：恢复先把确认过的那份保护原子
+// 认领（改名到本进程专有的交接文件）再只删除该交接文件，绝不误删新写入者随后
+// 取得的保护；目标在核对期间更替时以退出码 1 说明，交接中断留下的状态由后续
+// recover-lock 安全清理。查询不取锁，保存为原子替换，
 // 只读到提交前或提交后的完整快照。
 
-import {lstat, readFile, writeFile, rename, unlink} from 'node:fs/promises';
+import {link, lstat, readdir, readFile, writeFile, rename, unlink} from 'node:fs/promises';
 import {realpathSync} from 'node:fs';
 import {hostname} from 'node:os';
 import {basename, dirname, join, resolve} from 'node:path';
@@ -998,6 +1001,7 @@ async function saveStore(file: string, store: Store): Promise<void> {
     await unlink(tmp).catch(() => {});
     throw new BizError(`保存数据文件 ${file} 失败：${(err as Error).message}（原文件已保留）`);
   }
+  await testSyncPoint('store-saved');
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,8 +1013,19 @@ async function saveStore(file: string, store: Store): Promise<void> {
 // 命名：相对路径、绝对路径与含 ./.. 的等价写法共享同一把锁；不同数据文件
 // 互不影响；数据文件尚不存在时同样受保护。竞争可等待，但 5 秒内未取得即以
 // 退出码 1 报告占用（可重试）。进程异常退出会留下残留锁：recover-lock 仅在
-// 确认原写入进程已退出后解除，存活或无法确认一律拒绝，不按保护存在时长抢占；
-// 释放与恢复都只删除自己确认的那一份，绝不误删其他进程后来取得的保护。
+// 确认原写入进程已退出后解除，存活或无法确认一律拒绝，不按保护存在时长抢占。
+//
+// 交接互斥（取得、释放、恢复都只对“自己确认的那一份”生效，不靠重复读取或
+// 随机延时掩盖删除竞态）：
+//   - 取得时记录所创建锁文件的 inode，释放只删除 inode 与内容都仍是本次取得
+//     的那一份，绝不误删其他进程后来取得的保护；
+//   - 恢复先把确认过的保护原子改名（rename）到本进程专有的交接文件
+//     （<锁>.recover-<pid>）完成认领，再只删除该交接文件——原路径随即可能被
+//     新写入者取得，较早的恢复从机制上无法误删新保护；认领到的内容与先前确认
+//     的不一致（目标在核对期间被更替）时，把认领到的保护放回原位并以退出码 1
+//     说明，绝不宣称解除了他人的保护；
+//   - 恢复者在交接中途异常退出留下的交接文件，由后续 recover-lock 安全清理：
+//     原持有者已确认退出则删除，仍存活则放回原位，无需人工删文件。
 // ---------------------------------------------------------------------------
 
 const LOCK_TIMEOUT_MS = 5000; // 取得写入保护的最长等待时间
@@ -1057,18 +1072,58 @@ function currentLockInfo(file: string): LockInfo {
   };
 }
 
-// 本进程当前持有的锁（一次命令至多一把；main 统一释放）
-let heldLockPath: string | null = null;
+// 本进程当前持有的锁（一次命令至多一把；main 统一释放）。
+// 记录取得时锁文件的 dev/ino：释放只作用于本次取得的那一份，
+// 绝不误删其他进程后来取得的保护。
+interface HeldLock {
+  path: string;
+  dev: number;
+  ino: number;
+}
+let heldLock: HeldLock | null = null;
+
+// 本地回归同步钩子（仅测试使用）：设置环境变量 SHIFTBOOK_TEST_SYNC_DIR 后，
+// 在写入保护交接的关键点写出 <点名>-ready-<pid> 标记并等待 <点名>-go-<pid>
+// 出现，让回归测试用真实子进程在明确同步点上交错（不靠随机延时）；
+// 未设置该变量时完全不参与正常路径。
+async function testSyncPoint(name: string): Promise<void> {
+  const dir = process.env.SHIFTBOOK_TEST_SYNC_DIR;
+  if (dir === undefined || dir === '') return;
+  const go = join(dir, `${name}-go-${process.pid}`);
+  await writeFile(join(dir, `${name}-ready-${process.pid}`), `${name}\n`, 'utf8');
+  const deadline = Date.now() + 60000;
+  for (;;) {
+    try {
+      await lstat(go);
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new BizError(`测试同步点 ${name} 检查放行标记失败：${(err as Error).message}`);
+      }
+      if (Date.now() >= deadline) throw new BizError(`测试同步点 ${name} 等待放行超时`);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  }
+}
 
 async function acquireWriteLock(file: string): Promise<void> {
-  if (heldLockPath !== null) return;
+  if (heldLock !== null) return;
   const lockPath = lockPathFor(file);
   const content = JSON.stringify(currentLockInfo(file)) + '\n';
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
   for (;;) {
     try {
       await writeFile(lockPath, content, {encoding: 'utf8', flag: 'wx'});
-      heldLockPath = lockPath;
+      try {
+        const st = await lstat(lockPath);
+        heldLock = {path: lockPath, dev: st.dev, ino: st.ino};
+        await testSyncPoint('lock-acquired');
+      } catch (err) {
+        // 取得后的登记或同步失败：撤掉本次创建的保护，不留残留
+        heldLock = null;
+        await unlink(lockPath).catch(() => {});
+        throw err;
+      }
       return;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
@@ -1092,15 +1147,18 @@ async function acquireWriteLock(file: string): Promise<void> {
   }
 }
 
-// 释放本进程取得的保护；仅删除自己创建的锁文件，绝不动其他进程后来取得的保护
+// 释放本进程取得的保护；仅当锁文件的 inode 与内容都仍是本次取得的那一份时才
+// 删除，绝不动其他进程后来取得的保护
 async function releaseWriteLock(): Promise<void> {
-  const lockPath = heldLockPath;
-  if (lockPath === null) return;
-  heldLockPath = null;
+  const held = heldLock;
+  if (held === null) return;
+  heldLock = null;
   try {
-    const info = JSON.parse(await readFile(lockPath, 'utf8')) as LockInfo;
+    const st = await lstat(held.path);
+    if (st.dev !== held.dev || st.ino !== held.ino) return; // 已被更替：是他人的保护
+    const info = JSON.parse(await readFile(held.path, 'utf8')) as LockInfo;
     if (info.pid !== process.pid || info.host !== hostname()) return;
-    await unlink(lockPath);
+    await unlink(held.path);
   } catch {
     // 锁文件已不存在或不可读：不影响本次命令的结果
   }
@@ -1113,8 +1171,107 @@ async function loadStoreForWrite(file: string): Promise<Store> {
   return loadStore(file);
 }
 
+// 查询本机进程状态；查询异常（如无权限）抛出 BizError，绝不按已退出处理
+function localProcessState(pid: number, who: string): 'alive' | 'exited' {
+  try {
+    process.kill(pid, 0);
+    return 'alive';
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ESRCH') return 'exited';
+    throw new BizError(
+      `无法确认${who}（进程 ${pid}）是否已退出：${(err as Error).message}，拒绝解除写入保护`,
+    );
+  }
+}
+
+// 恢复交接文件路径：恢复者认领时把确认过的锁文件原子改名到此（按恢复进程标识区分）
+function claimPathFor(lockPath: string, recoverPid: number): string {
+  return `${lockPath}.recover-${recoverPid}`;
+}
+
+// 清理交接中断留下的交接文件（恢复者在认领后异常退出）。只处理能确认状态的：
+// 认领者仍存活 -> 另一恢复正在交接，拒绝打扰；认领者已退出 -> 按原持有者状态，
+// 已退出则删除该交接文件（其保护随认领即告解除），仍存活则把保护放回原路径。
+// 返回清理说明（可能为空）；无法确认的一律拒绝，绝不按已退出处理。
+async function sweepStaleClaims(lockPath: string): Promise<string[]> {
+  const dir = dirname(lockPath);
+  const prefix = `${basename(lockPath)}.recover-`;
+  let names: string[];
+  try {
+    names = (await readdir(dir)).filter((n) => n.startsWith(prefix));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw new BizError(`无法检查恢复交接状态（目录 ${dir}）：${(err as Error).message}`);
+  }
+  const notes: string[] = [];
+  for (const name of names) {
+    const claimPath = join(dir, name);
+    try {
+      const recoverPid = Number(name.slice(prefix.length));
+      if (!Number.isInteger(recoverPid) || recoverPid <= 0) {
+        throw new BizError(`恢复交接文件 ${claimPath} 名称无法辨认，无法确认交接状态，拒绝继续（请人工核查）`);
+      }
+      // 交接文件只可能来自此前的其他恢复进程；与本进程同标识说明是标识复用
+      // 留下的旧文件，其认领者早已退出
+      if (recoverPid !== process.pid &&
+          localProcessState(recoverPid, '发起交接的恢复进程') === 'alive') {
+        throw new BizError(
+          `另一恢复进程 ${recoverPid} 正在交接本数据文件的写入保护，请待其结束后重试；本次未做任何改动`,
+        );
+      }
+      let info: LockInfo;
+      try {
+        const parsed = JSON.parse(await readFile(claimPath, 'utf8')) as LockInfo;
+        if (!Number.isInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.host !== 'string') {
+          throw new Error('invalid claim content');
+        }
+        info = parsed;
+      } catch {
+        throw new BizError(
+          `恢复交接文件 ${claimPath} 内容无法辨认，无法确认原写入进程，拒绝继续（请人工核查后自行处理该文件）`,
+        );
+      }
+      if (info.host !== hostname()) {
+        throw new BizError(
+          `恢复交接文件 ${claimPath} 记录的保护由另一台主机（${info.host}）的进程 ${info.pid} 取得，` +
+            '本机无法确认其是否已退出，拒绝继续',
+        );
+      }
+      if (localProcessState(info.pid, '原写入进程') === 'alive') {
+        // 原持有者仍存活：把认领走的保护放回原路径（硬链接，不覆盖任何新保护）；
+        // inode 不变，原持有者结束时的正常释放仍作用于本次取得的那一份
+        try {
+          await link(claimPath, lockPath);
+          await unlink(claimPath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+            throw new BizError(
+              `中断交接的保护（原写入进程 ${info.pid} 仍存活）无法放回原位：${lockPath} 已被新的保护占用，` +
+                `交接文件 ${claimPath} 已保留，拒绝继续`,
+            );
+          }
+          throw err;
+        }
+        notes.push(`已将 1 份中断交接的写入保护放回原位（原写入进程 ${info.pid} 仍存活，保护继续有效）。`);
+        continue;
+      }
+      // 原持有者与认领者都已确认退出：删除交接文件即完成清理
+      await unlink(claimPath);
+      notes.push(`已清理 1 份中断的恢复交接（原写入进程 ${info.pid} 已确认退出，未改动业务数据）。`);
+    } catch (err) {
+      // 交接文件在清理期间消失：另一恢复入口已处理，无需重复操作
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw err;
+    }
+  }
+  return notes;
+}
+
 // 本地恢复入口：仅确认原写入进程已退出时才解除残留保护；存活或无法确认一律
 // 明确拒绝，不按保护存在时长抢占。不重放旧命令，不改业务数据或标识计数。
+// 解除采用原子认领：把确认过的那份保护改名到本进程专有的交接文件后只删除该
+// 交接文件，绝不触碰原路径上随后出现的新保护；目标在核对期间更替时以退出码 1
+// 说明，不宣称解除新保护。
 async function cmdRecoverLock(args: string[]): Promise<void> {
   const {values, positionals} = parseFlags(args, []);
   if (values.size > 0) {
@@ -1126,6 +1283,10 @@ async function cmdRecoverLock(args: string[]): Promise<void> {
 
   const file = activeDataFile;
   const lockPath = lockPathFor(file);
+
+  // 先安全清理此前中断的恢复交接（若有），无需人工删文件
+  for (const note of await sweepStaleClaims(lockPath)) console.log(note);
+
   const readLock = async (): Promise<{dev: number; ino: number; text: string}> => {
     const st = await lstat(lockPath);
     return {dev: st.dev, ino: st.ino, text: await readFile(lockPath, 'utf8')};
@@ -1161,38 +1322,79 @@ async function cmdRecoverLock(args: string[]): Promise<void> {
     );
   }
 
-  let alive = false;
-  try {
-    process.kill(info.pid, 0);
-    alive = true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ESRCH') {
-      throw new BizError(`无法确认原写入进程 ${info.pid} 是否已退出（无权限查询），拒绝解除写入保护`);
-    }
-  }
-  if (alive) {
+  if (localProcessState(info.pid, '原写入进程') === 'alive') {
     throw new BizError(
       `写入保护仍由运行中的进程 ${info.pid} 持有（始于 ${info.acquiredAt}），拒绝解除；` +
         '不按保护存在时长抢占，请等待其结束，或确认其已退出后重试',
     );
   }
 
-  // 删除前再次核对：锁文件未被替换（inode 与内容均一致），
-  // 绝不误删其他进程在核对期间重新取得的保护
-  let second: {dev: number; ino: number; text: string};
+  await testSyncPoint('recover-validated');
+
+  // 原子认领：把确认过的那份保护改名到本进程专有的交接文件。此后只删除该
+  // 交接文件——原路径即使被新写入者取得也绝不触碰，从机制上杜绝误删新保护。
+  const claimPath = claimPathFor(lockPath, process.pid);
   try {
-    second = await readLock();
+    await rename(lockPath, claimPath);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      console.log('残留写入保护已被解除（可能由另一恢复入口处理），无需重复操作。');
-      return;
+      // 确认过的保护已消失：被另一恢复解除，或已被新保护更替
+      try {
+        await lstat(lockPath);
+      } catch (err2) {
+        if ((err2 as NodeJS.ErrnoException).code === 'ENOENT') {
+          console.log('残留写入保护已被解除（可能由另一恢复入口处理），无需重复操作。');
+          return;
+        }
+        throw new BizError(`无法读取写入保护文件 ${lockPath}: ${(err2 as Error).message}`);
+      }
+      throw new BizError(
+        '写入保护在核对期间已更替（确认过的那份已被解除，原路径已有新的保护），' +
+          '拒绝解除；本次未删除任何保护',
+      );
     }
-    throw new BizError(`无法读取写入保护文件 ${lockPath}: ${(err as Error).message}`);
+    throw new BizError(`无法认领写入保护文件 ${lockPath}: ${(err as Error).message}`);
   }
-  if (second.dev !== first.dev || second.ino !== first.ino || second.text !== first.text) {
-    throw new BizError('写入保护在核对期间已变化（可能已有新的写入者取得保护），拒绝解除');
+
+  await testSyncPoint('recover-claimed');
+
+  // 核对认领到的正是先前确认的那份（inode 与内容均一致）。若不一致，说明
+  // 核对期间目标被更替、认领到的是他人（可能仍存活）的保护：放回原位并
+  // 明确失败，绝不删除也不宣称解除。
+  let claimed: {dev: number; ino: number; text: string};
+  try {
+    const st = await lstat(claimPath);
+    claimed = {dev: st.dev, ino: st.ino, text: await readFile(claimPath, 'utf8')};
+  } catch (err) {
+    throw new BizError(`无法读取已认领的交接文件 ${claimPath}: ${(err as Error).message}`);
   }
-  await unlink(lockPath);
+  if (claimed.dev !== first.dev || claimed.ino !== first.ino || claimed.text !== first.text) {
+    try {
+      await link(claimPath, lockPath); // 硬链接放回原位，不覆盖任何新保护
+      await unlink(claimPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new BizError(
+          '写入保护在核对期间已更替，认领到的他人保护无法放回原位（原路径已有新的保护）：' +
+            `已保留在 ${claimPath}，本次未删除任何保护`,
+        );
+      }
+      throw new BizError(`无法放回认领到的保护（${claimPath} -> ${lockPath}）：${(err as Error).message}`);
+    }
+    throw new BizError(
+      '写入保护在核对期间已更替（可能已有新的写入者取得保护），拒绝解除；' +
+        '认领到的保护已放回原位，本次未删除任何保护',
+    );
+  }
+
+  // 只删除自己认领的那一份；若已被另一恢复入口清理，结果相同（保护已解除）
+  try {
+    await unlink(claimPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new BizError(`无法删除已认领的交接文件 ${claimPath}: ${(err as Error).message}`);
+    }
+  }
   console.log(
     `已解除数据文件 ${file} 的残留写入保护（原写入进程 ${info.pid} 已确认退出）。` +
       '未重放任何旧命令，数据文件、业务记录与标识计数均未改动。',
@@ -3763,8 +3965,12 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   recover-lock
       本地恢复入口：进程异常退出可能留下残留保护（锁文件），导致修改入口
       一直报告占用。本命令仅在确认原写入进程已退出时解除残留保护；进程仍
-      存活或无法确认时明确拒绝，不按保护存在时长抢占。不重放旧命令，不改
-      业务数据或标识计数；没有残留保护时明确提示且不改动。
+      存活或无法确认时明确拒绝，不按保护存在时长抢占。解除采用原子认领：
+      只删除确认过的那一份保护，绝不误删新写入者随后取得的保护；目标在
+      核对期间更替时以退出码 1 说明，不宣称解除新保护。恢复者在交接中途
+      异常退出留下的交接状态，由后续 recover-lock 自动安全清理（原持有者
+      已退出则删除、仍存活则放回原位），无需人工删文件。不重放旧命令，
+      不改业务数据或标识计数；没有残留保护时明确提示且不改动。
 
 退出码:
   0  成功
@@ -3776,8 +3982,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
      EXDATE 非法、无规则带 EXDATE、全部排除、展开超出四位年份）、UID 与
      首次导入不一致、新事件开放不足或冲突、数据文件损坏（含候补、停用、
      批量改期或导入记录结构、引用或快照非法）、保存失败、数据文件被其他
-     进程占用（5 秒内未取得写入保护）或恢复被拒绝（原写入进程存活或无法
-     确认已退出）等）
+     进程占用（5 秒内未取得写入保护）、恢复被拒绝（原写入进程存活或无法
+     确认已退出）或恢复目标在核对期间更替等）
   2  用法错误（未知参数、缺少必需选项、多余位置参数等）
 
 示例:
