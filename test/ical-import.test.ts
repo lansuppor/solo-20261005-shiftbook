@@ -17,6 +17,9 @@ import {fileURLToPath} from 'node:url';
 
 const APP = join(dirname(fileURLToPath(import.meta.url)), '..', 'app.ts');
 const OPEN_ALL: Array<[string, string]> = [['2026-01-01T00:00', '2027-01-01T00:00']];
+// 255 字节文件名：保存时临时文件（<名>.<pid>.tmp）必然超出文件名长度上限，
+// 从而在不调整任何权限的前提下，可重复地触发真实保存失败。
+const LONG_NAME = 'f'.repeat(250) + '.json';
 
 // ---------------------------------------------------------------------------
 // 基础设施
@@ -329,7 +332,7 @@ test('结构错误、关键属性重复、非法时间等一律整批失败', (t
     ['不存在的日期', ical(event('a', '20260230T100000', '20260230T110000')), /真实有效/],
     ['结束早于开始', ical(event('a', '20261012T110000', '20261012T100000')), /晚于开始/],
     ['RRULE FREQ=DAILY', ical(event('a', '20261012T100000', '20261012T110000', 'RRULE:FREQ=DAILY;COUNT=2\n')), /仅支持按周重复/],
-    ['RECURRENCE-ID', ical(event('a', '20261012T100000', '20261012T110000', 'RECURRENCE-ID:20261012T100000\n')), /重复相关属性/],
+    ['RECURRENCE-ID 无主事件', ical(event('a', '20261012T100000', '20261012T110000', 'RECURRENCE-ID:20261012T100000\n')), /缺少随文件提交的主事件|RECURRENCE-ID/],
     ['STATUS:CANCELLED', ical(event('a', '20261012T100000', '20261012T110000', 'STATUS:CANCELLED\n')), /取消事件/],
     ['METHOD:CANCEL', 'BEGIN:VCALENDAR\nVERSION:2.0\nMETHOD:CANCEL\n' + event('a', '20261012T100000', '20261012T110000') + 'END:VCALENDAR\n', /取消事件/],
     ['嵌套 VALARM', ical(event('a', '20261012T100000', '20261012T110000', 'BEGIN:VALARM\nEND:VALARM\n')), /嵌套组件/],
@@ -516,6 +519,7 @@ test('按周重复事件：RRULE 展开为系列，成员与身份原子落盘',
       {start: '2026-10-19T10:00', bookingId: 'B0002'},
       {start: '2026-10-26T10:00', bookingId: 'B0003'},
     ],
+    exceptions: [],
   });
 
   // 重启后旧入口仍可见系列与成员
@@ -875,4 +879,510 @@ test('重复导入记录损坏（系列/映射/成员引用非法）拒绝加载
   // 完好文件恢复后可正常加载（成员现状与首次请求不同合法）
   writeFileSync(df, goodBytes);
   ok(df, ['list-series'], '完好文件恢复后正常');
+});
+
+// ---------------------------------------------------------------------------
+// 例外事件辅助构造（均为浮动时间；weeklyEvent 固定 COUNT=3，特殊用例自行拼串）
+// ---------------------------------------------------------------------------
+
+function weeklyEvent(uid: string, start: string, end: string, extra = ''): string {
+  return `BEGIN:VEVENT\nUID:${uid}\nDTSTART:${start}\nDTEND:${end}\nRRULE:FREQ=WEEKLY;COUNT=3\n${extra}END:VEVENT\n`;
+}
+
+function excEvent(uid: string, rid: string, start: string, end: string, extra = ''): string {
+  return `BEGIN:VEVENT\nUID:${uid}\nRECURRENCE-ID:${rid}\nDTSTART:${start}\nDTEND:${end}\n${extra}END:VEVENT\n`;
+}
+
+// ---------------------------------------------------------------------------
+// 23. 前置与乱序例外：例外写在主事件之前、多个例外乱序，仍按原发生顺序建成员
+// ---------------------------------------------------------------------------
+
+test('RECURRENCE-ID 例外：前置与乱序书写仍按原发生顺序展开替换', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+
+  // 例外位于主事件之前，且两个例外的书写顺序与原发生顺序相反；
+  // occ2（10-12）改到 10-08 上午（早于 occ3），occ3（10-19）改到 10-22 下午（晚于常规节奏）
+  const f = writeIcal(
+    dir,
+    'unordered.ics',
+    ical(
+      excEvent('weekly-u', '20261019T100000', '20261022T140000', '20261022T150000'),
+      excEvent('weekly-u', '20261012T100000', '20261008T090000', '20261008T100000'),
+      weeklyEvent('weekly-u', '20261005T100000', '20261005T110000'),
+    ),
+  );
+  const r = importOk(df, f, ['R0001'], '前置+乱序例外导入');
+  assert.match(r.stdout, /单次改期例外 2 个，生成 3 个成员/);
+  // 展示按原发生顺序，例外位置和改期后先后不改变关联
+  assert.match(r.stdout, /第 1 次发生（原发生 2026-10-05T10:00） → B0001: 2026-10-05T10:00 → 2026-10-05T11:00/);
+  assert.match(
+    r.stdout,
+    /第 2 次发生（原发生 2026-10-12T10:00） → B0002 \[已预约\][\s\S]*RECURRENCE-ID 2026-10-12T10:00）: 2026-10-08T09:00 → 2026-10-08T10:00/,
+  );
+  assert.match(
+    r.stdout,
+    /第 3 次发生（原发生 2026-10-19T10:00） → B0003 \[已预约\][\s\S]*RECURRENCE-ID 2026-10-19T10:00）: 2026-10-22T14:00 → 2026-10-22T15:00/,
+  );
+
+  const store = readStore(df);
+  assert.deepEqual(
+    store.bookings.map((b: any) => [b.id, b.start, b.end, b.seriesId]),
+    [
+      ['B0001', '2026-10-05T10:00', '2026-10-05T11:00', 'S0001'],
+      ['B0002', '2026-10-08T09:00', '2026-10-08T10:00', 'S0001'],
+      ['B0003', '2026-10-22T14:00', '2026-10-22T15:00', 'S0001'],
+    ],
+  );
+  // 身份：occurrences 永远按原发生关联；exceptions 快照规范化为按原发生顺序
+  assert.deepEqual(store.imports[0].occurrences, [
+    {start: '2026-10-05T10:00', bookingId: 'B0001'},
+    {start: '2026-10-12T10:00', bookingId: 'B0002'},
+    {start: '2026-10-19T10:00', bookingId: 'B0003'},
+  ]);
+  assert.deepEqual(store.imports[0].exceptions, [
+    {recurrenceId: '2026-10-12T10:00', start: '2026-10-08T09:00', end: '2026-10-08T10:00'},
+    {recurrenceId: '2026-10-19T10:00', start: '2026-10-22T14:00', end: '2026-10-22T15:00'},
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// 24. 例外可改时长并跨日；年份边界开放资源下正常落盘
+// ---------------------------------------------------------------------------
+
+test('RECURRENCE-ID 例外：可改时长并跨日，成员仍属同一系列', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室', [['0001-01-01T00:00', '9999-12-31T23:59']]);
+
+  // 原 occ1 为 60 分钟不跨日；例外改为跨日 90 分钟（23:30 → 次日 01:00）
+  const f = writeIcal(
+    dir,
+    'cross.ics',
+    ical(
+      weeklyEvent('weekly-c', '20261005T100000', '20261005T110000'),
+      excEvent('weekly-c', '20261005T100000', '20261007T233000', '20261008T010000'),
+    ),
+  );
+  importOk(df, f, ['R0001'], '跨日改时长例外');
+  const store = readStore(df);
+  assert.equal(store.bookings.length, 3, '不额外生成成员');
+  assert.deepEqual([store.bookings[0].start, store.bookings[0].end], ['2026-10-07T23:30', '2026-10-08T01:00']);
+  assert.equal(store.bookings[0].seriesId, 'S0001', '例外成员仍属该系列');
+  // 跨日成员在原发生日（10-05）已查不到，在跨日的两天可查到
+  const d5 = ok(df, ['list-bookings', '--date', '2026-10-05'], '原发生日无该成员');
+  assert.match(d5.stdout, /当天没有预约/);
+  const d7 = ok(df, ['list-bookings', '--date', '2026-10-07'], '跨日首日可见');
+  assert.match(d7.stdout, /B0001 \[已预约\] 2026-10-07T23:30 → 2026-10-08T01:00/);
+  const d8 = ok(df, ['list-bookings', '--date', '2026-10-08'], '跨日次日可见');
+  assert.match(d8.stdout, /B0001/);
+});
+
+// ---------------------------------------------------------------------------
+// 25. 原时段释放：批内新事件可占用被例外替换掉的原时段；落盘后原时段也可新建预约
+// ---------------------------------------------------------------------------
+
+test('RECURRENCE-ID 例外：被替换原时段释放（批内不冲突、落盘后可新建）', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+
+  // occ1（10-05 10:00）改到 10-06；同文件新独立事件恰好落在被释放的 10-05 10:00
+  const f = writeIcal(
+    dir,
+    'release.ics',
+    ical(
+      weeklyEvent('weekly-rel', '20261005T100000', '20261005T110000'),
+      excEvent('weekly-rel', '20261005T100000', '20261006T100000', '20261006T110000'),
+      event('solo-takes-slot', '20261005T100000', '20261005T110000'),
+    ),
+  );
+  const r = importOk(df, f, ['R0001'], '原时段被批内独立事件占用仍成功');
+  assert.match(r.stdout, /新增 2 项，重放 0 项/);
+  assert.match(r.stdout, /solo-takes-slot.*B0004/);
+
+  // 落盘后原时段再次可被新建预约占用（B0001 已移走）
+  const c = ok(df, ['create-booking', '--resource', 'R0001', '--start', '2026-10-05T11:00', '--end', '2026-10-05T12:00'], '原时段端点相接新建');
+  assert.match(c.stdout, /B0005/);
+  const store = readStore(df);
+  assert.equal(store.bookings.find((b: any) => b.id === 'B0001').start, '2026-10-06T10:00');
+});
+
+// ---------------------------------------------------------------------------
+// 26. 例外目标受阻：停用覆盖不足、批外冲突、批内同系列成员冲突，双方互列
+// ---------------------------------------------------------------------------
+
+test('RECURRENCE-ID 例外：目标开放不足/批外冲突/批内冲突均整批失败', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+  ok(df, ['create-booking', '--resource', 'R0001', '--start', '2026-10-21T14:30', '--end', '2026-10-21T15:00'], '阻挡例外目标的既有预约');
+  ok(df, ['add-closure', '--resource', 'R0001', '--start', '2026-10-22T13:00', '--end', '2026-10-22T16:00'], '覆盖另一例外目标的停用');
+
+  const f = writeIcal(
+    dir,
+    'blocked.ics',
+    ical(
+      weeklyEvent('weekly-bad', '20261005T100000', '20261005T110000'),
+      excEvent('weekly-bad', '20261012T100000', '20261021T140000', '20261021T150000'), // 与 B0001 冲突
+      excEvent('weekly-bad', '20261019T100000', '20261022T140000', '20261022T150000'), // 落在停用
+    ),
+  );
+  const r = importBizFail(df, f, ['R0001'], '两个例外目标分别受阻');
+  assert.match(
+    r.stderr,
+    /第 2 次发生（原发生 2026-10-12T10:00，目标时间 2026-10-21T14:00 → 2026-10-21T15:00）[\s\S]*B0001/,
+  );
+  assert.match(
+    r.stderr,
+    /第 3 次发生（原发生 2026-10-19T10:00，目标时间 2026-10-22T14:00 → 2026-10-22T15:00）[\s\S]*C0001/,
+  );
+  assert.match(r.stderr, /被替换原时段 2026-10-12T10:00 → 2026-10-12T11:00 已释放/);
+  assert.equal(readStore(df).bookings.length, 1, '整批未导入');
+  assert.equal(readStore(df).seriesSeq, 0);
+
+  // 批内冲突：例外把 occ2 移到 occ3 的目标时间，双方互列且都带原发生
+  const f2 = writeIcal(
+    dir,
+    'sibling.ics',
+    ical(
+      'BEGIN:VEVENT\nUID:sib\nDTSTART:20261102T100000\nDTEND:20261102T110000\nRRULE:FREQ=WEEKLY;COUNT=2\nEND:VEVENT\n',
+      excEvent('sib', '20261102T100000', '20261109T100000', '20261109T110000'),
+    ),
+  );
+  const r2 = importBizFail(df, f2, ['R0001'], '例外与同系列兄弟成员冲突');
+  assert.match(r2.stderr, /原发生 2026-11-02T10:00，目标时间 2026-11-09T10:00[\s\S]*第 2 次发生（2026-11-09T10:00 → 2026-11-09T11:00）/);
+  assert.match(r2.stderr, /第 2 次发生（2026-11-09T10:00 → 2026-11-09T11:00）[\s\S]*原发生 2026-11-02T10:00，目标时间 2026-11-09T10:00/);
+});
+
+// ---------------------------------------------------------------------------
+// 27. 混合重放：例外前置/乱序仍为重放（不写文件）；本地改期/取消后重放不覆盖；
+//     与新独立事件混合时仅新项校验与计数
+// ---------------------------------------------------------------------------
+
+test('RECURRENCE-ID 例外：乱序重放不写文件；本地改期/取消不覆盖、不复活；混合新项', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+
+  const f1 = writeIcal(
+    dir,
+    'first.ics',
+    ical(
+      weeklyEvent('weekly-mix', '20261005T100000', '20261005T110000'),
+      excEvent('weekly-mix', '20261012T100000', '20261013T090000', '20261013T100000'),
+    ),
+  );
+  importOk(df, f1, ['R0001'], '首次导入带例外系列');
+  // 本地再改期 B0002，并取消 B0003
+  ok(df, ['reschedule-booking', 'B0002', '--start', '2026-10-13T15:00', '--end', '2026-10-13T16:00'], '本地改期例外成员');
+  ok(df, ['cancel-booking', 'B0003'], '本地取消成员');
+  const before = readFileSync(df);
+
+  // 重放：例外 VEVENT 前置且乱序（只一个例外，仍放主事件之前）
+  const f2 = writeIcal(
+    dir,
+    'replay.ics',
+    ical(
+      excEvent('weekly-mix', '20261012T100000', '20261013T090000', '20261013T100000'),
+      weeklyEvent('weekly-mix', '20261005T100000', '20261005T110000'),
+    ),
+  );
+  const r = importOk(df, f2, ['R0001'], '前置乱序重放');
+  assert.match(r.stdout, /全部为重放/);
+  assert.match(r.stdout, /例外 1 个，成员 3 个/);
+  assert.match(r.stdout, /原发生 2026-10-12T10:00） → B0002 \[已预约\]/);
+  assert.match(r.stdout, /首次请求例外目标: 2026-10-13T09:00 → 2026-10-13T10:00/);
+  assert.match(r.stdout, /当前安排: 2026-10-13T15:00 → 2026-10-13T16:00/, '本地改期不被覆盖');
+  assert.match(r.stdout, /原发生 2026-10-19T10:00） → B0003 \[已取消\]/, '本地取消不复活');
+  assert.ok(before.equals(readFileSync(df)), '重放逐字节不变');
+
+  // 混合新独立事件：新增 1 项、重放 1 项，计数只增新预约
+  const f3 = writeIcal(
+    dir,
+    'mix-new.ics',
+    ical(
+      excEvent('weekly-mix', '20261012T100000', '20261013T090000', '20261013T100000'),
+      weeklyEvent('weekly-mix', '20261005T100000', '20261005T110000'),
+      event('solo-new', '20261102T080000', '20261102T090000'),
+    ),
+  );
+  const r3 = importOk(df, f3, ['R0001'], '例外系列重放混合新项');
+  assert.match(r3.stdout, /新增 1 项，重放 1 项/);
+  const store = readStore(df);
+  assert.equal(store.bookingSeq, 4, '仅新独立事件推进计数');
+  assert.equal(store.bookings.length, 4);
+});
+
+// ---------------------------------------------------------------------------
+// 28. 身份变化：增删例外、改例外时间/目标原发生整批拒绝；书写顺序不影响身份
+// ---------------------------------------------------------------------------
+
+test('RECURRENCE-ID 例外：增删改整批拒绝且文件不变；书写顺序不影响身份', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+
+  const f1 = writeIcal(
+    dir,
+    'first.ics',
+    ical(
+      weeklyEvent('weekly-id', '20261005T100000', '20261005T110000'),
+      excEvent('weekly-id', '20261012T100000', '20261013T090000', '20261013T100000'),
+      excEvent('weekly-id', '20261019T100000', '20261020T090000', '20261020T100000'),
+    ),
+  );
+  importOk(df, f1, ['R0001'], '首次导入两个例外');
+  const before = readFileSync(df);
+
+  // 同样两个例外但书写顺序相反（含主事件位置穿插）：仍是重放，不写文件
+  const fReorder = writeIcal(
+    dir,
+    'reorder.ics',
+    ical(
+      excEvent('weekly-id', '20261019T100000', '20261020T090000', '20261020T100000'),
+      weeklyEvent('weekly-id', '20261005T100000', '20261005T110000'),
+      excEvent('weekly-id', '20261012T100000', '20261013T090000', '20261013T100000'),
+    ),
+  );
+  const r0 = importOk(df, fReorder, ['R0001'], '例外书写顺序不同仍为重放');
+  assert.match(r0.stdout, /全部为重放/);
+  assert.ok(before.equals(readFileSync(df)), '顺序重放不写文件');
+
+  const reject = (name: string, content: string, pattern: RegExp): void => {
+    const f = writeIcal(dir, `${name}.ics`, content);
+    const r = importBizFail(df, f, ['R0001'], name);
+    assert.match(r.stderr, /例外集合不同/);
+    assert.match(r.stderr, pattern);
+    assert.ok(before.equals(readFileSync(df)), `${name} 后文件逐字节不变`);
+  };
+
+  // 删除一个例外
+  reject(
+    '删除例外',
+    ical(
+      weeklyEvent('weekly-id', '20261005T100000', '20261005T110000'),
+      excEvent('weekly-id', '20261012T100000', '20261013T090000', '20261013T100000'),
+    ),
+    /本次为[^\n]*例外 1 个/,
+  );
+  // 新增一个例外（occ1）
+  reject(
+    '新增例外',
+    ical(
+      weeklyEvent('weekly-id', '20261005T100000', '20261005T110000'),
+      excEvent('weekly-id', '20261005T100000', '20261006T090000', '20261006T100000'),
+      excEvent('weekly-id', '20261012T100000', '20261013T090000', '20261013T100000'),
+      excEvent('weekly-id', '20261019T100000', '20261020T090000', '20261020T100000'),
+    ),
+    /例外 3 个/,
+  );
+  // 改变例外起止时间
+  reject(
+    '改变例外时间',
+    ical(
+      weeklyEvent('weekly-id', '20261005T100000', '20261005T110000'),
+      excEvent('weekly-id', '20261012T100000', '20261013T093000', '20261013T103000'),
+      excEvent('weekly-id', '20261019T100000', '20261020T090000', '20261020T100000'),
+    ),
+    /例外集合不同/,
+  );
+  // 同样两个例外，但 RECURRENCE-ID 改指另一原发生（occ1 顶替 occ2）
+  reject(
+    '改变例外关联的原发生',
+    ical(
+      weeklyEvent('weekly-id', '20261005T100000', '20261005T110000'),
+      excEvent('weekly-id', '20261005T100000', '20261013T090000', '20261013T100000'),
+      excEvent('weekly-id', '20261019T100000', '20261020T090000', '20261020T100000'),
+    ),
+    /例外集合不同/,
+  );
+  assert.equal(readStore(df).bookingSeq, 3, '拒绝均不推进计数');
+});
+
+// ---------------------------------------------------------------------------
+// 29. 保存失败与重试：真实保存失败逐字节保留、标识未消费；同原数据重试成功
+// ---------------------------------------------------------------------------
+
+test('RECURRENCE-ID 例外：保存失败逐字节保留且不消费标识，重试成功', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+
+  const ics = writeIcal(
+    dir,
+    'a.ics',
+    ical(
+      weeklyEvent('weekly-save', '20261005T100000', '20261005T110000'),
+      excEvent('weekly-save', '20261012T100000', '20261013T090000', '20261013T103000'),
+      event('solo-save', '20261102T080000', '20261102T090000'),
+    ),
+  );
+
+  // 数据放到保存必然失败的位置（数据文件名 255 字节，临时文件名超限）
+  const origBytes = readFileSync(df);
+  const longFile = join(dir, LONG_NAME);
+  writeFileSync(longFile, origBytes);
+  const r = bizFail(longFile, ['import-ical', ics, '--resource', 'R0001'], '保存失败');
+  assert.match(r.stderr, /保存数据文件 .* 失败/);
+  assert.ok(origBytes.equals(readFileSync(longFile)), '保存失败原文件逐字节保留');
+  assert.equal(readStore(longFile).bookingSeq, 0, '失败不消费标识');
+
+  // 可写位置用同一原数据重试：成功，标识从 B0001 起未被失败尝试消费
+  const retryFile = join(dir, 'retry.json');
+  writeFileSync(retryFile, origBytes);
+  const r2 = importOk(retryFile, ics, ['R0001'], '可写位置重试');
+  assert.match(r2.stdout, /新增 2 项，重放 0 项/);
+  const store = readStore(retryFile);
+  assert.deepEqual(store.bookings.map((b: any) => b.id), ['B0001', 'B0002', 'B0003', 'B0004']);
+  assert.equal(store.bookings[1].start, '2026-10-13T09:00', '例外时间正确落盘');
+  const imp = store.imports.find((x: any) => x.uid === 'weekly-save');
+  assert.deepEqual(imp.exceptions, [
+    {recurrenceId: '2026-10-12T10:00', start: '2026-10-13T09:00', end: '2026-10-13T10:30'},
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// 30. 新进程持久查询：重启后例外成员按改期后时间可查，系列归属与身份保留
+// ---------------------------------------------------------------------------
+
+test('RECURRENCE-ID 例外：新进程查询持久结果，成员可独立改期/取消且身份不丢', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+
+  const f = writeIcal(
+    dir,
+    'a.ics',
+    ical(
+      weeklyEvent('weekly-persist', '20261005T100000', '20261005T110000'),
+      excEvent('weekly-persist', '20261012T100000', '20261013T140000', '20261013T150000'),
+    ),
+  );
+  importOk(df, f, ['R0001'], '首次导入');
+
+  // 每个 ok/bizFail 都是全新子进程；原发生日只剩 occ1/occ3，10-12 当天仅 occ3 不在该日
+  const day12 = ok(df, ['list-bookings', '--date', '2026-10-12'], '新进程查原发生日');
+  assert.doesNotMatch(day12.stdout, /2026-10-12T10:00 → 2026-10-12T11:00/, '例外成员不在原时段');
+  const day13 = ok(df, ['list-bookings', '--date', '2026-10-13'], '新进程查改期后日期');
+  assert.match(day13.stdout, /B0002 \[已预约\] 2026-10-13T14:00 → 2026-10-13T15:00/);
+  assert.match(day13.stdout, /所属系列: S0001/, '例外成员仍属系列');
+
+  // 例外成员就是普通系列成员，可经旧入口独立改期/取消
+  ok(df, ['reschedule-booking', 'B0002', '--start', '2026-10-13T16:00', '--end', '2026-10-13T17:00'], '独立改期例外成员');
+  ok(df, ['cancel-booking', 'B0001'], '独立取消另一成员');
+  const series = ok(df, ['list-series'], '系列查询仍含全部成员与归属');
+  assert.match(series.stdout, /S0001/);
+
+  // 再重放：身份（含例外集合）仍在，返回现状而不复活
+  const r = importOk(df, f, ['R0001'], '本地改动后重放');
+  assert.match(r.stdout, /B0001 \[已取消\]/);
+  assert.match(r.stdout, /B0002 \[已预约\][\s\S]*当前安排: 2026-10-13T16:00 → 2026-10-13T17:00/);
+});
+
+// ---------------------------------------------------------------------------
+// 31. 例外结构负例：主事件缺失/错误、例外携带非法属性与参数、RECURRENCE-ID 非法
+// ---------------------------------------------------------------------------
+
+test('RECURRENCE-ID 例外：结构非法一律整批拒绝', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室', [['0001-01-01T00:00', '9999-12-31T23:59']]);
+
+  const master = weeklyEvent('u', '20261005T100000', '20261005T110000');
+  const exc = excEvent('u', '20261012T100000', '20261013T100000', '20261013T110000');
+  let no = 0;
+  const w = (content: string): string => writeIcal(dir, `ex-bad-${no++}.ics`, content);
+  const cases: Array<[string, string, RegExp]> = [
+    ['两个同 UID 主事件', ical(master, master), /文件内 UID 重复/],
+    ['例外无主事件', ical(exc), /缺少随文件提交的主事件/],
+    ['独立事件配例外', ical(event('u', '20261005T100000', '20261005T110000'), exc), /主事件不是按周重复事件/],
+    ['例外带 RRULE', ical(master, excEvent('u', '20261012T100000', '20261013T100000', '20261013T110000', 'RRULE:FREQ=WEEKLY;COUNT=2\n')), /不得带 RRULE/],
+    ['例外带 EXDATE', ical(master, excEvent('u', '20261012T100000', '20261013T100000', '20261013T110000', 'EXDATE:20261019T100000\n')), /不得带 EXDATE/],
+    ['RECURRENCE-ID 带 RANGE', ical(master, 'BEGIN:VEVENT\nUID:u\nRECURRENCE-ID;RANGE=THISANDPRIOR:20261012T100000\nDTSTART:20261013T100000\nDTEND:20261013T110000\nEND:VEVENT\n'), /RANGE/],
+    ['RECURRENCE-ID 逗号列表', ical(master, 'BEGIN:VEVENT\nUID:u\nRECURRENCE-ID:20261012T100000,20261019T100000\nDTSTART:20261013T100000\nDTEND:20261013T110000\nEND:VEVENT\n'), /只能指定单个时间/],
+    ['RECURRENCE-ID 秒非 00', ical(master, excEvent('u', '20261012T100001', '20261013T100000', '20261013T110000')), /秒必须为 00/],
+    ['RECURRENCE-ID 带 TZID', ical(master, 'BEGIN:VEVENT\nUID:u\nRECURRENCE-ID;TZID=Asia/Shanghai:20261012T100000\nDTSTART:20261013T100000\nDTEND:20261013T110000\nEND:VEVENT\n'), /时区/],
+    ['RECURRENCE-ID 不匹配原开始', ical(master, excEvent('u', '20261013T100000', '20261014T100000', '20261014T110000')), /不匹配任何原开始时间/],
+    ['RECURRENCE-ID 匹配已排除发生', ical(weeklyEvent('u', '20261005T100000', '20261005T110000', 'EXDATE:20261012T100000\n'), excEvent('u', '20261012T100000', '20261013T100000', '20261013T110000')), /已被 EXDATE 排除/],
+    ['同一原发生重复例外', ical(master, exc, exc), /重复例外/],
+    ['例外结束早于开始', ical(master, excEvent('u', '20261012T100000', '20261013T110000', '20261013T100000')), /晚于开始/],
+    ['例外缺 DTSTART', ical(master, 'BEGIN:VEVENT\nUID:u\nRECURRENCE-ID:20261012T100000\nDTEND:20261013T110000\nEND:VEVENT\n'), /缺少 DTSTART/],
+    ['例外取消事件', ical(master, excEvent('u', '20261012T100000', '20261013T100000', '20261013T110000', 'STATUS:CANCELLED\n')), /取消事件/],
+  ];
+  for (const [name, content, pattern] of cases) {
+    const r = importBizFail(df, w(content), ['R0001'], `例外负例：${name}`);
+    assert.match(r.stderr, pattern, `例外负例：${name}`);
+  }
+  assert.equal(readStore(df).bookings.length, 0, '全部例外负例均未产生预约');
+});
+
+// ---------------------------------------------------------------------------
+// 32. 例外快照损坏检测：RECURRENCE-ID 不匹配、时间非法、重复例外、未知字段
+// ---------------------------------------------------------------------------
+
+test('RECURRENCE-ID 例外：快照非法视为数据损坏并保留原文件', (t) => {
+  const dir = tempDir(t);
+  const df = join(dir, 'data.json');
+  addResource(df, '会议室');
+
+  const f = writeIcal(
+    dir,
+    'a.ics',
+    ical(
+      weeklyEvent('weekly-corrupt', '20261005T100000', '20261005T110000'),
+      excEvent('weekly-corrupt', '20261012T100000', '20261013T090000', '20261013T100000'),
+    ),
+  );
+  importOk(df, f, ['R0001'], '首次导入');
+  const goodBytes = readFileSync(df);
+  const reload = (ctx: string) => bizFail(df, ['list-series'], ctx);
+  const corrupt = (mutate: (s: any) => void, pattern: RegExp, ctx: string): void => {
+    writeFileSync(df, goodBytes);
+    const s = JSON.parse(goodBytes.toString('utf8'));
+    mutate(s);
+    writeFileSync(df, JSON.stringify(s));
+    assert.match(reload(ctx).stderr, pattern, ctx);
+  };
+
+  corrupt(
+    (s) => { s.imports[0].exceptions[0].recurrenceId = '2026-11-02T10:00'; },
+    /不匹配任何未排除原发生/,
+    'RECURRENCE-ID 不匹配',
+  );
+  corrupt(
+    (s) => { s.imports[0].exceptions[0].end = '2026-10-13T08:00'; },
+    /结束必须晚于开始/,
+    '例外结束非法',
+  );
+  corrupt(
+    (s) => {
+      s.imports[0].exceptions.push({recurrenceId: '2026-10-12T10:00', start: '2026-10-14T09:00', end: '2026-10-14T10:00'});
+    },
+    /同一原发生存在重复例外/,
+    '重复例外',
+  );
+  corrupt(
+    (s) => { s.imports[0].exceptions[0].bogus = 1; },
+    /未知字段/,
+    '例外未知字段',
+  );
+  corrupt(
+    (s) => { s.imports[0].exceptions = 'x'; },
+    /exceptions 必须是数组/,
+    'exceptions 非数组',
+  );
+
+  // 旧记录无 exceptions 字段视为空集合：文件可正常加载；但重放带例外的请求
+  // 时按“空例外集合”比对，例外集合不同仍整批拒绝（不覆盖本地安排）
+  writeFileSync(df, goodBytes);
+  const s = JSON.parse(goodBytes.toString('utf8'));
+  delete s.imports[0].exceptions;
+  writeFileSync(df, JSON.stringify(s));
+  ok(df, ['list-series'], '旧记录无 exceptions 视为空集合且可加载');
+  const r = importBizFail(df, f, ['R0001'], '旧记录重放带例外请求按空集合比对');
+  assert.match(r.stderr, /例外集合不同/);
+
+  writeFileSync(df, goodBytes);
 });

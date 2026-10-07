@@ -41,10 +41,13 @@
 // iCalendar 导入：import-ical 读取本地 UTF-8 的 VCALENDAR（VERSION:2.0），
 // 为每个新 VEVENT 创建预约（统一使用命令行给定的资源集合，不自动处理候补）：
 // 无 RRULE 的独立事件创建一项普通预约；带 RRULE:FREQ=WEEKLY;COUNT=n 的事件创建
-// 一个按周重复系列（EXDATE 排除的发生不生成成员）。UID 永久关联首次导入（独立
-// 事件关联其预约；重复事件关联其系列、各原发生时间与对应成员），相同 UID 且
-// 重复与否、首项时间、COUNT、排除集合与资源集合一致为重放（不改动原安排），
-// 任一不同则整批拒绝。
+// 一个按周重复系列（EXDATE 排除的发生不生成成员）。同一 UID 允许一个按周主事件
+// （不带 RECURRENCE-ID，须随文件提交）配若干例外 VEVENT（各带单个 RECURRENCE-ID
+// 及改期后的 DTSTART/DTEND）：例外匹配主事件展开后未排除的原开始，可改时间与时长，
+// 不额外生成成员、不生成额外成员。UID 永久关联首次导入（独立事件关联其预约；
+// 重复事件关联其系列、各原发生时间、对应成员及按原发生关联的例外起止集合），
+// 相同 UID 且重复与否、首项时间、COUNT、排除集合、例外集合与资源集合一致为重放
+// （不改动原安排），任一不同则整批拒绝；例外在文件中的书写位置与顺序不影响身份。
 //
 // 多项预约目标（系列成员、批量改期目标、撤销恢复安排、导入新事件）的可行性
 // 校验统一由 validateBatchTargets 完成（无写入副作用），各入口只负责展开
@@ -328,6 +331,9 @@ interface BatchOpRec {
 // 按周重复事件（RRULE:FREQ=WEEKLY;COUNT=n）：seriesId 指向首次导入创建的系列，
 // occurrences 按原发生顺序记录每个未排除发生的原开始时间（YYYY-MM-DDTHH:mm）与
 // 对应成员预约标识（排除的发生不在其中）；count/exdates 为首次请求的重复参数。
+// exceptions 按原发生时间关联该次发生的改期例外（RECURRENCE-ID = 原开始，
+// start/end 为例外的改期后起止；首次请求无例外时为空数组），同一次发生至多一个
+// 例外，被替换原时段以例外时间参与覆盖与冲突校验。
 // 快照保留首次导入的时间与资源集合（之后成员被改期/取消、系列被整体取消也不变），
 // 重放按快照比对本次请求，身份不依赖导入文件路径
 interface ImportRec {
@@ -340,6 +346,7 @@ interface ImportRec {
   count?: number; // 仅重复事件：RRULE COUNT（1..100000，含首项）
   exdates?: string[]; // 仅重复事件：排除集合快照（原开始时间文本，按时间排序去重）
   occurrences?: Array<{start: string; bookingId: string}>; // 仅重复事件：原发生时间 -> 成员
+  exceptions?: Array<{recurrenceId: string; start: string; end: string}>; // 仅重复事件：按原发生关联的例外起止（按原发生顺序）
 }
 
 interface Store {
@@ -883,7 +890,7 @@ function validateStore(raw: unknown, file: string): Store {
       if (typeof im.bookingId !== 'string' || !/^B\d{4,}$/.test(im.bookingId)) {
         bad(`${at}(UID “${uid}”).bookingId 非法: ${String(im.bookingId)}`);
       }
-      for (const k of ['count', 'exdates', 'occurrences']) {
+      for (const k of ['count', 'exdates', 'occurrences', 'exceptions']) {
         if (im[k] !== undefined) bad(`${at}(UID “${uid}”) 独立事件身份不应携带 ${k}`);
       }
       claimBooking(uid, im.bookingId as string, at);
@@ -974,6 +981,45 @@ function validateStore(raw: unknown, file: string): Store {
       bad(`${at}(UID “${uid}”) 系列 ${rec.seriesId} 存在未登记在 occurrences 中的成员（系列与发生映射必须一一对应）`);
     }
     rec.occurrences = occs;
+
+    // 例外集合（旧记录无 exceptions 字段视为空集合）：每项按原发生时间
+    // （RECURRENCE-ID，必须命中某个未排除原发生）关联改期后起止，同一原发生
+    // 至多一个例外；快照自身须合法（真实时间、结束晚于开始）。成员现状与
+    // 例外快照不同不算损坏（本地可再改期、取消）。
+    const exceptions: Array<{recurrenceId: string; start: string; end: string}> = [];
+    if (im.exceptions !== undefined) {
+      if (!Array.isArray(im.exceptions)) bad(`${at}(UID “${uid}”).exceptions 必须是数组`);
+      const keptTimes = new Set(occs.map((o) => o.start));
+      const exOccSeen = new Set<string>();
+      (im.exceptions as unknown[]).forEach((xv, j) => {
+        const eat = `${at}(UID “${uid}”).exceptions[${j}]`;
+        if (typeof xv !== 'object' || xv === null || Array.isArray(xv)) bad(`${eat} 必须是对象`);
+        const x = xv as Record<string, unknown>;
+        for (const k of Object.keys(x)) {
+          if (k !== 'recurrenceId' && k !== 'start' && k !== 'end') bad(`${eat} 存在未知字段 “${k}”`);
+        }
+        if (typeof x.recurrenceId !== 'string') bad(`${eat}.recurrenceId 必须是时间字符串`);
+        parseDateTime(x.recurrenceId, `${eat}.recurrenceId`);
+        if (!keptTimes.has(x.recurrenceId)) {
+          bad(`${at}(UID “${uid}”) 例外的 RECURRENCE-ID ${x.recurrenceId} 不匹配任何未排除原发生`);
+        }
+        if (exOccSeen.has(x.recurrenceId)) {
+          bad(`${at}(UID “${uid}”) 同一原发生存在重复例外: ${x.recurrenceId}`);
+        }
+        exOccSeen.add(x.recurrenceId);
+        if (typeof x.start !== 'string') bad(`${eat}.start 必须是时间字符串`);
+        if (typeof x.end !== 'string') bad(`${eat}.end 必须是时间字符串`);
+        const xs = parseDateTime(x.start, `${eat}.start`);
+        const xe = parseDateTime(x.end, `${eat}.end`);
+        if (xe <= xs) bad(`${eat} 结束必须晚于开始`);
+        exceptions.push({recurrenceId: x.recurrenceId, start: x.start, end: x.end});
+      });
+    }
+    // 规范化为按原发生顺序排列，顺序不影响身份
+    const occOrder = new Map(occs.map((o, k) => [o.start, k]));
+    exceptions.sort((a, b) => occOrder.get(a.recurrenceId)! - occOrder.get(b.recurrenceId)!);
+    rec.exceptions = exceptions;
+
     store.imports.push(rec);
   });
 
@@ -4221,9 +4267,13 @@ async function cmdCancelClosure(args: string[]): Promise<void> {
 // 读取 UTF-8 的 VCALENDAR（VERSION:2.0，至少一个独立 VEVENT），为新事件创建预约，
 // 全部使用命令行给定的同一资源集合（不自动处理候补）：无 RRULE 的事件创建一项
 // 普通预约；带 RRULE:FREQ=WEEKLY;COUNT=n 的事件创建按周重复系列（EXDATE 排除的
-// 发生不生成成员）。UID 永久关联首次导入（独立事件关联预约；重复事件关联系列、
-// 各原发生时间与成员）；相同 UID 且请求一致为重放（返回当前安排与状态，不做任何
-// 改动），重复与否/首项时间/COUNT/排除集合/资源集合任一不同则整批拒绝。
+// 发生不生成成员）。同一 UID 允许一个不带 RECURRENCE-ID 的按周主事件配若干例外
+// VEVENT（各带单个 RECURRENCE-ID 与改期后 DTSTART/DTEND，文件中位置不限）：
+// 例外匹配展开后未排除的原开始并替换该次发生的目标时间，不额外生成成员。
+// UID 永久关联首次导入（独立事件关联预约；重复事件关联系列、各原发生时间、成员
+// 及按原发生关联的例外起止集合）；相同 UID 且请求一致为重放（返回当前安排与状态，
+// 不做任何改动），重复与否/首项时间/COUNT/排除集合/例外集合/资源集合任一不同则
+// 整批拒绝，例外的书写顺序不影响身份。
 // ---------------------------------------------------------------------------
 
 // 标准折行展开：以空格或制表符开头的行是上一行的延续（去掉首个空白字符拼接）。
@@ -4306,8 +4356,8 @@ function assertFloatingDateTimeParams(
   }
 }
 
-// 仍一律拒绝的重复相关属性（RRULE 与 EXDATE 已支持按周重复的受限子集）
-const ICAL_RECURRENCE_PROPS = new Set(['RDATE', 'EXRULE', 'RECURRENCE-ID']);
+// 仍一律拒绝的重复相关属性（RRULE、EXDATE 与 RECURRENCE-ID 已支持受限子集）
+const ICAL_RECURRENCE_PROPS = new Set(['RDATE', 'EXRULE']);
 
 // 解析 RRULE 值：仅支持 FREQ=WEEKLY 与 COUNT=n 两个部件（n 为 1..100000 的整数，
 // 含首项）；部件名大小写无关、顺序无关。空部件、重复部件、FREQ 其他取值、
@@ -4358,8 +4408,24 @@ function parseExdateValue(
   return parts.map((p) => parseIcalDateTime(p.trim(), 'EXDATE ', bad));
 }
 
-// 一个解析完成的 VEVENT（时间已换算为营业地分钟数与 YYYY-MM-DDTHH:mm 文本）
+// 一个解析完成的 VEVENT 发生（时间已换算为营业地分钟数与 YYYY-MM-DDTHH:mm 文本）。
+// start*/end* 为该成员的最终目标时间（套用例外后）；original* 为按 RRULE 展开的
+// 原时段（未套例外时两者相同）；hasException 标记该次发生是否被例外替换。
 interface IcalOccurrence {
+  startRaw: string;
+  endRaw: string;
+  startMin: number;
+  endMin: number;
+  originalStartRaw: string;
+  originalEndRaw: string;
+  hasException: boolean;
+}
+
+// 按周系列的单次改期例外：recurrenceId 为被替换原发生的原开始，
+// start/end 为改期后的目标起止（可改时间与时长）
+interface IcalException {
+  recurrenceIdRaw: string;
+  recurrenceIdMin: number;
   startRaw: string;
   endRaw: string;
   startMin: number;
@@ -4375,10 +4441,39 @@ interface IcalEvent {
   recurring: boolean; // 是否带 RRULE:FREQ=WEEKLY;COUNT=n
   count?: number; // 重复事件的 COUNT（含首项，1..100000）
   exdates?: string[]; // 重复事件的排除集合（原开始时间文本，去重按时间排序）
-  occurrences: IcalOccurrence[]; // 独立事件 1 项；重复事件为全部未排除发生（按原发生顺序）
+  occurrences: IcalOccurrence[]; // 独立事件 1 项；重复事件为全部未排除发生（按原发生顺序，尚未套用例外）
+  exceptions?: IcalException[]; // 仅重复事件：按原发生关联的改期例外（按原发生顺序）
 }
 
-// 解析整个 iCalendar 文件；任何结构错误、关键属性重复或缺失都抛出 BizError（整批失败）
+// 解析 RECURRENCE-ID 属性：单个浮动时间（沿用 DTSTART 的参数限制），
+// 但显式拒绝 RANGE 参数（单次改期例外不得跨范围影响后续发生）
+function parseRecurrenceIdValue(
+  params: string[],
+  value: string,
+  bad: (reason: string) => never,
+): {raw: string; min: number} {
+  for (const p of params) {
+    if (/^RANGE=/i.test(p)) bad('RECURRENCE-ID 不支持 RANGE 参数（单次改期例外只影响该次原发生）');
+  }
+  assertFloatingDateTimeParams(params, 'RECURRENCE-ID ', bad);
+  if (value.includes(',')) bad('RECURRENCE-ID 只能指定单个时间（不接受逗号列表）');
+  return parseIcalDateTime(value.trim(), 'RECURRENCE-ID ', bad);
+}
+
+// 一个刚从文件读出、尚未归并到主事件的原始 VEVENT
+interface RawVevent {
+  order: number; // 在文件中的 VEVENT 次序（0 基）
+  uid: string;
+  start: {raw: string; min: number};
+  end: {raw: string; min: number};
+  rrule?: string;
+  exdates: Array<{raw: string; min: number}>;
+  recurrenceId?: {raw: string; min: number}; // 带此属性者为例外 VEVENT
+}
+
+// 解析整个 iCalendar 文件；任何结构错误、关键属性重复或缺失都抛出 BizError（整批失败）。
+// 同一 UID 允许一个不带 RECURRENCE-ID 的按周主事件配若干例外 VEVENT（各带单个
+// RECURRENCE-ID 与改期后 DTSTART/DTEND，可位于主事件之前或之后）；其余重复 UID 拒绝。
 function parseIcalFile(text: string, file: string): IcalEvent[] {
   const bad = (reason: string): never => {
     throw new BizError(`iCalendar 文件 ${file} 无法导入：${reason}（整批未导入，数据未改动）`);
@@ -4386,8 +4481,7 @@ function parseIcalFile(text: string, file: string): IcalEvent[] {
   const lines = unfoldIcalLines(text, bad);
   if (lines.length === 0) bad('文件为空');
 
-  const events: IcalEvent[] = [];
-  const seenUids = new Set<string>();
+  const rawEvents: RawVevent[] = [];
   let inCalendar = false;
   let calendarEnded = false;
   let versionSeen = false;
@@ -4397,6 +4491,7 @@ function parseIcalFile(text: string, file: string): IcalEvent[] {
   let curEnd: {raw: string; min: number} | undefined;
   let curRrule: string | undefined; // RRULE 原文（至多一条）
   let curExdates: Array<{raw: string; min: number}> = []; // 多行 EXDATE 合并后的候选时间
+  let curRecurrenceId: {raw: string; min: number} | undefined;
 
   const closeEvent = (): void => {
     if (curUid === undefined) bad('VEVENT 缺少 UID 属性');
@@ -4405,82 +4500,22 @@ function parseIcalFile(text: string, file: string): IcalEvent[] {
     if (curEnd.min <= curStart.min) {
       bad(`VEVENT（UID “${curUid}”）结束时间必须晚于开始时间（${curStart.raw} → ${curEnd.raw}），允许跨日`);
     }
-    if (seenUids.has(curUid)) bad(`文件内 UID 重复: “${curUid}”（解码后区分大小写）`);
-    seenUids.add(curUid);
-
-    const ev: IcalEvent = {
+    rawEvents.push({
+      order: rawEvents.length,
       uid: curUid,
-      startRaw: curStart.raw,
-      endRaw: curEnd.raw,
-      startMin: curStart.min,
-      endMin: curEnd.min,
-      recurring: false,
-      occurrences: [],
-    };
-
-    // 无规则却有 EXDATE：整批拒绝（排除日期只在按周重复事件中有意义）
-    if (curRrule === undefined) {
-      if (curExdates.length > 0) bad(`VEVENT（UID “${curUid}”）含 EXDATE 却没有 RRULE（无规则不能带排除日期）`);
-      ev.occurrences.push({
-        startRaw: curStart.raw,
-        endRaw: curEnd.raw,
-        startMin: curStart.min,
-        endMin: curEnd.min,
-      });
-    } else {
-      const count = parseWeeklyRrule(curRrule, bad);
-      ev.recurring = true;
-      ev.count = count;
-      // EXDATE 只能匹配原开始时间：全部候选必须落在按周展开的原开始时间集合上，
-      // 多行与逗号列表合并、按集合去重
-      const allStarts = new Map<number, string>();
-      for (let i = 0; i < count; i++) {
-        const sMin = curStart.min + i * 7 * 1440;
-        const eMin = curEnd.min + i * 7 * 1440;
-        const sRaw = formatDateTime(sMin);
-        const eRaw = formatDateTime(eMin);
-        if (sRaw === null || eRaw === null) {
-          bad(
-            `VEVENT（UID “${curUid}”）按周展开第 ${i + 1} 项超出四位年份范围（0001-9999），整批拒绝`,
-          );
-        }
-        allStarts.set(sMin, sRaw);
-      }
-      const exSet = new Set<number>();
-      for (const ex of curExdates) {
-        if (!allStarts.has(ex.min)) {
-          bad(
-            `VEVENT（UID “${curUid}”）的 EXDATE ${ex.raw} 不匹配任何原开始时间` +
-              '（排除日期只能等于某一发生的原开始时间，时刻须一致）',
-          );
-        }
-        exSet.add(ex.min);
-      }
-      ev.exdates = [...exSet]
-        .map((m) => allStarts.get(m)!)
-        .sort();
-      for (let i = 0; i < count; i++) {
-        const sMin = curStart.min + i * 7 * 1440;
-        if (exSet.has(sMin)) continue; // 仅为未排除项生成成员
-        ev.occurrences.push({
-          startRaw: formatDateTime(sMin)!,
-          endRaw: formatDateTime(curEnd.min + i * 7 * 1440)!,
-          startMin: sMin,
-          endMin: curEnd.min + i * 7 * 1440,
-        });
-      }
-      if (ev.occurrences.length === 0) {
-        bad(`VEVENT（UID “${curUid}”）的全部 ${count} 个发生都被 EXDATE 排除，整批拒绝（至少保留一项）`);
-      }
-    }
-
-    events.push(ev);
+      start: curStart,
+      end: curEnd,
+      ...(curRrule !== undefined ? {rrule: curRrule} : {}),
+      exdates: curExdates,
+      ...(curRecurrenceId !== undefined ? {recurrenceId: curRecurrenceId} : {}),
+    });
     inEvent = false;
     curUid = undefined;
     curStart = undefined;
     curEnd = undefined;
     curRrule = undefined;
     curExdates = [];
+    curRecurrenceId = undefined;
   };
 
   for (const line of lines) {
@@ -4500,6 +4535,7 @@ function parseIcalFile(text: string, file: string): IcalEvent[] {
         curEnd = undefined;
         curRrule = undefined;
         curExdates = [];
+        curRecurrenceId = undefined;
       } else {
         bad(`事件内不允许嵌套组件 “${value.trim()}”（如 VALARM）`);
       }
@@ -4569,15 +4605,21 @@ function parseIcalFile(text: string, file: string): IcalEvent[] {
         break;
       }
       case 'EXDATE': {
-        // 沿用浮动时间与参数限制；多行、逗号列表在 closeEvent 中合并去重
+        // 沿用浮动时间与参数限制；多行、逗号列表在归并主事件时合并去重
         curExdates.push(...parseExdateValue(params, value, bad));
+        break;
+      }
+      case 'RECURRENCE-ID': {
+        // 单次改期例外：单个浮动时间，不允许 RANGE 参数；只能配按周主事件
+        if (curRecurrenceId !== undefined) bad('VEVENT 内 RECURRENCE-ID 属性重复');
+        curRecurrenceId = parseRecurrenceIdValue(params, value, bad);
         break;
       }
       case 'DESCRIPTION':
         break; // 描述属性忽略
       default:
         if (ICAL_RECURRENCE_PROPS.has(name)) {
-          bad(`不支持重复相关属性 ${name}（仅支持按周 RRULE 与 EXDATE 排除日期）`);
+          bad(`不支持重复相关属性 ${name}（仅支持按周 RRULE、EXDATE 排除日期与 RECURRENCE-ID 单次例外）`);
         }
         // 其余属性（SUMMARY、LOCATION、DTSTAMP、SEQUENCE 等）忽略
     }
@@ -4586,8 +4628,180 @@ function parseIcalFile(text: string, file: string): IcalEvent[] {
   if (inEvent) bad('VEVENT 缺少对应的 END:VEVENT');
   if (inCalendar) bad('VCALENDAR 缺少对应的 END:VCALENDAR');
   if (!versionSeen) bad('缺少 VERSION:2.0 属性');
-  if (events.length === 0) bad('VCALENDAR 中没有任何 VEVENT（至少需要一个独立事件）');
-  return events;
+  if (rawEvents.length === 0) bad('VCALENDAR 中没有任何 VEVENT（至少需要一个独立事件）');
+
+  // 按 UID 归并：每个 UID 至多一个不带 RECURRENCE-ID 的主事件，
+  // 其余同 UID VEVENT 必须是带 RECURRENCE-ID 的例外且主事件须为按周重复事件。
+  // 主事件/独立事件的文件顺序决定返回顺序；例外在文件中的位置不限。
+  interface RawGroup {
+    master?: RawVevent;
+    exceptions: RawVevent[];
+  }
+  const groups = new Map<string, RawGroup>();
+  for (const raw of rawEvents) {
+    let g = groups.get(raw.uid);
+    if (g === undefined) {
+      g = {exceptions: []};
+      groups.set(raw.uid, g);
+    }
+    if (raw.recurrenceId === undefined) {
+      if (g.master !== undefined) {
+        bad(`文件内 UID 重复: “${raw.uid}”（同一 UID 只允许一个不带 RECURRENCE-ID 的主事件，其余须为例外 VEVENT）`);
+      }
+      g.master = raw;
+    } else {
+      g.exceptions.push(raw);
+    }
+  }
+
+  const buildEvent = (uid: string, g: RawGroup): IcalEvent => {
+    const master = g.master;
+    if (master === undefined) {
+      const ids = g.exceptions
+        .map((x) => x.recurrenceId!.raw)
+        .join('、');
+      bad(
+        `UID “${uid}” 的例外 VEVENT（RECURRENCE-ID ${ids}）缺少随文件提交的主事件` +
+          '（须有一个不带 RECURRENCE-ID 的按周重复 VEVENT）',
+      );
+    }
+    const curStart = master.start;
+    const curEnd = master.end;
+    const ev: IcalEvent = {
+      uid,
+      startRaw: curStart.raw,
+      endRaw: curEnd.raw,
+      startMin: curStart.min,
+      endMin: curEnd.min,
+      recurring: false,
+      occurrences: [],
+    };
+
+    // 无规则却有 EXDATE：整批拒绝（排除日期只在按周重复事件中有意义）
+    if (master.rrule === undefined) {
+      if (master.exdates.length > 0) bad(`VEVENT（UID “${uid}”）含 EXDATE 却没有 RRULE（无规则不能带排除日期）`);
+      if (g.exceptions.length > 0) {
+        bad(
+          `UID “${uid}” 存在 ${g.exceptions.length} 个带 RECURRENCE-ID 的例外 VEVENT，` +
+            '但其主事件不是按周重复事件（RECURRENCE-ID 只能配 RRULE:FREQ=WEEKLY 主事件）',
+        );
+      }
+      ev.occurrences.push({
+        startRaw: curStart.raw,
+        endRaw: curEnd.raw,
+        startMin: curStart.min,
+        endMin: curEnd.min,
+        originalStartRaw: curStart.raw,
+        originalEndRaw: curEnd.raw,
+        hasException: false,
+      });
+      return ev;
+    }
+
+    const count = parseWeeklyRrule(master.rrule, bad);
+    ev.recurring = true;
+    ev.count = count;
+    // EXDATE 只能匹配原开始时间：全部候选必须落在按周展开的原开始时间集合上，
+    // 多行与逗号列表合并、按集合去重
+    const allStarts = new Map<number, string>();
+    for (let i = 0; i < count; i++) {
+      const sMin = curStart.min + i * 7 * 1440;
+      const eMin = curEnd.min + i * 7 * 1440;
+      const sRaw = formatDateTime(sMin);
+      const eRaw = formatDateTime(eMin);
+      if (sRaw === null || eRaw === null) {
+        bad(`VEVENT（UID “${uid}”）按周展开第 ${i + 1} 项超出四位年份范围（0001-9999），整批拒绝`);
+      }
+      allStarts.set(sMin, sRaw);
+    }
+    const exSet = new Set<number>();
+    for (const ex of master.exdates) {
+      if (!allStarts.has(ex.min)) {
+        bad(
+          `VEVENT（UID “${uid}”）的 EXDATE ${ex.raw} 不匹配任何原开始时间` +
+            '（排除日期只能等于某一发生的原开始时间，时刻须一致）',
+        );
+      }
+      exSet.add(ex.min);
+    }
+    ev.exdates = [...exSet].map((m) => allStarts.get(m)!).sort();
+
+    // 未排除的原发生（此时尚未套用例外）
+    const kept: IcalOccurrence[] = [];
+    for (let i = 0; i < count; i++) {
+      const sMin = curStart.min + i * 7 * 1440;
+      if (exSet.has(sMin)) continue; // 仅为未排除项生成成员
+      kept.push({
+        startRaw: formatDateTime(sMin)!,
+        endRaw: formatDateTime(curEnd.min + i * 7 * 1440)!,
+        startMin: sMin,
+        endMin: curEnd.min + i * 7 * 1440,
+        originalStartRaw: formatDateTime(sMin)!,
+        originalEndRaw: formatDateTime(curEnd.min + i * 7 * 1440)!,
+        hasException: false,
+      });
+    }
+    if (kept.length === 0) {
+      bad(`VEVENT（UID “${uid}”）的全部 ${count} 个发生都被 EXDATE 排除，整批拒绝（至少保留一项）`);
+    }
+
+    // 归并例外 VEVENT：不得带 RRULE/EXDATE；RECURRENCE-ID 须命中一个未排除原开始，
+    // 同一原发生至多一个例外；例外可改时间与时长（沿用浮动时间参数限制）。
+    const exceptions: IcalException[] = [];
+    const exceptionByOcc = new Map<number, IcalException>();
+    for (const x of g.exceptions) {
+      const rid = x.recurrenceId!;
+      if (x.rrule !== undefined) {
+        bad(`例外 VEVENT（UID “${uid}”，RECURRENCE-ID ${rid.raw}）不得带 RRULE（例外仍属该系列）`);
+      }
+      if (x.exdates.length > 0) {
+        bad(`例外 VEVENT（UID “${uid}”，RECURRENCE-ID ${rid.raw}）不得带 EXDATE`);
+      }
+      if (!allStarts.has(rid.min)) {
+        bad(
+          `例外 VEVENT（UID “${uid}”）的 RECURRENCE-ID ${rid.raw} 不匹配任何原开始时间` +
+            '（须等于主事件展开后某一发生的原开始时间，时刻须一致）',
+        );
+      }
+      if (exSet.has(rid.min)) {
+        bad(`例外 VEVENT（UID “${uid}”）的 RECURRENCE-ID ${rid.raw} 匹配的原发生已被 EXDATE 排除`);
+      }
+      if (exceptionByOcc.has(rid.min)) {
+        bad(`UID “${uid}” 同一原发生 ${rid.raw} 存在重复例外 VEVENT（一次原发生至多一个例外）`);
+      }
+      const ex: IcalException = {
+        recurrenceIdRaw: rid.raw,
+        recurrenceIdMin: rid.min,
+        startRaw: x.start.raw,
+        endRaw: x.end.raw,
+        startMin: x.start.min,
+        endMin: x.end.min,
+      };
+      exceptionByOcc.set(rid.min, ex);
+      exceptions.push(ex);
+    }
+    // 例外书写顺序不影响身份与结果：统一按原发生顺序排列
+    exceptions.sort((a, b) => a.recurrenceIdMin - b.recurrenceIdMin);
+    ev.exceptions = exceptions;
+
+    // 展开并排除后用例外目标替换对应原发生：不额外生成成员，被替换原时段不再参与校验
+    for (const occ of kept) {
+      const ex = exceptionByOcc.get(occ.startMin);
+      if (ex === undefined) continue;
+      occ.startRaw = ex.startRaw;
+      occ.endRaw = ex.endRaw;
+      occ.startMin = ex.startMin;
+      occ.endMin = ex.endMin;
+      occ.hasException = true;
+    }
+    ev.occurrences = kept;
+    return ev;
+  };
+
+  return [...groups.entries()]
+    .map(([uid, g]) => ({uid, g, masterOrder: g.master?.order ?? Number.MAX_SAFE_INTEGER}))
+    .sort((a, b) => a.masterOrder - b.masterOrder)
+    .map(({uid, g}) => buildEvent(uid, g));
 }
 
 async function cmdImportIcal(args: string[]): Promise<void> {
@@ -4614,27 +4828,47 @@ async function cmdImportIcal(args: string[]): Promise<void> {
   const events = parseIcalFile(text, icalFile);
 
   // 区分重放与新增：UID 命中既有导入身份即重放候选；
-  // 重复与否、首项时间、COUNT、排除集合与资源集合（顺序无关）须与首次导入快照
-  // 完全一致，否则整批拒绝；部件顺序、排除值顺序与资源顺序不算变化。
+  // 重复与否、首项时间、COUNT、排除集合、按原发生关联的例外集合与资源集合（顺序无关）
+  // 须与首次导入快照完全一致，否则整批拒绝；部件顺序、排除值/例外的书写顺序与
+  // 资源顺序不算变化。
   const importByUid = new Map(store.imports.map((r) => [r.uid, r]));
   interface ImportItem {
     ev: IcalEvent;
-    index: number; // 0 基，按文件顺序
+    index: number; // 0 基，按主事件/独立事件的文件顺序
     replay?: ImportRec;
   }
   const sameStringSet = (a: string[], b: string[]): boolean =>
     a.length === b.length && a.every((x, j) => x === b[j]); // 两侧均已排序
+  // 例外身份：按原发生（RECURRENCE-ID）关联改期后起止；书写顺序不影响身份
+  type ExceptionKey = {recurrenceId: string; start: string; end: string};
+  const exceptionMap = (list: ReadonlyArray<ExceptionKey>): Map<string, {start: string; end: string}> =>
+    new Map(list.map((x) => [x.recurrenceId, {start: x.start, end: x.end}]));
+  const sameExceptions = (a: ReadonlyArray<ExceptionKey>, b: ReadonlyArray<ExceptionKey>): boolean => {
+    if (a.length !== b.length) return false;
+    const mb = exceptionMap(b);
+    return a.every((x) => {
+      const y = mb.get(x.recurrenceId);
+      return y !== undefined && y.start === x.start && y.end === x.end;
+    });
+  };
+  // 解析结果的例外字段名为 *Raw，比对前归一化为快照同构的三元组
+  const parsedExceptions = (ev: IcalEvent): ExceptionKey[] =>
+    (ev.exceptions ?? []).map((x) => ({recurrenceId: x.recurrenceIdRaw, start: x.startRaw, end: x.endRaw}));
   const mismatches: string[] = [];
   const items: ImportItem[] = events.map((ev, index) => {
     const rec = importByUid.get(ev.uid);
     if (rec === undefined) return {ev, index};
     const firstDesc =
       `${rec.start} → ${rec.end}` +
-      (rec.count !== undefined ? `，COUNT=${rec.count}，排除 ${rec.exdates?.length ?? 0} 项` : '') +
+      (rec.count !== undefined
+        ? `，COUNT=${rec.count}，排除 ${rec.exdates?.length ?? 0} 项，例外 ${rec.exceptions?.length ?? 0} 个`
+        : '') +
       `（资源 ${rec.resourceIds.join('、')}）`;
     const thisDesc =
       `${ev.startRaw} → ${ev.endRaw}` +
-      (ev.count !== undefined ? `，COUNT=${ev.count}，排除 ${ev.exdates?.length ?? 0} 项` : '') +
+      (ev.count !== undefined
+        ? `，COUNT=${ev.count}，排除 ${ev.exdates?.length ?? 0} 项，例外 ${ev.exceptions?.length ?? 0} 个`
+        : '') +
       `（资源 ${ids.join('、')}）`;
     const reasons: string[] = [];
     if ((rec.seriesId !== undefined) !== ev.recurring) {
@@ -4647,6 +4881,9 @@ async function cmdImportIcal(args: string[]): Promise<void> {
     if (ev.recurring && !sameStringSet(rec.exdates ?? [], ev.exdates ?? [])) {
       reasons.push('排除集合不同');
     }
+    if (ev.recurring && !sameExceptions(rec.exceptions ?? [], parsedExceptions(ev))) {
+      reasons.push('例外集合不同（按原发生关联的例外增删或例外起止时间改变）');
+    }
     if (!sameStringSet(rec.resourceIds, ids)) reasons.push('资源集合不同');
     if (reasons.length > 0) {
       mismatches.push(
@@ -4658,8 +4895,8 @@ async function cmdImportIcal(args: string[]): Promise<void> {
   });
   if (mismatches.length > 0) {
     throw new BizError(
-      `iCalendar 导入被拒绝：${mismatches.length} 个 UID 的重复与否、首项时间、COUNT、排除集合` +
-        '或资源集合与首次导入不一致（相同 UID 不会覆盖本地安排，整批未导入）：\n' +
+      `iCalendar 导入被拒绝：${mismatches.length} 个 UID 的重复与否、首项时间、COUNT、排除集合、` +
+        '例外集合或资源集合与首次导入不一致（相同 UID 不会覆盖本地安排，整批未导入）：\n' +
         mismatches.map((m) => `- ${m}`).join('\n'),
     );
   }
@@ -4682,15 +4919,25 @@ async function cmdImportIcal(args: string[]): Promise<void> {
   const failures = validateBatchTargets(store, flat);
 
   if (failures.length > 0) {
-    // 按文件及原发生顺序报告全部受阻发生：UID、时间、开放不足资源（含相关停用）、
-    // 全部冲突与共同资源；批内双方互列 UID 及原发生时间
+    // 按文件及原发生顺序报告全部受阻发生：UID、原发生与目标时间、开放不足资源
+    // （含相关停用）、全部冲突与共同资源；批内双方互列 UID、原发生与目标时间。
+    // 无例外的发生原时段即目标，沿用“时间”写法；例外项额外列出原发生与被释放原时段。
+    const occLabel = (o: IcalOccurrence): string =>
+      o.hasException
+        ? `原发生 ${o.originalStartRaw}，目标时间 ${o.startRaw} → ${o.endRaw}`
+        : `${o.startRaw} → ${o.endRaw}`;
     const blocks = failures.map((f) => {
       const t = flat[f.index];
       const ev = t.item.ev;
       const lines = [
-        `第 ${t.item.index + 1} 项 UID “${ev.uid}” 第 ${t.occNo} 次发生` +
-          `（${t.occ.startRaw} → ${t.occ.endRaw}）：`,
+        `第 ${t.item.index + 1} 项 UID “${ev.uid}” 第 ${t.occNo} 次发生（${occLabel(t.occ)}）：`,
       ];
+      if (t.occ.hasException) {
+        lines.push(
+          `  单次改期例外（RECURRENCE-ID ${t.occ.originalStartRaw}）：被替换原时段 ` +
+            `${t.occ.originalStartRaw} → ${t.occ.originalEndRaw} 已释放，不参与覆盖或冲突校验`,
+        );
+      }
       if (f.gaps.length > 0) {
         lines.push('  开放不足资源:');
         lines.push(...gapLines(f.gaps, '    '));
@@ -4709,8 +4956,7 @@ async function cmdImportIcal(args: string[]): Promise<void> {
         for (const x of f.internal) {
           const o = flat[x.otherIndex];
           lines.push(
-            `    - 第 ${o.item.index + 1} 项 UID “${o.item.ev.uid}” 第 ${o.occNo} 次发生` +
-              `（${o.occ.startRaw} → ${o.occ.endRaw}）` +
+            `    - 第 ${o.item.index + 1} 项 UID “${o.item.ev.uid}” 第 ${o.occNo} 次发生（${occLabel(o.occ)}）` +
               `：共同资源 ${formatResourceIds(store, x.shared)}`,
           );
         }
@@ -4740,20 +4986,33 @@ async function cmdImportIcal(args: string[]): Promise<void> {
         ];
       }
       const {seriesId, members} = assignedSeries.get(it)!;
+      const exPart =
+        ev.exceptions!.length > 0 ? `，单次改期例外 ${ev.exceptions!.length} 个` : '';
       const lines = [
         `- 第 ${it.index + 1} 项 UID “${ev.uid}” → 新系列 ${seriesId}` +
-          `（新增按周重复系列：COUNT=${ev.count}，排除 ${ev.exdates!.length} 项，生成 ${members.length} 个成员）`,
+          `（新增按周重复系列：COUNT=${ev.count}，排除 ${ev.exdates!.length} 项${exPart}，生成 ${members.length} 个成员）`,
         `    资源: ${formatResourceIds(store, ids)}`,
       ];
       for (let k = 0; k < members.length; k++) {
         const {occ, bookingId} = members[k];
-        lines.push(`    第 ${k + 1} 次发生（原发生 ${occ.startRaw}） → ${bookingId}: ${occ.startRaw} → ${occ.endRaw}`);
+        if (occ.hasException) {
+          lines.push(
+            `    第 ${k + 1} 次发生（原发生 ${occ.originalStartRaw}） → ${bookingId} [已预约]`,
+          );
+          lines.push(
+            `      单次改期例外（RECURRENCE-ID ${occ.originalStartRaw}）: ` +
+              `${occ.startRaw} → ${occ.endRaw}`,
+          );
+        } else {
+          lines.push(`    第 ${k + 1} 次发生（原发生 ${occ.originalStartRaw}） → ${bookingId}: ${occ.startRaw} → ${occ.endRaw}`);
+        }
       }
       return lines;
     }
 
     // 重放：显示原系列、原发生时间、预约及其当前时间、资源、状态；
-    // 不做任何改动（成员被改期、单独/整体取消或随批量改期撤销也不复活、不重建）
+    // 不做任何改动（成员被改期、单独/整体取消或随批量改期撤销也不复活、不重建）。
+    // 首次请求的例外快照只说明该次发生曾随导入改期；现状一律以成员当前安排为准。
     const rec = it.replay;
     if (rec.bookingId !== undefined) {
       const b = store.bookings.find((x) => x.id === rec.bookingId)!;
@@ -4765,14 +5024,21 @@ async function cmdImportIcal(args: string[]): Promise<void> {
         `    当前资源: ${formatResourceIds(store, b.resourceIds)}`,
       ];
     }
+    const exceptionByOcc = exceptionMap(rec.exceptions ?? []);
+    const exPartReplay =
+      (rec.exceptions?.length ?? 0) > 0 ? `，例外 ${rec.exceptions!.length} 个` : '';
     const lines = [
       `- 第 ${it.index + 1} 项 UID “${ev.uid}” → 系列 ${rec.seriesId}` +
-        `（重放，未做改动；COUNT=${rec.count}，排除 ${rec.exdates!.length} 项，成员 ${rec.occurrences!.length} 个）`,
+        `（重放，未做改动；COUNT=${rec.count}，排除 ${rec.exdates!.length} 项${exPartReplay}，成员 ${rec.occurrences!.length} 个）`,
     ];
     rec.occurrences!.forEach((o, k) => {
       const b = store.bookings.find((x) => x.id === o.bookingId)!;
       const statusLabel = b.status === 'active' ? '已预约' : '已取消';
+      const ex = exceptionByOcc.get(o.start);
       lines.push(`    第 ${k + 1} 次发生（原发生 ${o.start}） → ${o.bookingId} [${statusLabel}]`);
+      if (ex !== undefined) {
+        lines.push(`      首次请求例外目标: ${ex.start} → ${ex.end}（现状以成员当前安排为准，不复活、不补员）`);
+      }
       lines.push(`      当前安排: ${b.start} → ${b.end}`);
       lines.push(`      当前资源: ${formatResourceIds(store, b.resourceIds)}`);
     });
@@ -4838,7 +5104,12 @@ async function cmdImportIcal(args: string[]): Promise<void> {
       resourceIds: [...ids],
       count: ev.count,
       exdates: [...ev.exdates!],
-      occurrences: members.map(({occ, bookingId}) => ({start: occ.startRaw, bookingId})),
+      occurrences: members.map(({occ, bookingId}) => ({start: occ.originalStartRaw, bookingId})),
+      exceptions: ev.exceptions!.map((x) => ({
+        recurrenceId: x.recurrenceIdRaw,
+        start: x.startRaw,
+        end: x.endRaw,
+      })),
     });
     assignedSeries.set(it, {seriesId, members});
   }
@@ -5049,28 +5320,39 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       一个非空 UID、DTSTART 和 DTEND；时间仅支持浮动 YYYYMMDDTHHmmss，秒为
       00，年份 0001-9999，真实有效、结束晚于开始、允许跨日、不随机器时区
       变化；支持 CRLF 或 LF、标准折行与 UID 文本转义，属性名忽略大小写，
-      解码后 UID 区分大小写；描述属性忽略，全天、时区、RDATE/EXRULE/
-      RECURRENCE-ID、取消事件及事件内嵌套组件拒绝；结构错误、关键属性重复
-      或文件内 UID 重复均整批失败），全部新事件统一使用所给资源集合
-      （至少一个不同的已登记资源）。无 RRULE 的事件创建一项普通预约；
+      解码后 UID 区分大小写；描述属性忽略，全天、时区、RDATE/EXRULE、
+      取消事件及事件内嵌套组件拒绝；结构错误、关键属性重复或文件内 UID
+      重复均整批失败（同一 UID 的主事件+例外组合除外，见下）。
+      全部新事件统一使用所给资源集合（至少一个不同的已登记资源）。
+      无 RRULE 的事件创建一项普通预约；
       带 RRULE:FREQ=WEEKLY;COUNT=n（n 为 1..100000 的整数，含首项；部件
       大小写与顺序无关，其他 FREQ 与任何其他部件拒绝）的事件创建一个按周
       重复系列：首项由 DTSTART/DTEND 确定，每项起止同时后移 7 个营业地
       日历日（时刻与跨日长度不变），仅为未排除项生成成员，超出 0001-9999
       年整批拒绝。EXDATE 沿用浮动时间及参数限制，可多行、逗号列表、集合
       去重，只能匹配某一发生的原开始时间（时刻须一致）；无 RRULE 却有
-      EXDATE 或全部发生被排除均整批拒绝。UID 在同一数据文件中永久关联
-      首次请求（独立事件关联其预约；重复事件关联其系列、各原发生时间与
-      对应成员），身份不依赖文件路径；相同 UID 的重复与否、首项时间、
-      COUNT、排除集合或资源集合改变均整批拒绝（部件与排除值的顺序、资源
-      顺序不算变化），一致则为重放：显示原系列、原发生时间、预约及当前
-      时间、资源、状态，不做任何改动（成员被改期、单独/整体取消或随批量
-      改期撤销也不复活、不重建）。文件可混合独立与重复事件、新项与重放，
-      仅新预约校验开放覆盖与批内外冲突（重放成员按当前状态与安排占用），
-      受阻按文件及原发生顺序报告全部 UID、时间、不足资源、相关停用、
-      全部冲突与共同资源，批内双方互列 UID 及原发生时间；全部为重放时
-      不写文件、不推进计数；新系列、成员与导入身份一次原子保存后才成功，
-      按上述顺序显示新增或重放、完整关联与安排。
+      EXDATE 或全部发生被排除均整批拒绝。
+      单次改期例外：同一 UID 允许一个不带 RECURRENCE-ID 的按周主事件配
+      若干例外 VEVENT（主事件须随文件提交，例外在文件中的位置不限），
+      其余重复 UID 拒绝。例外须有恰好一个 RECURRENCE-ID（浮动时间、秒
+      00、年份 0001-9999，禁止 RANGE 参数与逗号列表）及自身 DTSTART/
+      DTEND（同一套浮动时间参数限制，可改时间与时长），不得带 RRULE 或
+      EXDATE；RECURRENCE-ID 匹配主事件展开后未排除的某个原开始（时刻须
+      一致），同一原发生不得重复。例外仍属该系列、使用命令行资源，不额外
+      生成成员——展开并排除后以例外目标替换该次发生，被替换原时段不参与
+      覆盖或冲突校验；新目标统一校验实际可用覆盖与共同资源左闭右开冲突。
+      UID 在同一数据文件中永久关联首次请求（独立事件关联其预约；重复事件
+      关联其系列、各原发生时间、对应成员及按原发生关联的例外起止集合），
+      身份不依赖文件路径；相同 UID 的重复与否、首项时间、COUNT、排除集合、
+      例外集合或资源集合改变均整批拒绝（部件与排除值的顺序、例外书写顺序、
+      资源顺序不算变化），一致则为重放：按原发生顺序显示系列、原发生、
+      成员标识、当前时间、资源与状态（含首次请求例外目标），不做任何改动
+      （成员本地改期、单独/整体取消或随批量改期撤销也不覆盖、不复活、不补员）。
+      文件可混合独立与重复事件、多个系列、新项与重放，仅新目标校验开放覆盖
+      与批内外冲突（重放成员按当前有效安排占用），受阻按主事件/独立事件的
+      文件顺序及原发生顺序报告全部 UID、原发生、目标时间、不足资源、相关停用、
+      全部冲突与共同资源，批内双方互列；全部为重放时不写文件、不推进计数；
+      新系列、成员与导入身份（含例外快照）一次原子保存后才成功。
       文件示例:
         BEGIN:VCALENDAR
         VERSION:2.0
@@ -5085,6 +5367,12 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
         DTEND:20261006T110000
         RRULE:FREQ=WEEKLY;COUNT=4
         EXDATE:20261013T100000
+        END:VEVENT
+        BEGIN:VEVENT
+        UID:weekly-review@example.com
+        RECURRENCE-ID:20261020T100000
+        DTSTART:20261021T140000
+        DTEND:20261021T150000
         END:VEVENT
         END:VCALENDAR
 
