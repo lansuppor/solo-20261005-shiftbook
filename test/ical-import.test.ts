@@ -329,7 +329,7 @@ test('结构错误、关键属性重复、非法时间等一律整批失败', (t
     ['不存在的日期', ical(event('a', '20260230T100000', '20260230T110000')), /真实有效/],
     ['结束早于开始', ical(event('a', '20261012T110000', '20261012T100000')), /晚于开始/],
     ['RRULE FREQ=DAILY', ical(event('a', '20261012T100000', '20261012T110000', 'RRULE:FREQ=DAILY;COUNT=2\n')), /仅支持按周重复/],
-    ['RECURRENCE-ID', ical(event('a', '20261012T100000', '20261012T110000', 'RECURRENCE-ID:20261012T100000\n')), /重复相关属性/],
+    ['孤立 RECURRENCE-ID（无主事件）', ical(event('a', '20261012T100000', '20261012T110000', 'RECURRENCE-ID:20261012T100000\n')), /却没有主事件/],
     ['STATUS:CANCELLED', ical(event('a', '20261012T100000', '20261012T110000', 'STATUS:CANCELLED\n')), /取消事件/],
     ['METHOD:CANCEL', 'BEGIN:VCALENDAR\nVERSION:2.0\nMETHOD:CANCEL\n' + event('a', '20261012T100000', '20261012T110000') + 'END:VCALENDAR\n', /取消事件/],
     ['嵌套 VALARM', ical(event('a', '20261012T100000', '20261012T110000', 'BEGIN:VALARM\nEND:VALARM\n')), /嵌套组件/],
