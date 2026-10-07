@@ -3218,25 +3218,42 @@ async function cmdFindSlot(args: string[]): Promise<void> {
 // ---------------------------------------------------------------------------
 // 多项弹性预约的联合排程与原子创建（schedule-flex）
 //
-// 读取本地 JSON 清单（{"items": [...]}，非空、有顺序），每项给出营业地时间窗口、
-// 所需连续分钟数与有顺序的需求组（每组列出一个可任选其一的候选资源数组）。
+// 读取本地 JSON 清单（{"items": [...], "relations": [...]}，非空、有顺序），
+// 每项给出营业地时间窗口、所需连续分钟数与有顺序的需求组（每组列出一个可
+// 任选其一的候选资源数组）；顶层可附 "relations"（省略或为空保持原行为）：
+// 每条关系以从 1 开始的清单序号指定前项与后项及非负整数分钟最小、最大间隔
+// （minGap <= maxGap，零允许紧接），要求“后项开始 - 前项结束 ∈ [min,max]”
+// 含两端；关系可逆清单顺序、也适用于不同资源的项；非整数或越界序号、自指、
+// 重复有向关系、有向环均由 parseFlexRelations 整单拒绝。
 // 为整份清单寻找同时可行的安排：每项完整落在自身窗口内，每组恰选一个候选，
-// 一项所选资源互不相同并全程固定（不换资源、不拼接间断）；新项之间仅共同资源
-// 的左闭右开时间重叠才冲突，端点相接可行。多个完整方案按清单顺序逐项比较：
-// 先比该项开始分钟，再按需求组顺序以字符串字典序比资源标识，第一处差异取
-// 较小者，随后才比较下一项（清单顺序只用于取舍，不限定活动发生先后）。
+// 一项所选资源互不相同并全程固定（不换资源、不拼接间断）；全部关系同时
+// 生效；新项之间仅共同资源的左闭右开时间重叠才冲突，端点相接可行。多个
+// 完整方案按清单顺序逐项比较：先比该项开始分钟，再按需求组顺序以字符串
+// 字典序比资源标识，第一处差异取较小者，随后才比较下一项（清单顺序只用于
+// 取舍，不限定活动发生先后；关系不改变取舍次序）。
 // 有解时按清单顺序各创建一项普通预约（稳定、不复用标识，不加入系列、不改动
-// 既有预约与候补、不自动处理候补），原子保存全部预约后才报告成功；无整体解
-// 明确提示并退出 1，不保存部分方案。每次提交都是新的创建请求，不按清单路径
-// 或内容去重。
+// 既有预约与候补、不自动处理候补、不保留关系），原子保存全部预约后才报告
+// 成功；无整体解明确提示并退出 1，不保存部分方案。每次提交都是新的创建
+// 请求，不按清单路径或内容去重。
 //
 // 求解不逐项贪选最早：项 i 的开始分钟若被项 j 的占用“顶住”，则 s_i = s_j + d_j，
-// 故候选开始分钟取“基础空闲段起点”与“其他项占用结束（s_j + d_j）”的闭包
-// （仅候选资源集合有交集的项之间传播；按开始分钟归纳，最小方案的每个开始都
-// 落在该闭包内）。随后按清单顺序深度优先逐项试探：开始分钟升序、同一开始的
-// 资源序列按字典序升序枚举，首个完整方案即按上述比较的最小方案——不会因为
-// 逐项固定最早选择而漏掉须调整前项时间或资源的解，也不跳过受阻项。
+// 故候选开始分钟取三类边界的闭包：(1) 基础空闲段起点；(2) 其他项占用结束
+// s_j + d_j（仅候选资源集合有交集的项之间传播）；(3) 关系间隔边界——关系
+// p->q 间隔 [lo,hi] 下，已知 s_p 传播 s_q 的 s_p+d_p+lo 与 s_p+d_p+hi，已知
+// s_q 传播 s_p 的 s_q-d_p-hi 与 s_q-d_p-lo（按开始分钟归纳，最小方案的每个
+// 开始都落在该闭包内）。随后按清单顺序深度优先逐项试探：开始分钟升序、
+// 同一开始的资源序列按字典序升序枚举，放置每项时检查全部两端都已放置的
+// 关系（每条边恰在第二个端点放置时检查一次，逆清单方向由前项放置处补查），
+// 首个完整方案即按上述比较的最小方案——不会因为逐项固定最早选择而漏掉须
+// 调整前项时间或资源（含被最大间隔顶推延后）的解，也不跳过受阻项。
 // ---------------------------------------------------------------------------
+
+interface FlexRelation {
+  predecessor: number; // 前项（1 基清单序号）
+  successor: number; // 后项（1 基清单序号）
+  minGap: number; // 最小衔接间隔（非负整数分钟，含两端）
+  maxGap: number; // 最大衔接间隔（非负整数分钟，minGap <= maxGap）
+}
 
 interface FlexPlanItem {
   index: number; // 1 基清单序号
@@ -3246,6 +3263,7 @@ interface FlexPlanItem {
   endMin: number;
   duration: number; // 所需连续分钟数（正整数，不超过窗口长度）
   groups: RequirementGroup[]; // 有顺序的需求组，每组恰选一个候选
+  incoming: FlexRelation[]; // 以本项为后项的关系（前项可能在清单更后面）
 }
 
 interface FlexPlacement {
@@ -3270,19 +3288,69 @@ async function loadFlexManifest(file: string): Promise<unknown> {
 }
 
 // 清单结构（与业务数据无关的纯类型校验）；返回逐项原始记录
-function parseFlexPlanShape(raw: unknown, file: string): Array<Record<string, unknown>> {
+function parseFlexPlanShape(raw: unknown, file: string): {
+  items: Array<Record<string, unknown>>;
+  relations: Array<Record<string, unknown>>;
+} {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     throw new BizError(`预约清单 ${file} 内容非法：顶层必须是对象，形如 {"items": [...]}`);
   }
   const o = raw as Record<string, unknown>;
   for (const k of Object.keys(o)) {
-    if (k !== 'items') throw new BizError(`预约清单 ${file} 内容非法：存在未知字段 “${k}”，只允许 items`);
+    if (k !== 'items' && k !== 'relations') {
+      throw new BizError(`预约清单 ${file} 内容非法：存在未知字段 “${k}”，只允许 items、relations`);
+    }
   }
   if (!Array.isArray(o.items)) {
     throw new BizError(`预约清单 ${file} 内容非法：items 必须是非空数组`);
   }
   const items = o.items as unknown[];
   if (items.length === 0) throw new BizError(`预约清单 ${file} 为空：items 至少包含一项预约请求`);
+
+  // 附加项间关系（可省略或为空数组：省略或为空保持无关系的原行为）。
+  // 结构在此做与业务数据无关的纯类型校验；序号范围、自指、重复与有向环
+  // 需在知道项数后由 parseFlexRelations 再校验。
+  const relationRecords: Array<Record<string, unknown>> = [];
+  if (o.relations !== undefined) {
+    if (!Array.isArray(o.relations)) {
+      throw new BizError(`预约清单 ${file} 内容非法：relations 必须是数组（可省略或为空）`);
+    }
+    const relProblems: string[] = [];
+    (o.relations as unknown[]).forEach((rel, ri) => {
+      const at = `第 ${ri + 1} 条关系`;
+      if (typeof rel !== 'object' || rel === null || Array.isArray(rel)) {
+        relProblems.push(`${at} 必须是对象`);
+        return;
+      }
+      const rr = rel as Record<string, unknown>;
+      let wellFormed = true;
+      for (const k of Object.keys(rr)) {
+        if (k !== 'predecessor' && k !== 'successor' && k !== 'minGap' && k !== 'maxGap') {
+          relProblems.push(`${at} 存在未知字段 “${k}”（只允许 predecessor、successor、minGap、maxGap）`);
+          wellFormed = false;
+        }
+      }
+      for (const k of ['predecessor', 'successor', 'minGap', 'maxGap'] as const) {
+        if (typeof rr[k] !== 'number' || !Number.isInteger(rr[k])) {
+          relProblems.push(`${at} 的 ${k} 必须是整数（前项/后项为从 1 开始的清单序号，间隔为非负整数分钟）`);
+          wellFormed = false;
+        }
+      }
+      if (wellFormed) {
+        if ((rr.minGap as number) < 0 || (rr.maxGap as number) < 0) {
+          relProblems.push(`${at} 的最小、最大间隔必须是非负整数分钟`);
+        } else if ((rr.minGap as number) > (rr.maxGap as number)) {
+          relProblems.push(
+            `${at} 最小间隔 ${rr.minGap} 分钟不得大于最大间隔 ${rr.maxGap} 分钟`,
+          );
+        }
+      }
+      relationRecords.push(rr);
+    });
+    if (relProblems.length > 0) {
+      throw new BizError(`预约清单 ${file} 内容非法，整单拒绝：\n${relProblems.map((p) => `- ${p}`).join('\n')}`);
+    }
+  }
 
   const problems: string[] = [];
   const records: Array<Record<string, unknown> | null> = [];
@@ -3325,7 +3393,80 @@ function parseFlexPlanShape(raw: unknown, file: string): Array<Record<string, un
   if (problems.length > 0) {
     throw new BizError(`预约清单 ${file} 内容非法，整单拒绝：\n${problems.map((p) => `- ${p}`).join('\n')}`);
   }
-  return records as Array<Record<string, unknown>>;
+  return {items: records as Array<Record<string, unknown>>, relations: relationRecords};
+}
+
+// 解析附加项间关系：序号以从 1 开始的清单序号指定前项与后项；非整数或越界
+// 序号、自指、重复有向关系（同一前项→后项，书写顺序无关）、有向环均整单拒绝。
+// 间隔结构（整数、非负、min<=max）已在 parseFlexPlanShape 校验。
+function parseFlexRelations(
+  rawRelations: Array<Record<string, unknown>>,
+  itemCount: number,
+  file: string,
+): FlexRelation[] {
+  const problems: string[] = [];
+  const seen = new Set<string>(); // “前项->后项”，重复有向关系（与书写顺序无关）整单拒绝
+  const relations: FlexRelation[] = [];
+  rawRelations.forEach((rr, ri) => {
+    const at = `第 ${ri + 1} 条关系`;
+    const predecessor = rr.predecessor as number;
+    const successor = rr.successor as number;
+    const minGap = rr.minGap as number;
+    const maxGap = rr.maxGap as number;
+    let validRefs = true;
+    if (predecessor < 1 || predecessor > itemCount) {
+      problems.push(`${at} 前项序号 ${predecessor} 越界：清单共 ${itemCount} 项，序号须从 1 开始`);
+      validRefs = false;
+    }
+    if (successor < 1 || successor > itemCount) {
+      problems.push(`${at} 后项序号 ${successor} 越界：清单共 ${itemCount} 项，序号须从 1 开始`);
+      validRefs = false;
+    }
+    if (validRefs && predecessor === successor) {
+      problems.push(`${at} 自指：前项与后项不能同为第 ${predecessor} 项`);
+      validRefs = false;
+    }
+    if (validRefs) {
+      // 同一有向关系（前项→后项）重复书写即重复，与其在清单中的书写顺序无关；
+      // 两个相反方向的关系不算重复，而构成有向环（由下方环检测拒绝）
+      const key = `${predecessor}->${successor}`;
+      if (seen.has(key)) {
+        problems.push(`${at} 重复有向关系：第 ${predecessor} 项 → 第 ${successor} 项的关系已指定`);
+      } else {
+        seen.add(key);
+        relations.push({predecessor, successor, minGap, maxGap});
+      }
+    }
+  });
+  if (problems.length > 0) {
+    throw new BizError(`预约清单 ${file} 内容非法，整单拒绝：\n${problems.map((p) => `- ${p}`).join('\n')}`);
+  }
+
+  // 有向环检测（Kahn 拓扑排序）：关系可逆清单顺序，环使“后项开始-前项结束”
+  // 的先后约束不可同时满足，整单拒绝
+  const indegree = new Array<number>(itemCount).fill(0);
+  const adjacency = Array.from({length: itemCount}, () => [] as number[]);
+  for (const rel of relations) {
+    adjacency[rel.predecessor - 1].push(rel.successor - 1);
+    indegree[rel.successor - 1] += 1;
+  }
+  const queue = indegree.map((d, i) => (d === 0 ? i : -1)).filter((i) => i >= 0);
+  let visited = 0;
+  const working = [...indegree];
+  while (queue.length > 0) {
+    const node = queue.shift()!;
+    visited += 1;
+    for (const next of adjacency[node]) {
+      working[next] -= 1;
+      if (working[next] === 0) queue.push(next);
+    }
+  }
+  if (visited !== itemCount) {
+    throw new BizError(
+      `预约清单 ${file} 内容非法，整单拒绝：项间关系存在有向环（须为有向无环图；关系可逆清单顺序，但不能循环）`,
+    );
+  }
+  return relations;
 }
 
 // 逐项做与业务数据相关的校验（窗口真实有效、时长不超过窗口、组内重复与未知资源），
@@ -3387,6 +3528,7 @@ function parseFlexPlanItems(store: Store, records: Array<Record<string, unknown>
       endMin: win.endMin,
       duration,
       groups,
+      incoming: [],
     };
   });
   if (problems.length > 0) {
@@ -3424,6 +3566,7 @@ function* assignmentsInLexOrder(
 // 逐项（清单顺序）深度优先：开始分钟升序、同一开始的资源序列字典序升序，
 // 首个完整方案即“逐项先比开始分钟、再比资源序列”的最小方案。
 function solveFlexPlan(store: Store, items: FlexPlanItem[]): FlexPlacement[] | null {
+  const n = items.length;
   // 每项各候选资源的基础空闲段：实际可用时间（开放合并后扣除有效停用并集）
   // 裁进自身窗口，再扣除当前有效预约占用（已取消预约/停用与未兑现候补不阻挡）
   const baseFree: Array<Map<string, Array<[number, number]>>> = items.map((it) => {
@@ -3436,8 +3579,17 @@ function solveFlexPlan(store: Store, items: FlexPlanItem[]): FlexPlacement[] | n
     return m;
   });
 
-  // 候选开始分钟闭包：基础空闲段起点，加上“被其他项占用结束顶住”的起点
-  // s_i = s_j + d_j（仅候选资源集合有交集的项之间传播；值域有限，必收敛）
+  // 候选开始分钟闭包：
+  // 1) 基础空闲段起点；
+  // 2) “被其他项占用结束顶住”的起点 s_i = s_j + d_j（仅候选资源集合有交集的项
+  //    之间传播，对应共同资源左闭右开冲突的边界）；
+  // 3) 项间关系边界：关系 p -> q（间隔 [lo,hi]）要求 s_p + d_p + lo <= s_q
+  //    <= s_p + d_p + hi。已知 s_p 时 s_q 的边界为 s_p+d_p+lo、s_p+d_p+hi；
+  //    已知 s_q 时 s_p 的边界为 s_q-d_p-hi、s_q-d_p-lo（关系可逆清单顺序、
+  //    也适用于不同资源的项）。
+  // 最小方案中每项的开始必落在自身窗口内某约束边界的闭包上（按开始分钟归纳：
+  // 若两侧均不贴边界即可整体平移至更小开始，与最小性矛盾），闭包在有限整数
+  // 值域（各项窗内）上迭代必收敛。
   const candidateIds = items.map((it) => {
     const set = new Set<string>();
     for (const g of it.groups) for (const id of g.candidates) set.add(id);
@@ -3447,11 +3599,30 @@ function solveFlexPlan(store: Store, items: FlexPlanItem[]): FlexPlacement[] | n
     for (const id of candidateIds[a]) if (candidateIds[b].has(id)) return true;
     return false;
   };
+  // 关系邻接：incoming[i] 已按后项归并；outgoing 供“先放置后项、后放置前项”
+  // （逆清单顺序关系）时在放置前项处统一检查
+  const outgoing: Array<FlexRelation[][]> = items.map(() => []);
+  items.forEach((it, i) => {
+    for (const rel of it.incoming) outgoing[rel.predecessor - 1].push(rel);
+  });
+  const relBetween = new Map<string, FlexRelation[]>(); // “a,b”（a<b 的下标）上的关系（含各自方向）
+  items.forEach((it) => {
+    for (const rel of it.incoming) {
+      const a = Math.min(rel.predecessor, rel.successor) - 1;
+      const b = Math.max(rel.predecessor, rel.successor) - 1;
+      const key = `${a},${b}`;
+      const list = relBetween.get(key) ?? [];
+      list.push(rel);
+      relBetween.set(key, list);
+    }
+  });
+  const fitsWindow = (i: number, t: number): boolean =>
+    t >= items[i].startMin && t + items[i].duration <= items[i].endMin;
   const candStarts: Array<Set<number>> = items.map((it, i) => {
     const set = new Set<number>();
     for (const segs of baseFree[i].values()) {
       for (const [s] of segs) {
-        if (s + it.duration <= it.endMin) set.add(s);
+        if (fitsWindow(i, s)) set.add(s);
       }
     }
     return set;
@@ -3459,29 +3630,60 @@ function solveFlexPlan(store: Store, items: FlexPlanItem[]): FlexPlacement[] | n
   let changed = true;
   while (changed) {
     changed = false;
-    for (let j = 0; j < items.length; j++) {
-      for (let i = 0; i < items.length; i++) {
-        if (i === j || !sharesCandidate(i, j)) continue;
-        for (const s of candStarts[j]) {
-          const t = s + items[j].duration;
-          if (
-            t >= items[i].startMin &&
-            t + items[i].duration <= items[i].endMin &&
-            !candStarts[i].has(t)
-          ) {
-            candStarts[i].add(t);
-            changed = true;
+    const add = (i: number, t: number): void => {
+      if (fitsWindow(i, t) && !candStarts[i].has(t)) {
+        candStarts[i].add(t);
+        changed = true;
+      }
+    };
+    for (let j = 0; j < n; j++) {
+      for (const s of candStarts[j]) {
+        for (let i = 0; i < n; i++) {
+          if (i === j) continue;
+          // 2) 共同资源冲突边界：i 紧接 j 之后开始
+          if (sharesCandidate(i, j)) add(i, s + items[j].duration);
+          // 3) 项间关系边界
+          const a = Math.min(i, j);
+          const b = Math.max(i, j);
+          for (const rel of relBetween.get(`${a},${b}`) ?? []) {
+            if (rel.predecessor - 1 === j && rel.successor - 1 === i) {
+              // j 是前项、i 是后项：s_i = s_j + d_j + [min,max]
+              add(i, s + items[j].duration + rel.minGap);
+              add(i, s + items[j].duration + rel.maxGap);
+            } else if (rel.predecessor - 1 === i && rel.successor - 1 === j) {
+              // i 是前项、j 是后项：s_i = s_j - d_i - [min,max]
+              add(i, s - items[i].duration - rel.maxGap);
+              add(i, s - items[i].duration - rel.minGap);
+            }
           }
         }
       }
     }
   }
 
-  // 已放置项对各资源的占用（随试探入栈/出栈增减）
+  // 已放置项的开始/结束（未放置为 null）与对各资源的占用（随试探入栈/出栈增减）
+  const placedStart = new Array<number | null>(n).fill(null);
+  const placedEnd = new Array<number | null>(n).fill(null);
   const occById = new Map<string, Array<[number, number]>>();
 
+  // 放置 idx（[s,e]）时，对全部两端都已放置的关系做边界检查（含两端）；
+  // 每条边恰在其第二个端点放置时被检查一次
+  const relationsSatisfied = (idx: number, s: number, e: number): boolean => {
+    for (const rel of items[idx].incoming) {
+      // idx 是后项；前项可能尚未放置（逆清单顺序），稍后在前项放置处检查
+      const predEnd = placedEnd[rel.predecessor - 1];
+      if (predEnd !== null && (s - predEnd < rel.minGap || s - predEnd > rel.maxGap)) return false;
+    }
+    for (const rel of outgoing[idx]) {
+      // idx 是前项；后项可能先放置（逆清单顺序）
+      const succStart = placedStart[rel.successor - 1];
+      if (succStart !== null && (succStart - e < rel.minGap || succStart - e > rel.maxGap)) return false;
+    }
+    return true;
+  };
+
   const search = (idx: number): FlexPlacement[] | null => {
-    if (idx === items.length) return [];
+    if (idx === n) return [];
     const it = items[idx];
     // 当前空闲段 = 基础空闲段扣除已放置项占用
     const freeById = new Map<string, Array<[number, number]>>();
@@ -3491,6 +3693,8 @@ function solveFlexPlan(store: Store, items: FlexPlanItem[]): FlexPlacement[] | n
     }
     for (const s of [...candStarts[idx]].sort((a, b) => a - b)) {
       const e = s + it.duration;
+      // 先按项间关系剪枝（不依赖资源选择）
+      if (!relationsSatisfied(idx, s, e)) continue;
       const cache = new Map<string, boolean>();
       const usable = (id: string): boolean => {
         let v = cache.get(id);
@@ -3506,11 +3710,17 @@ function solveFlexPlan(store: Store, items: FlexPlanItem[]): FlexPlacement[] | n
           occ.push([s, e]);
           occById.set(id, occ);
         }
+        placedStart[idx] = s;
+        placedEnd[idx] = e;
         const rest = search(idx + 1);
         if (rest !== null) return [{startMin: s, endMin: e, picks}, ...rest];
         for (const id of picks) occById.get(id)!.pop();
       }
     }
+    // 本分路失败：清除本项放置痕迹，避免上一层改试其他选项时把陈旧端点
+    // 误当作已放置（逆清单顺序关系会读取后项端点）
+    placedStart[idx] = null;
+    placedEnd[idx] = null;
     return null;
   };
 
@@ -3532,15 +3742,19 @@ async function cmdScheduleFlex(args: string[]): Promise<void> {
   // 修改入口：先取得写入保护再读最新数据，排程至保存全程受保护
   const file = activeDataFile;
   const store = await loadStoreForWrite(file);
-  const records = parseFlexPlanShape(await loadFlexManifest(manifestFile), manifestFile);
-  const items = parseFlexPlanItems(store, records, manifestFile);
+  const parsed = parseFlexPlanShape(await loadFlexManifest(manifestFile), manifestFile);
+  const items = parseFlexPlanItems(store, parsed.items, manifestFile);
+  // 附加项间关系：序号越界、自指、重复有向关系、有向环均在此整单拒绝；
+  // 关系可逆清单顺序、也适用于不同资源的项，按后项归并供求解统一检查
+  const relations = parseFlexRelations(parsed.relations, items.length, manifestFile);
+  for (const rel of relations) items[rel.successor - 1].incoming.push(rel);
 
   const plan = solveFlexPlan(store, items);
   if (plan === null) {
     throw new BizError(
       `无整体解：清单 ${manifestFile} 的 ${items.length} 项预约不存在同时可行的安排` +
         '（每项须完整落在自身窗口内，各组所选资源互不相同并全程固定，' +
-        '新项之间共同资源时间不得重叠）。未创建任何预约，数据文件未改动。',
+        '新项之间共同资源时间不得重叠，全部项间先后与衔接间隔关系须同时满足）。未创建任何预约，数据文件未改动。',
     );
   }
 
@@ -5264,17 +5478,27 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       时间或资源的解，也不跳过受阻项。多个完整方案按清单顺序逐项比较：
       先比该项开始分钟，再按需求组顺序以字符串字典序比资源标识，第一处
       差异取较小者（候选书写顺序不影响结果；清单顺序只用于取舍，不限定
-      活动发生先后）。有解时按清单顺序各创建一项普通预约（稳定、不复用
-      标识，不加入系列、不改动既有预约或候补、不自动处理候补），原子保存
-      全部预约后才退出 0，并显示各项标识、起止时间与按组对应的资源；
-      每次提交都是新的创建请求，不按清单路径或内容去重。无整体解明确
-      提示并退出 1，不保存部分方案；清单不可读、损坏或内容非法同样整单
-      失败，不产生记录、占用或计数变化。
+      活动发生先后）。可附加项间关系（顶层 "relations" 数组，省略或为空
+      保持原行为）：每条以从 1 开始的清单序号给出前项 predecessor 与后项
+      successor，及非负整数分钟最小、最大衔接间隔 minGap/maxGap（minGap
+      ≤ maxGap，零允许紧接）；全部关系同时生效，要求后项开始减前项结束
+      落在 [minGap, maxGap]（含两端），适用于不同资源的项，关系方向可逆
+      清单顺序（后项可写在前面）。非整数或越界序号、自指、重复有向关系、
+      有向环均整单拒绝。关系只约束创建时求解；创建后各项仍可独立改期或
+      取消。有解时按清单顺序各创建一项普通预约（稳定、不复用标识，不加入
+      系列、不改动既有预约或候补、不自动处理候补），原子保存全部预约后才
+      退出 0，并显示各项标识、起止时间与按组对应的资源；每次提交都是新的
+      创建请求，不按清单路径或内容去重。无整体解明确提示并退出 1，不保存
+      部分方案；清单不可读、损坏或内容非法同样整单失败，不产生记录、占用
+      或计数变化。
       清单示例:
         {
           "items": [
             {"window": "2026-10-12T08:00/2026-10-12T18:00", "duration": 60, "groups": [["R0001","R0002"], ["R0003"]]},
             {"window": "2026-10-12T09:00/2026-10-12T12:00", "duration": 90, "groups": [["R0001"]]}
+          ],
+          "relations": [
+            {"predecessor": 1, "successor": 2, "minGap": 0, "maxGap": 120}
           ]
         }
 
@@ -5477,7 +5701,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
      组内重复候选、已取消预约、时间非法、
      开放不足、冲突、非法次数、超出四位年份、未知系列、未知候补、取消已兑现
      候补、候补标识非法、停用区间与有效预约重叠、未知停用、停用标识非法、
-     改期清单不可读/损坏/内容非法、预约清单不可读/损坏/内容非法或整单无
+     改期清单不可读/损坏/内容非法、预约清单不可读/损坏/内容非法（含项间
+     关系序号越界或非整数、自指、重复有向关系、有向环、间隔非法）或整单无
      可行方案、弹性批量改期清单不可读/损坏/内容非法或整单无可行方案、未知批量改期操作、撤销涉及预约与记录
      不一致或恢复安排受阻、iCalendar 文件不可读/结构非法（含重复规则或
      EXDATE 非法、无规则带 EXDATE、全部排除、展开超出四位年份）、UID 与
