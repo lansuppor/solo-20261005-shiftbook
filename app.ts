@@ -49,6 +49,14 @@
 // 相同 UID 且重复与否、首项时间、COUNT、排除集合、例外集合与资源集合一致为重放
 // （不改动原安排），任一不同则整批拒绝；例外在文件中的书写位置与顺序不影响身份。
 //
+// iCalendar 本地导出：export-ical 按已解码 UID 选择一个已导入的按周重复系列，
+// 只读一份完整快照，把保存本地变更后的当前安排导出为 VERSION:2.0 的 VCALENDAR
+// （主事件保留首次 UID、首项 DTSTART/DTEND 与 RRULE；EXDATE 为首次排除集合与
+// 已取消成员原开始的去重并集；有效成员相对原周展开的起止时间或完整资源集合有
+// 变化时输出同 UID 例外，RECURRENCE-ID 固定为原开始、目标取当前值，首次导入
+// 例外同样重新比较而不复制快照；取消成员不输出例外；全部取消仍生成合法但无
+// 有效发生的日历）。不等待或改动写入保护、不修改业务数据、身份、历史或计数。
+//
 // 多项预约目标（系列成员、批量改期目标、撤销恢复安排、导入新事件）的可行性
 // 校验统一由 validateBatchTargets 完成（无写入副作用），各入口只负责展开
 // 目标、给出需排除的当前占用，并按各自业务定位与顺序渲染诊断。
@@ -5337,10 +5345,234 @@ async function cmdImportIcal(args: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// iCalendar 本地导出（export-ical，只读）
+//
+// 按已解码 UID 选择一个“已导入的按周重复系列”，把保存本地变更后的当前安排
+// 导出为 VERSION:2.0 的 VCALENDAR：
+//   - 主事件保留首次 UID、首项 DTSTART/DTEND 与 RRULE:FREQ=WEEKLY;COUNT=n；
+//   - EXDATE = 首次排除集合 ∪ 已取消成员原开始时间（按时间去重排序）；
+//   - 有效成员相对“原周展开”的起止时间或完整资源集合有变化时，输出同 UID 的
+//     例外 VEVENT：RECURRENCE-ID 固定为该成员原开始，DTSTART/DTEND 取当前值，
+//     DESCRIPTION 为当前完整资源集合；无变化不输出例外；取消成员不输出例外。
+// 首次导入时随文件带来的例外也一律按上述规则与原周展开重新比较，不复制首次
+// 例外快照；全部成员取消时仍生成合法但无有效发生的日历（EXDATE 覆盖全部发生）。
+//
+// 只读一份完整快照：不等待或改动写入保护、不修改业务数据、身份、历史或计数，
+// 原有 UID 重放规则不变。输出先写临时文件再原子替换，完整替换成功后才退出 0；
+// 输出路径与数据文件、写入保护或恢复协调文件等价时拒绝。
+// ---------------------------------------------------------------------------
+
+const EXPORT_PRODID = '-//shiftbook//local weekly-series export//CN';
+
+// TEXT 值转义：反斜杠、分号、逗号与换行（\r\n、\r、\n 均编码为 \n）
+function escapeIcalText(value: string): string {
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/;/g, '\\;')
+    .replace(/,/g, '\\,')
+    .replace(/\r\n|\r|\n/g, '\\n');
+}
+
+// RFC 5545 折行：物理行不超过 75 个 UTF-8 字节（不计行尾 CRLF），续行以一个
+// 空格开头（该空格计入 75 字节，故续行内容至多 74 字节）；按码点切分，绝不拆开
+// 一个 Unicode 字符。
+function foldIcalLine(line: string): string[] {
+  const chunks: string[] = [];
+  let cur = '';
+  let curBytes = 0;
+  for (const ch of line) {
+    const len = Buffer.byteLength(ch, 'utf8');
+    const limit = chunks.length === 0 ? 75 : 74;
+    if (curBytes + len > limit) {
+      chunks.push(cur);
+      cur = '';
+      curBytes = 0;
+    }
+    cur += ch;
+    curBytes += len;
+  }
+  chunks.push(cur);
+  return chunks.map((c, i) => (i === 0 ? c : ` ${c}`));
+}
+
+// 营业地时间文本 YYYY-MM-DDTHH:mm -> 浮动 iCalendar 时间 YYYYMMDDTHHmm00
+function floatingFromRaw(raw: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(raw);
+  if (!m) throw new BizError(`内部时间文本无法转换为浮动 iCalendar 时间: “${raw}”`);
+  return `${m[1]}${m[2]}${m[3]}T${m[4]}${m[5]}00`;
+}
+
+// 合法 UTC 的 DTSTAMP：YYYYMMDDTHHMMSSZ
+function utcStampNow(): string {
+  return new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+}
+
+// DESCRIPTION 文本：逐资源列出标识、名称与类型（中文类型标签），按标识排序，
+// 每项一行（输出时换行经 TEXT 转义为 \n）
+function resourceDescription(store: Store, ids: string[]): string {
+  return ids
+    .map((id) => {
+      const r = store.resources.find((x) => x.id === id);
+      if (r === undefined) throw new BizError(`数据损坏：资源 ${id} 不存在，无法导出其名称与类型（未写出任何文件）`);
+      return `资源 ${r.id} ${r.name}（${RESOURCE_TYPE_LABEL[r.type]}）`;
+    })
+    .join('\n');
+}
+
+interface SeriesExport {
+  text: string;
+  activeCount: number; // 有效成员数
+  excludedCount: number; // 输出 EXDATE 数量（首次排除 ∪ 已取消成员原开始）
+  exceptionCount: number; // 输出例外 VEVENT 数量
+}
+
+function buildSeriesIcal(store: Store, rec: ImportRec): SeriesExport {
+  if (rec.seriesId === undefined || rec.count === undefined || rec.occurrences === undefined) {
+    throw new BizError(`UID “${rec.uid}” 不是按周重复系列导入身份（导出中止，未写出任何文件）`);
+  }
+  const stamp = utcStampNow();
+  const firstResourceIds = [...rec.resourceIds].sort();
+  // 每次原发生的时长与首项相同（按周后移只改日期、不改时刻与跨日长度）
+  const masterDurationMin =
+    parseDateTime(rec.end, '导出：首项结束时间') - parseDateTime(rec.start, '导出：首项开始时间');
+
+  const exdates = new Set<string>(rec.exdates ?? []);
+  interface OutException {
+    recurrenceId: string;
+    start: string;
+    end: string;
+    resourceIds: string[];
+  }
+  const exceptions: OutException[] = []; // rec.occurrences 按原发生顺序，追加即有序
+  let activeCount = 0;
+  const bookingById = new Map(store.bookings.map((b) => [b.id, b]));
+
+  for (const occ of rec.occurrences) {
+    const b = bookingById.get(occ.bookingId);
+    if (b === undefined) {
+      throw new BizError(
+        `数据损坏：UID “${rec.uid}” 的成员预约 ${occ.bookingId} 不存在（导出中止，未写出任何文件）`,
+      );
+    }
+    if (b.status === 'cancelled') {
+      // 取消成员：不输出例外，其原开始并入排除集合
+      exdates.add(occ.start);
+      continue;
+    }
+    activeCount += 1;
+    const origStartMin = parseDateTime(occ.start, '导出：成员原发生开始时间');
+    const origEndRaw = formatDateTime(origStartMin + masterDurationMin);
+    if (origEndRaw === null) {
+      throw new BizError(
+        `数据损坏：UID “${rec.uid}” 原发生 ${occ.start} 的结束超出四位年份范围（0001-9999，导出中止）`,
+      );
+    }
+    const currentResourceIds = [...b.resourceIds].sort();
+    const sameResources =
+      currentResourceIds.length === firstResourceIds.length &&
+      currentResourceIds.every((id, j) => id === firstResourceIds[j]);
+    // 与“原周展开”逐项比较：首次导入例外、本地改期/换资源一视同仁
+    const changed = b.start !== occ.start || b.end !== origEndRaw || !sameResources;
+    if (changed) {
+      exceptions.push({recurrenceId: occ.start, start: b.start, end: b.end, resourceIds: currentResourceIds});
+    }
+  }
+
+  const excludedSorted = [...exdates].sort(); // 定宽文本字典序即原发生时间顺序
+  const uidText = escapeIcalText(rec.uid);
+  const lines: string[] = ['BEGIN:VCALENDAR', 'VERSION:2.0', `PRODID:${EXPORT_PRODID}`];
+
+  // 主事件在前：保留首次 UID、首项 DTSTART/DTEND 与 RRULE；DESCRIPTION 用首次资源集合
+  lines.push('BEGIN:VEVENT');
+  lines.push(`UID:${uidText}`);
+  lines.push(`DTSTAMP:${stamp}`);
+  lines.push(`DTSTART:${floatingFromRaw(rec.start)}`);
+  lines.push(`DTEND:${floatingFromRaw(rec.end)}`);
+  lines.push(`RRULE:FREQ=WEEKLY;COUNT=${rec.count}`);
+  for (const ex of excludedSorted) lines.push(`EXDATE:${floatingFromRaw(ex)}`);
+  lines.push(`DESCRIPTION:${escapeIcalText(resourceDescription(store, firstResourceIds))}`);
+  lines.push('END:VEVENT');
+
+  // 例外按原发生顺序；RECURRENCE-ID 固定为原开始，目标时间与资源取当前值
+  for (const x of exceptions) {
+    lines.push('BEGIN:VEVENT');
+    lines.push(`UID:${uidText}`);
+    lines.push(`DTSTAMP:${stamp}`);
+    lines.push(`RECURRENCE-ID:${floatingFromRaw(x.recurrenceId)}`);
+    lines.push(`DTSTART:${floatingFromRaw(x.start)}`);
+    lines.push(`DTEND:${floatingFromRaw(x.end)}`);
+    lines.push(`DESCRIPTION:${escapeIcalText(resourceDescription(store, x.resourceIds))}`);
+    lines.push('END:VEVENT');
+  }
+  lines.push('END:VCALENDAR');
+
+  const text = lines.map(foldIcalLine).flat().join('\r\n') + '\r\n';
+  return {text, activeCount, excludedCount: exdates.size, exceptionCount: exceptions.length};
+}
+
+async function cmdExportIcal(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, ['output']);
+  if (positionals.length !== 1) {
+    throw new UsageError('用法: export-ical <已解码 UID> --output <iCalendar 输出文件>');
+  }
+  const uid = positionals[0];
+  const output = requireFlag(values, 'output');
+  const file = activeDataFile;
+
+  // 输出不得与数据文件、写入保护（<数据文件>.lock）或恢复协调文件（.lock.recover）
+  // 等价：相对/绝对/含 ./.. 的同源写法（含指向数据文件的符号链接）一律拒绝
+  const outCanonical = canonicalDataPath(output);
+  const blockedPaths = [canonicalDataPath(file), lockPathFor(file), recoveryPathFor(file)];
+  if (blockedPaths.includes(outCanonical)) {
+    throw new BizError(
+      `导出文件 ${output} 与数据文件、其写入保护或恢复协调文件等价，拒绝写出（请指定其他输出路径）`,
+    );
+  }
+
+  // 只读一份完整快照：不等待写入保护、不修改数据文件、身份、历史或计数
+  const store = await loadStore(file);
+  const rec = store.imports.find((x) => x.uid === uid);
+  if (rec === undefined) {
+    throw new BizError(
+      `未找到 UID “${uid}” 的导入记录：export-ical 只能选择已导入的按周重复系列` +
+      '（UID 为导入时解码后的值，区分大小写；独立事件不能导出）',
+    );
+  }
+  if (rec.seriesId === undefined) {
+    throw new BizError(
+      `UID “${uid}” 关联的是独立事件（预约 ${rec.bookingId}），不是按周重复系列：` +
+      'export-ical 仅导出已导入的按周重复系列',
+    );
+  }
+  const result = buildSeriesIcal(store, rec);
+
+  // 先完整写入临时文件再原子改名：任何失败都不触碰原输出文件；
+  // 原输出不存在时失败也不留半成品（临时文件已清理）
+  const tmp = `${output}.${process.pid}.export-tmp`;
+  try {
+    await writeFile(tmp, result.text, {encoding: 'utf8', flag: 'wx'});
+    await rename(tmp, output);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw new BizError(
+      `写入导出文件 ${output} 失败：${(err as Error).message}` +
+      '（原输出文件保持不变；原本不存在时也未留下半成品，业务数据未改动）',
+    );
+  }
+
+  console.log(
+    `已导出按周重复系列：UID “${uid}”（系列 ${rec.seriesId}）→ ${output}\n` +
+      `  有效成员 ${result.activeCount} 项；` +
+      `排除 ${result.excludedCount} 项（首次排除集合与已取消成员原开始的并集）；` +
+      `输出例外 ${result.exceptionCount} 个。`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用、批量改期记录与安全撤销、iCalendar 导入、候选资源组合的最早可行时段查询、多项弹性预约的联合排程与原子创建、尽量少改动既有预约的弹性批量改期，以及资源使用率与繁忙时段统计）
+const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用、批量改期记录与安全撤销、iCalendar 导入与已导入按周系列的本地导出、候选资源组合的最早可行时段查询、多项弹性预约的联合排程与原子创建、尽量少改动既有预约的弹性批量改期，以及资源使用率与繁忙时段统计）
 
 用法:
   node app.ts [--data <数据文件>] <命令> [选项]
@@ -5600,6 +5832,32 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
         END:VEVENT
         END:VCALENDAR
 
+导出命令（已导入按周重复系列的本地 iCalendar 导出，只读）:
+  export-ical <已解码 UID> --output <iCalendar 输出文件>
+      按导入时解码后的 UID（区分大小写）选择一个已导入的按周重复系列，把保存
+      本地变更（成员改期、换资源、单独取消、整体取消、批量改期安全撤销等）后的
+      当前安排导出到本地 UTF-8 iCalendar 文件。未知 UID 或 UID 关联的是独立事件
+      （而非按周系列）均拒绝；输出路径与数据文件、写入保护（<数据文件>.lock）或
+      恢复协调文件等价（含符号链接）时拒绝。
+      输出 VERSION:2.0 的 VCALENDAR（含 PRODID，各 VEVENT 含 UID 与合法 UTC 的
+      DTSTAMP，CRLF、标准 75 字节折行，文本转义反斜杠、分号、逗号与换行）：
+      主事件在前，保留首次 UID、首项 DTSTART/DTEND（浮动 YYYYMMDDTHHmmss，秒
+      00，年份 0001-9999，时刻与跨日规则同导入）与 RRULE:FREQ=WEEKLY;COUNT=n；
+      EXDATE 为首次排除集合与已取消成员原开始时间的去重并集（按原发生排序）。
+      有效成员相对“原周展开”的起止时间或完整资源集合有变化时，输出同 UID 的
+      例外 VEVENT：RECURRENCE-ID 固定为该成员原开始，DTSTART/DTEND 取当前值；
+      无变化不输出例外；首次导入带来的例外也按当前安排重新比较，不复制首次
+      例外快照；取消成员不输出例外。主事件 DESCRIPTION 为首次资源集合，例外
+      DESCRIPTION 为当前完整资源集合，均逐行列出资源标识、名称与类型并按标识
+      排序。全部成员取消时仍生成合法且无有效发生的日历。例外与排除值按原发生
+      顺序排列。本命令只读一份完整数据快照：不等待或改动写入保护、不修改业务
+      数据、身份、历史或计数，原 UID 重放规则不变；旧记录无例外字段仍可导出。
+      输出先写临时文件再原子替换，完整替换成功后才退出 0，报告有效成员、排除
+      与例外数量；读写失败退出 1 且原输出文件保持不变（原本不存在时不留半成品），
+      业务文件始终不变。
+      示例:
+        node app.ts export-ical weekly-review@example.com --output ./weekly.ics
+
 实际可用时间:
   资源的实际可用时间 = 原开放区间合并后扣除全部有效停用区间的并集（原开放
   记录保留）。创建预约、单项及批量改期、创建系列、登记及处理候补均按实际
@@ -5707,9 +5965,10 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
      不一致或恢复安排受阻、iCalendar 文件不可读/结构非法（含重复规则或
      EXDATE 非法、无规则带 EXDATE、全部排除、展开超出四位年份）、UID 与
      首次导入不一致、新事件开放不足或冲突、数据文件损坏（含候补、停用、
-     批量改期或导入记录结构、引用或快照非法）、保存失败、数据文件被其他
-     进程占用（5 秒内未取得写入保护）或恢复被拒绝（原写入进程存活或无法
-     确认已退出）等）
+     批量改期或导入记录结构、引用或快照非法）、保存失败、导出未知 UID 或
+     选择了独立事件、导出输出路径与数据/保护/恢复协调文件等价或写出失败、
+     数据文件被其他进程占用（5 秒内未取得写入保护）或恢复被拒绝（原写入进程
+     存活或无法确认已退出）等）
   2  用法错误（未知参数、缺少必需选项、多余位置参数等）
 
 示例:
@@ -5744,6 +6003,7 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   node app.ts list-closures
   node app.ts cancel-closure C0001
   node app.ts import-ical ./events.ics --resource R0001 --resource R0002
+  node app.ts export-ical weekly-review@example.com --output ./weekly.ics
 `;
 
 let activeDataFile = DEFAULT_DATA_FILE;
@@ -5834,6 +6094,9 @@ async function main(): Promise<void> {
         break;
       case 'import-ical':
         await cmdImportIcal(commandArgs);
+        break;
+      case 'export-ical':
+        await cmdExportIcal(commandArgs);
         break;
       case 'recover-lock':
         await cmdRecoverLock(commandArgs);
