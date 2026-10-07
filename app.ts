@@ -26,6 +26,14 @@
 // 方案），有解时按清单顺序各创建一项普通预约并一次原子保存；无整体解明确
 // 提示并退出 1，不保存部分方案。
 //
+// 弹性批量改期：reschedule-flex 读取本地 JSON 清单（多项“既有预约标识 +
+// 目标窗口 + 有顺序候选资源组”的改期请求，时长保持预约当前长度），为整单
+// 求解最终安排：先最小化变化预约数量（起止时间或完整资源集合不同才算变化），
+// 数量相同再按清单顺序逐项先比开始分钟、再按组序比资源标识字典序取最小方案；
+// 只改本批时间与资源，有变化时记一条批量改期操作记录（与改期同次原子保存，
+// 可 list-batch-ops 查询、undo-batch-op 整笔安全撤销），无变化成功不写文件、
+// 不建记录、不推进计数。
+//
 // 使用统计：usage-stats 统计窗口内所选资源的实际可用、占用、空闲分钟与
 // 使用率（逐日 + 整窗 + 全部资源合计），并给出同时被占用的所选资源数量
 // 峰值及全部达到峰值的最大连续区间；只读快照，不写数据文件。
@@ -2994,18 +3002,21 @@ function parseRequirementGroups(store: Store, rawGroups: string[]): RequirementG
 
 // 单个资源在窗口内的空闲区间：实际可用时间（开放合并后扣除有效停用并集）
 // 裁进窗口，再扣除该资源当前有效预约的占用（普通预约、系列成员、导入预约与
-// 候补兑现预约均按当前安排占用；已取消不占用）
+// 候补兑现预约均按当前安排占用；已取消不占用）；
+// excludeBookingIds 中的预约（弹性批量改期的本批预约）旧占用不计
 function resourceFreeSegments(
   store: Store,
   id: string,
   wStart: number,
   wEnd: number,
+  excludeBookingIds: ReadonlySet<string> = new Set<string>(),
 ): Array<[number, number]> {
   const r = store.resources.find((x) => x.id === id)!;
   const available = clipSegments(availableSegmentsOf(store, r), wStart, wEnd);
   const busy: Array<[number, number]> = [];
   for (const b of store.bookings) {
     if (b.status !== 'active') continue;
+    if (excludeBookingIds.has(b.id)) continue;
     if (!b.resourceIds.includes(id)) continue;
     const bStart = parseDateTime(b.start, '预约开始时间');
     const bEnd = parseDateTime(b.end, '预约结束时间');
@@ -3512,6 +3523,419 @@ async function cmdScheduleFlex(args: string[]): Promise<void> {
       console.log(`    第 ${g + 1} 组: ${id}（${r.name}，${RESOURCE_TYPE_LABEL[r.type]}）`);
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// 弹性批量改期（reschedule-flex）
+//
+// 读取本地 JSON 清单（{"items": [...]}，非空、有顺序），每项给出一个既有预约
+// 标识、目标时间窗口与有顺序的候选资源组，时长保持预约当前长度。为整单求解
+// 最终安排：排除本批旧占用，其余有效预约按现状阻挡（取消记录与未兑现候补
+// 不阻挡）；开放合并重叠或相接后扣除有效停用；每项完整落窗，各组恰选一个
+// 且所选互异，全部所选资源同时连续可用、全程固定；仅共同资源的左闭右开
+// 时间重叠冲突，端点相接可行。
+//
+// 取舍：先最小化变化预约数量（起止时间或完整资源集合不同才算变化，资源
+// 顺序不计）；数量相同再按清单顺序逐项先比开始分钟、再按组序比资源标识
+// 字符串，取字典序最小的完整方案（候选书写顺序不影响结果）。求解按变化
+// 数 k = 0..n 递增试探：候选开始分钟取“基础空闲段起点 ∪ 各项当前开始
+// （在窗内时）”与“其他项占用结束（s_j + d_j）”的闭包（仅候选资源集合
+// 有交集的项之间传播），随后按清单顺序深度优先（开始升序、同一开始的
+// 资源序列字典序升序）并带上变化预算剪枝，首个完整方案即该 k 下的最小
+// 方案；最小可行 k 即最少变化数。
+//
+// 只改本批预约的时间与资源：标识、状态、系列归属、导入身份与首次请求、
+// 候补原请求及兑现关联全部保留，不新建预约、不自动处理候补。至少一项有
+// 变化时，将全部提交项的前后完整安排、系列归属及清单顺序记为一条稳定
+// 不复用的批量改期操作记录（O0001…，与 list-batch-ops / undo-batch-op
+// 共用），与改期同次原子保存，仅推进操作计数；无变化成功不写文件、不建
+// 记录、不推进计数。每次提交按当前状态求解，撤销后重提产生变化分配新的
+// 操作标识。
+// ---------------------------------------------------------------------------
+
+interface FlexRescheduleItem {
+  index: number; // 1 基清单序号
+  booking: BookingRec;
+  startRaw: string; // 窗口开始（YYYY-MM-DDTHH:mm）
+  endRaw: string; // 窗口结束
+  startMin: number;
+  endMin: number;
+  duration: number; // 预约当前长度（分钟），改期后保持不变
+  curStartMin: number; // 当前开始分钟
+  curResourceIds: string[]; // 当前完整资源集合（按标识排序）
+  groups: RequirementGroup[]; // 有顺序的候选资源组，每组恰选一个
+}
+
+// 清单结构（与业务数据无关的纯类型校验）；返回逐项原始记录
+function parseFlexRescheduleShape(raw: unknown, file: string): Array<Record<string, unknown>> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new BizError(`改期清单 ${file} 内容非法：顶层必须是对象，形如 {"items": [...]}`);
+  }
+  const o = raw as Record<string, unknown>;
+  for (const k of Object.keys(o)) {
+    if (k !== 'items') throw new BizError(`改期清单 ${file} 内容非法：存在未知字段 “${k}”，只允许 items`);
+  }
+  if (!Array.isArray(o.items)) {
+    throw new BizError(`改期清单 ${file} 内容非法：items 必须是非空数组`);
+  }
+  const items = o.items as unknown[];
+  if (items.length === 0) throw new BizError(`改期清单 ${file} 为空：items 至少包含一项改期请求`);
+
+  const problems: string[] = [];
+  const records: Array<Record<string, unknown> | null> = [];
+  items.forEach((it, idx) => {
+    const at = `第 ${idx + 1} 项`;
+    if (typeof it !== 'object' || it === null || Array.isArray(it)) {
+      problems.push(`${at} 必须是对象`);
+      records.push(null);
+      return;
+    }
+    const rec = it as Record<string, unknown>;
+    for (const k of Object.keys(rec)) {
+      if (k !== 'bookingId' && k !== 'window' && k !== 'groups') {
+        problems.push(`${at} 存在未知字段 “${k}”（只允许 bookingId、window、groups）`);
+      }
+    }
+    if (typeof rec.bookingId !== 'string' || rec.bookingId === '') {
+      problems.push(`${at} 的 bookingId 必须是非空字符串`);
+    }
+    if (typeof rec.window !== 'string' || rec.window === '') {
+      problems.push(`${at} 的 window 必须是 窗口开始/窗口结束 形式的非空字符串`);
+    }
+    if (!Array.isArray(rec.groups) || rec.groups.length === 0) {
+      problems.push(`${at} 的 groups 必须是非空数组（至少一个有顺序的候选资源组）`);
+    } else {
+      rec.groups.forEach((g, gi) => {
+        if (!Array.isArray(g) || g.length === 0) {
+          problems.push(`${at} 第 ${gi + 1} 候选资源组必须是非空数组（可任选其一的候选资源标识）`);
+        } else {
+          g.forEach((id) => {
+            if (typeof id !== 'string' || id === '') {
+              problems.push(`${at} 第 ${gi + 1} 候选资源组含非法候选：候选资源标识必须是非空字符串`);
+            }
+          });
+        }
+      });
+    }
+    records.push(rec);
+  });
+  if (problems.length > 0) {
+    throw new BizError(`改期清单 ${file} 内容非法，整单拒绝：\n${problems.map((p) => `- ${p}`).join('\n')}`);
+  }
+  return records as Array<Record<string, unknown>>;
+}
+
+// 逐项做与业务数据相关的校验（预约未知/重复/已取消、窗口真实有效且不短于
+// 预约当前时长、组内重复与未知资源），收集全部问题后一次性拒绝整单
+function parseFlexRescheduleItems(
+  store: Store,
+  records: Array<Record<string, unknown>>,
+  file: string,
+): FlexRescheduleItem[] {
+  const problems: string[] = [];
+  const seenBooking = new Map<string, number>(); // 标识 -> 首次出现的序号（1 基）
+  const items: Array<FlexRescheduleItem | null> = records.map((rec, idx) => {
+    const bookingId = rec.bookingId as string;
+    const at = `第 ${idx + 1} 项（${bookingId}）`;
+    let ok = true;
+
+    const firstAt = seenBooking.get(bookingId);
+    if (firstAt !== undefined) {
+      problems.push(`${at} 预约标识重复：该标识已在第 ${firstAt} 项出现，每项预约在清单中只能出现一次`);
+      ok = false;
+    } else {
+      seenBooking.set(bookingId, idx + 1);
+    }
+
+    const booking = store.bookings.find((b) => b.id === bookingId);
+    if (!booking) {
+      problems.push(`${at} 未知预约标识: ${bookingId}`);
+      ok = false;
+    } else if (booking.status === 'cancelled') {
+      problems.push(`${at} 预约 ${booking.id} 已取消，不能改期`);
+      ok = false;
+    }
+
+    let win: {start: string; end: string; startMin: number; endMin: number} | null = null;
+    try {
+      win = parseFlexWindow(rec.window as string, `${at}窗口`);
+    } catch (err) {
+      if (err instanceof BizError) {
+        problems.push(err.message);
+        ok = false;
+      } else {
+        throw err;
+      }
+    }
+
+    let duration = 0;
+    let curStartMin = 0;
+    if (booking !== undefined) {
+      curStartMin = parseDateTime(booking.start, `${at} 当前开始时间`);
+      duration = parseDateTime(booking.end, `${at} 当前结束时间`) - curStartMin;
+    }
+    if (win !== null && booking !== undefined && win.endMin - win.startMin < duration) {
+      problems.push(
+        `${at} 窗口长度 ${win.endMin - win.startMin} 分钟小于预约当前时长 ${duration} 分钟` +
+          `（窗口: ${win.start} → ${win.end}，时长保持预约当前长度）`,
+      );
+      ok = false;
+    }
+
+    const groups: RequirementGroup[] = [];
+    (rec.groups as string[][]).forEach((ids, gi) => {
+      const glabel = `${at} 第 ${gi + 1} 候选资源组`;
+      const seen = new Set<string>();
+      const dupes: string[] = [];
+      for (const id of ids) {
+        if (seen.has(id) && !dupes.includes(id)) dupes.push(id);
+        seen.add(id);
+      }
+      if (dupes.length > 0) {
+        problems.push(`${glabel}内候选资源重复: ${dupes.join('、')}`);
+        ok = false;
+      }
+      const unknown = [...seen].filter((id) => !store.resources.some((r) => r.id === id)).sort();
+      if (unknown.length > 0) {
+        problems.push(`${glabel}含未知资源标识: ${unknown.join('、')}`);
+        ok = false;
+      }
+      groups.push({index: gi + 1, candidates: [...seen].sort()});
+    });
+
+    if (!ok || win === null || booking === undefined) return null;
+    return {
+      index: idx + 1,
+      booking,
+      startRaw: win.start,
+      endRaw: win.end,
+      startMin: win.startMin,
+      endMin: win.endMin,
+      duration,
+      curStartMin,
+      curResourceIds: [...booking.resourceIds].sort(),
+      groups,
+    };
+  });
+  if (problems.length > 0) {
+    throw new BizError(`改期清单 ${file} 校验失败，整单拒绝（原有安排保持不变）：\n${problems.map((p) => `- ${p}`).join('\n')}`);
+  }
+  return items as FlexRescheduleItem[];
+}
+
+// 所选资源序列（按组顺序）与当前资源集合是否一致（资源顺序不计）
+function sameResourceSet(picks: string[], curSorted: string[]): boolean {
+  if (picks.length !== curSorted.length) return false;
+  const sorted = [...picks].sort();
+  return sorted.every((id, i) => id === curSorted[i]);
+}
+
+// 联合求解整单最终安排：先最小化变化预约数量，数量相同再按清单顺序逐项
+// 先比开始分钟、再按组序比资源标识字符串，取字典序最小完整方案。
+// 返回按清单顺序的各项安排（开始分钟 + 各组所选资源），无整体解返回 null。
+function solveFlexReschedule(store: Store, items: FlexRescheduleItem[]): FlexPlacement[] | null {
+  // 本批预约的旧占用一律不视为障碍；其余有效预约按现状阻挡
+  const batchIds = new Set(items.map((it) => it.booking.id));
+  const baseFree: Array<Map<string, Array<[number, number]>>> = items.map((it) => {
+    const m = new Map<string, Array<[number, number]>>();
+    for (const g of it.groups) {
+      for (const id of g.candidates) {
+        if (!m.has(id)) m.set(id, resourceFreeSegments(store, id, it.startMin, it.endMin, batchIds));
+      }
+    }
+    return m;
+  });
+
+  // 候选开始分钟闭包：基础空闲段起点 ∪ 各项当前开始（在窗内时），
+  // 加上“被其他项占用结束顶住”的起点 s_i = s_j + d_j
+  // （仅候选资源集合有交集的项之间传播；值域有限，必收敛）
+  const candidateIds = items.map((it) => {
+    const set = new Set<string>();
+    for (const g of it.groups) for (const id of g.candidates) set.add(id);
+    return set;
+  });
+  const sharesCandidate = (a: number, b: number): boolean => {
+    for (const id of candidateIds[a]) if (candidateIds[b].has(id)) return true;
+    return false;
+  };
+  const candStarts: Array<Set<number>> = items.map((it, i) => {
+    const set = new Set<number>();
+    for (const segs of baseFree[i].values()) {
+      for (const [s] of segs) {
+        if (s + it.duration <= it.endMin) set.add(s);
+      }
+    }
+    // 当前开始落在窗内时，“保持现状”总是一个候选（是否可行在试探中判定）
+    if (it.curStartMin >= it.startMin && it.curStartMin + it.duration <= it.endMin) {
+      set.add(it.curStartMin);
+    }
+    return set;
+  });
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let j = 0; j < items.length; j++) {
+      for (let i = 0; i < items.length; i++) {
+        if (i === j || !sharesCandidate(i, j)) continue;
+        for (const s of candStarts[j]) {
+          const t = s + items[j].duration;
+          if (
+            t >= items[i].startMin &&
+            t + items[i].duration <= items[i].endMin &&
+            !candStarts[i].has(t)
+          ) {
+            candStarts[i].add(t);
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+
+  // 已放置项对各资源的占用（随试探入栈/出栈增减；不变项同样放置以阻挡他项）
+  const occById = new Map<string, Array<[number, number]>>();
+
+  // 按清单顺序深度优先：开始分钟升序、同一开始的资源序列字典序升序，
+  // 只接受变化数不超过 budget 的完整方案；首个完整方案即该预算下的最小方案
+  const search = (idx: number, budget: number): FlexPlacement[] | null => {
+    if (idx === items.length) return [];
+    const it = items[idx];
+    const freeById = new Map<string, Array<[number, number]>>();
+    for (const [id, segs] of baseFree[idx]) {
+      const occ = occById.get(id);
+      freeById.set(id, occ !== undefined && occ.length > 0 ? subtractSegments(segs, occ) : segs);
+    }
+    for (const s of [...candStarts[idx]].sort((a, b) => a - b)) {
+      const e = s + it.duration;
+      const cache = new Map<string, boolean>();
+      const usable = (id: string): boolean => {
+        let v = cache.get(id);
+        if (v === undefined) {
+          v = isFullyCovered(freeById.get(id)!, s, e);
+          cache.set(id, v);
+        }
+        return v;
+      };
+      for (const picks of assignmentsInLexOrder(it.groups, usable)) {
+        // 起止时间或完整资源集合任一不同才算变化（时长固定，开始即决定结束；资源顺序不计）
+        const cost = s === it.curStartMin && sameResourceSet(picks, it.curResourceIds) ? 0 : 1;
+        if (cost > budget) continue;
+        for (const id of picks) {
+          const occ = occById.get(id) ?? [];
+          occ.push([s, e]);
+          occById.set(id, occ);
+        }
+        const rest = search(idx + 1, budget - cost);
+        if (rest !== null) return [{startMin: s, endMin: e, picks}, ...rest];
+        for (const id of picks) occById.get(id)!.pop();
+      }
+    }
+    return null;
+  };
+
+  // 变化数 k 递增：首个有解的 k 即最少变化数，其首个完整方案即最终取舍
+  for (let k = 0; k <= items.length; k++) {
+    const plan = search(0, k);
+    if (plan !== null) return plan;
+  }
+  return null;
+}
+
+async function cmdRescheduleFlex(args: string[]): Promise<void> {
+  const {values, positionals} = parseFlags(args, []);
+  if (values.size > 0) {
+    throw new UsageError(
+      `reschedule-flex 不接受选项: ${[...values.keys()].map((k) => '--' + k).join(' ')}`,
+    );
+  }
+  if (positionals.length !== 1) {
+    throw new UsageError('用法: reschedule-flex <改期清单文件>');
+  }
+  const manifestFile = positionals[0];
+
+  // 修改入口：先取得写入保护再读最新数据，求解至保存全程受保护
+  const file = activeDataFile;
+  const store = await loadStoreForWrite(file);
+  const records = parseFlexRescheduleShape(await loadManifest(manifestFile), manifestFile);
+  const items = parseFlexRescheduleItems(store, records, manifestFile);
+
+  const plan = solveFlexReschedule(store, items);
+  if (plan === null) {
+    throw new BizError(
+      `无整体解：清单 ${manifestFile} 的 ${items.length} 项改期不存在同时可行的安排` +
+        '（每项须完整落在自身窗口内，各组所选资源互不相同并全程固定，' +
+        '本批之间共同资源时间不得重叠）。未改动任何预约，数据文件与标识计数未改动。',
+    );
+  }
+
+  // 展开各项最终安排（开始分钟 -> 文本；窗口已校验在 0001-9999 内，时段不超出窗口）
+  const resolved = items.map((it, i) => {
+    const p = plan[i];
+    const start = formatDateTime(p.startMin);
+    const end = formatDateTime(p.endMin);
+    if (start === null || end === null) {
+      // 理论不可达：窗口已校验在四位年份内，时段不超出窗口
+      throw new BizError('可行时段超出四位年份范围');
+    }
+    const isChanged = !(p.startMin === it.curStartMin && sameResourceSet(p.picks, it.curResourceIds));
+    return {item: it, start, end, picks: p.picks, changed: isChanged};
+  });
+
+  const printPlan = (): void => {
+    for (const r of resolved) {
+      const b = r.item.booking;
+      console.log(
+        `- 第 ${r.item.index} 项 ${b.id}` +
+          (b.seriesId !== undefined ? `（系列 ${b.seriesId}，归属不变）` : '') +
+          `: ${r.start} → ${r.end}（${r.item.duration} 分钟）`,
+      );
+      r.picks.forEach((id, g) => {
+        const res = store.resources.find((x) => x.id === id)!;
+        console.log(`    第 ${g + 1} 组: ${id}（${res.name}，${RESOURCE_TYPE_LABEL[res.type]}）`);
+      });
+    }
+  };
+
+  // 无变化：成功但不写文件、不建记录、不推进计数
+  if (resolved.every((r) => !r.changed)) {
+    console.log(
+      `弹性批量改期成功：共 ${resolved.length} 项，安排均与现状一致，无业务变化` +
+        '（标识与系列归属不变，未生成改期操作记录，数据文件与标识计数未改动）',
+    );
+    printPlan();
+    return;
+  }
+
+  // 至少一项有变化：将全部提交项的前后完整安排、系列归属及清单顺序记为一条
+  // “未撤销”批量改期操作记录，与新安排在同一次原子保存中落盘后才报告成功；
+  // 保存失败则不留记录、不推进计数。仅改时间与资源；标识、status、seriesId、
+  // 导入身份与候补关联、其余标识计数全部不变，不创建任何预约或系列。
+  const opItems: BatchOpItem[] = resolved.map((r) => {
+    const b = r.item.booking;
+    const item: BatchOpItem = {
+      bookingId: b.id,
+      before: {start: b.start, end: b.end, resourceIds: [...b.resourceIds]},
+      after: {start: r.start, end: r.end, resourceIds: [...r.picks].sort()},
+    };
+    if (b.seriesId !== undefined) item.seriesId = b.seriesId;
+    return item;
+  });
+  store.batchSeq += 1;
+  const opId = `O${String(store.batchSeq).padStart(4, '0')}`;
+  for (const r of resolved) {
+    r.item.booking.start = r.start;
+    r.item.booking.end = r.end;
+    r.item.booking.resourceIds = [...r.picks].sort();
+  }
+  store.batchOps.push({id: opId, status: 'active', items: opItems});
+  await saveStore(file, store);
+
+  console.log(
+    `弹性批量改期成功：操作标识 ${opId}，共 ${resolved.length} 项` +
+      `（变化 ${resolved.filter((r) => r.changed).length} 项；仅改时间与资源，标识、状态与系列归属不变，未创建预约或系列）`,
+  );
+  printPlan();
+  console.log(`本次改期已记录为 ${opId}：可用 list-batch-ops 查询，undo-batch-op ${opId} 整笔安全撤销。`);
 }
 
 // ---------------------------------------------------------------------------
@@ -4431,7 +4855,7 @@ async function cmdImportIcal(args: string[]): Promise<void> {
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用、批量改期记录与安全撤销、iCalendar 导入、候选资源组合的最早可行时段查询、多项弹性预约的联合排程与原子创建，以及资源使用率与繁忙时段统计）
+const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用、批量改期记录与安全撤销、iCalendar 导入、候选资源组合的最早可行时段查询、多项弹性预约的联合排程与原子创建、尽量少改动既有预约的弹性批量改期，以及资源使用率与繁忙时段统计）
 
 用法:
   node app.ts [--data <数据文件>] <命令> [选项]
@@ -4463,6 +4887,12 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       至少一项有变化时生成稳定且不复用的操作标识（如 O0001）并与新安排原子
       保存，记录全部提交项的预约标识、系列归属、改期前后时间与完整资源集合及
       清单顺序；安排均与现状一致的提交成功但不建记录、不改文件或计数
+  reschedule-flex <改期清单文件>
+      弹性批量改期：按本地 JSON 清单为多项既有预约求解整单最终安排（每项给出
+      预约标识、目标窗口与有顺序的候选资源组，时长保持预约当前长度），先尽量
+      少改动既有预约，再取字典序最小方案；清单写法见下方“弹性批量改期清单”。
+      至少一项有变化时生成稳定且不复用的操作标识（如 O0001）并与新安排原子
+      保存；安排均与现状一致的提交成功但不建记录、不改文件或计数
   list-batch-ops
       按操作先后列出全部批量改期操作记录（未撤销/已撤销状态，项按提交顺序
       显示改期前后时间与完整资源、系列归属）；空结果明确提示
@@ -4692,6 +5122,39 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       ]
     }
 
+弹性批量改期清单（reschedule-flex 的 JSON 文件，UTF-8，顶层 {"items": [...]}）:
+  清单非空且有顺序；每项字段：
+    "bookingId": 要改期的预约标识（如 B0001）；未知、在清单中重复或已取消
+                 均整单拒绝；普通预约、系列成员、导入预约与候补兑现预约可
+                 混合提交，不要求同时提交整个系列
+    "window":    目标窗口 "YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm"（0001-9999 年，
+                 真实有效、结束晚于开始、允许跨日、与机器时区无关），长度不得
+                 小于预约当前时长；时长保持预约当前长度
+    "groups":    有顺序的候选资源组数组（如 [["R0001","R0002"],["R0003"]]）；
+                 至少一组、每组非空，组内重复或未知资源整单拒绝；资源可跨组、
+                 跨项出现
+  求解整单最终安排：排除本批旧占用，其余有效预约按现状阻挡（取消记录与未
+  兑现候补不阻挡）；开放合并重叠或相接后扣除有效停用；每项完整落窗，各组
+  恰选一个且所选互异，全部所选资源同时连续可用、全程固定；仅共同资源的
+  左闭右开时间重叠冲突，端点相接可行。取舍：先最小化变化预约数量（起止
+  时间或完整资源集合不同才算变化，资源顺序不计），数量相同再按清单顺序
+  逐项先比开始分钟、再按组序比资源标识字符串，取字典序最小完整方案
+  （候选书写顺序不影响结果）。只改本批时间与资源：标识、状态、系列归属、
+  导入身份与首次请求、候补原请求及兑现关联全部保留，不新建预约、不自动
+  处理候补。至少一项有变化时生成稳定且不复用的批量改期操作标识（O0001…），
+  记录全部提交项的前后完整安排、系列归属及清单顺序，与改期同次原子保存，
+  仅推进操作计数；无变化成功但不写文件、不建记录、不推进计数。记录可用
+  list-batch-ops 查询、undo-batch-op <操作标识> 整笔安全撤销；每次提交按
+  当前状态求解，撤销后重提产生变化分配新的操作标识。无整体解、清单不可读、
+  损坏或内容非法均整单失败（退出码 1），不改动任何预约、不推进计数。
+  清单示例:
+    {
+      "items": [
+        {"bookingId": "B0001", "window": "2026-10-12T08:00/2026-10-12T18:00", "groups": [["R0001", "R0002"], ["R0003"]]},
+        {"bookingId": "B0002", "window": "2026-10-12T09:00/2026-10-12T12:00", "groups": [["R0001"]]}
+      ]
+    }
+
 时间规则:
   日期时间格式 YYYY-MM-DDTHH:mm，查询日期 YYYY-MM-DD；
   为与机器时区无关的营业地时间，日期必须真实有效，结束晚于开始，允许跨日；
@@ -4727,7 +5190,7 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
      开放不足、冲突、非法次数、超出四位年份、未知系列、未知候补、取消已兑现
      候补、候补标识非法、停用区间与有效预约重叠、未知停用、停用标识非法、
      改期清单不可读/损坏/内容非法、预约清单不可读/损坏/内容非法或整单无
-     可行方案、未知批量改期操作、撤销涉及预约与记录
+     可行方案、弹性批量改期清单不可读/损坏/内容非法或整单无可行方案、未知批量改期操作、撤销涉及预约与记录
      不一致或恢复安排受阻、iCalendar 文件不可读/结构非法（含重复规则或
      EXDATE 非法、无规则带 EXDATE、全部排除、展开超出四位年份）、UID 与
      首次导入不一致、新事件开放不足或冲突、数据文件损坏（含候补、停用、
@@ -4746,6 +5209,7 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   node app.ts list-series
   node app.ts reschedule-booking B0002 --start 2026-10-12T14:00 --end 2026-10-12T15:00
   node app.ts reschedule-batch ./reschedule.json
+  node app.ts reschedule-flex ./reschedule-flex.json
   node app.ts list-batch-ops
   node app.ts undo-batch-op O0001
   node app.ts list-bookings --date 2026-10-12
@@ -4797,6 +5261,9 @@ async function main(): Promise<void> {
         break;
       case 'reschedule-batch':
         await cmdRescheduleBatch(commandArgs);
+        break;
+      case 'reschedule-flex':
+        await cmdRescheduleFlex(commandArgs);
         break;
       case 'list-batch-ops':
         await cmdListBatchOps(commandArgs);
