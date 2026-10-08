@@ -165,13 +165,13 @@ test('批量改期：整批交换时段成功；真实批内冲突双方互列�
   assert.match(r2.stderr, /第 2 项 B0002 目标 2026-10-12T14:30 → 2026-10-12T15:30/);
   assert.match(
     r2.stderr,
-    /B0002（本批第 2 项目标 2026-10-12T14:30 → 2026-10-12T15:30）：共同资源 R0001/,
-    '第 1 项列出对方标识与目标时间',
+    /本批第 2 项 B0002（活动 2026-10-12T14:30 → 2026-10-12T15:30）：[\s\S]*?R0001（甲）：本目标实际占用[\s\S]*第 2 项目标实际占用/,
+    '第 1 项列出对方标识、目标时间、共同资源与双方实际占用',
   );
   assert.match(
     r2.stderr,
-    /B0001（本批第 1 项目标 2026-10-12T14:00 → 2026-10-12T15:00）：共同资源 R0001/,
-    '第 2 项列出对方标识与目标时间',
+    /本批第 1 项 B0001（活动 2026-10-12T14:00 → 2026-10-12T15:00）：[\s\S]*?R0001（甲）：本目标实际占用[\s\S]*第 1 项目标实际占用/,
+    '第 2 项列出对方标识、目标时间、共同资源与双方实际占用',
   );
   assertFileBytes(df, bytesBefore, '批内冲突逐字节保留');
   store = readStore(df);
@@ -204,16 +204,16 @@ test('批量改期：非标识顺序提交的多项失败按清单顺序全部�
   const bytesBefore = readFileSync(df);
   const r = bizFail(df, ['reschedule-batch', manifest], '多项失败');
   assert.match(r.stderr, /共 3 项不满足条件（按清单顺序）/);
-  const i1 = r.stderr.indexOf('第 1 项 B0003');
-  const i2 = r.stderr.indexOf('第 2 项 B0001');
-  const i3 = r.stderr.indexOf('第 3 项 B0002');
+  const i1 = r.stderr.indexOf('第 1 项 B0003 目标');
+  const i2 = r.stderr.indexOf('第 2 项 B0001 目标');
+  const i3 = r.stderr.indexOf('第 3 项 B0002 目标');
   assert.ok(i1 >= 0 && i2 > i1 && i3 > i2, '失败项按清单顺序而非标识顺序报告');
-  assert.match(r.stderr, /第 1 项 B0003[\s\S]*?B0004（2026-10-12T14:00 → 2026-10-12T15:00）/, '批外冲突');
+  assert.match(r.stderr, /第 1 项 B0003[\s\S]*?B0004（活动 2026-10-12T14:00 → 2026-10-12T15:00）/, '批外冲突');
   assert.match(r.stderr, /第 2 项 B0001[\s\S]*?开放不足资源:[\s\S]*?R0001/, '开放不足');
   assert.match(
     r.stderr,
-    /第 3 项 B0002[\s\S]*?B0003（本批第 1 项目标 2026-10-12T14:00 → 2026-10-12T15:00）/,
-    '批内冲突列对方标识与目标时间',
+    /第 3 项 B0002[\s\S]*?本批第 1 项 B0003（活动 2026-10-12T14:00 → 2026-10-12T15:00）：[\s\S]*?R0001（甲）：本目标实际占用[\s\S]*第 1 项目标实际占用/,
+    '批内冲突列对方标识、目标时间、共同资源与双方实际占用',
   );
   assertFileBytes(df, bytesBefore, '多项失败逐字节保留');
   const store = readStore(df);
@@ -305,7 +305,7 @@ test('导入：重放预约改期后按新安排占用、取消后不再占用',
   ));
   const bytesBefore = readFileSync(df);
   const r2 = bizFail(df, ['import-ical', f3, '--resource', 'R0001'], '与改期后安排冲突');
-  assert.match(r2.stderr, /uid-c[\s\S]*?B0001（2026-10-12T15:00 → 2026-10-12T16:00）/, '按当前安排参与占用');
+  assert.match(r2.stderr, /uid-c[\s\S]*?B0001（活动 2026-10-12T15:00 → 2026-10-12T16:00）：[\s\S]*?R0001（甲）：本次发生实际占用[\s\S]*?B0001实际占用 2026-10-12T15:00 → 2026-10-12T16:00/, '按当前安排参与占用');
   assertFileBytes(df, bytesBefore, '冲突整批未导入');
   assert.equal(readStore(df).bookings.length, 2);
 
