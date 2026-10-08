@@ -38,6 +38,13 @@
 // 使用率（逐日 + 整窗 + 全部资源合计），并给出同时被占用的所选资源数量
 // 峰值及全部达到峰值的最大连续区间；只读快照，不写数据文件。
 //
+// 资源临时停用：add-closure 登记单资源停用（场地维护、设备检修、人员休息），
+// 不附清单时与有效预约时间重叠即拒绝；可附加一个本地弹性改期清单（格式沿用
+// reschedule-flex），一次原子提交停用与替代安排——重叠预约必须全部纳入（可
+// 额外纳入腾挪所需预约），拟停用计入求解，先最少变化再取字典序最小方案，
+// 停用每次成功登记都新建，改期有变化时另建一条同表批量改期操作记录，
+// cancel-closure 只取消停用，undo-batch-op 只恢复改期（不取消停用）。
+//
 // iCalendar 导入：import-ical 读取本地 UTF-8 的 VCALENDAR（VERSION:2.0），
 // 为每个新 VEVENT 创建预约（统一使用命令行给定的资源集合，不自动处理候补）：
 // 无 RRULE 的独立事件创建一项普通预约；带 RRULE:FREQ=WEEKLY;COUNT=n 的事件创建
@@ -1479,13 +1486,19 @@ function activeClosuresOf(store: Store, resourceId: string): ClosureRec[] {
     );
 }
 
-// 实际可用时间：原开放区间合并后，扣除该资源全部有效停用区间的并集（原开放记录保留）
-function availableSegmentsOf(store: Store, r: ResourceRec): Array<[number, number]> {
+// 实际可用时间：原开放区间合并后，扣除该资源全部有效停用区间的并集（原开放记录保留）。
+// extraCuts 供“停用 + 本地弹性改期清单”同次提交使用：拟登记的停用尚未落盘，
+// 求解时须把它与既有有效停用一并扣除（调用方保证为已合并的左闭右开区间）。
+function availableSegmentsOf(
+  store: Store,
+  r: ResourceRec,
+  extraCuts: ReadonlyArray<[number, number]> = [],
+): Array<[number, number]> {
   const cuts = activeClosuresOf(store, r.id).map(
     (c) =>
       [parseDateTime(c.start, '停用开始时间'), parseDateTime(c.end, '停用结束时间')] as [number, number],
   );
-  return subtractSegments(openSegmentsOf(r), cuts);
+  return subtractSegments(openSegmentsOf(r), [...cuts, ...extraCuts]);
 }
 
 interface CoverageGap {
@@ -1494,17 +1507,20 @@ interface CoverageGap {
   closures: ClosureRec[]; // 与该区间重叠的相关有效停用（按开始时间、标识排序）
 }
 
-// 找出实际可用时间（开放扣除有效停用）不能完整覆盖 [startMin, endMin) 的资源
+// 找出实际可用时间（开放扣除有效停用）不能完整覆盖 [startMin, endMin) 的资源。
+// extraCutsById 为按资源给出的附加扣除区间（拟登记但尚未落盘的停用），同样计入。
 function findCoverageGaps(
   store: Store,
   ids: string[],
   startMin: number,
   endMin: number,
+  extraCutsById?: ReadonlyMap<string, ReadonlyArray<[number, number]>>,
 ): CoverageGap[] {
   const gaps: CoverageGap[] = [];
   for (const id of ids) {
     const r = store.resources.find((x) => x.id === id)!;
-    if (isFullyCovered(availableSegmentsOf(store, r), startMin, endMin)) continue;
+    const extra = extraCutsById?.get(id) ?? [];
+    if (isFullyCovered(availableSegmentsOf(store, r, extra), startMin, endMin)) continue;
     const closures = activeClosuresOf(store, id).filter((c) => {
       const cs = parseDateTime(c.start, '停用开始时间');
       const ce = parseDateTime(c.end, '停用结束时间');
@@ -2274,6 +2290,10 @@ async function cmdUndoBatchOp(args: string[]): Promise<void> {
   // 可行性：对“整笔恢复后”的最终安排做统一批次校验（无写入副作用）。
   // 本操作涉及预约的当前占用一律排除（允许互换时段）；
   // 障碍只来自本操作之外的有效预约，以及各项恢复安排彼此之间。
+  // add-closure 附清单产生的记录，其停用不会随撤销取消：恢复校验须把全部
+  // 有效停用计入覆盖（validateBatchTargets 读当前 store，停用若仍有效自然
+  // 扣除），因此原安排仍被停用阻挡时整笔拒绝；先 cancel-closure 解除阻挡，
+  // 且全部预约当前安排仍与记录改期后安排一致后，整笔恢复才可行。
   const involvedIds = new Set(op.items.map((it) => it.bookingId));
   const targets = op.items.map((item) => ({
     startMin: parseDateTime(item.before.start, '恢复开始时间'),
@@ -3057,16 +3077,18 @@ function parseRequirementGroups(store: Store, rawGroups: string[]): RequirementG
 // 单个资源在窗口内的空闲区间：实际可用时间（开放合并后扣除有效停用并集）
 // 裁进窗口，再扣除该资源当前有效预约的占用（普通预约、系列成员、导入预约与
 // 候补兑现预约均按当前安排占用；已取消不占用）；
-// excludeBookingIds 中的预约（弹性批量改期的本批预约）旧占用不计
+// excludeBookingIds 中的预约（弹性批量改期、停用同次改期的本批预约）旧占用不计；
+// extraCuts 为拟登记但尚未落盘的停用区间（add-closure 附改期清单时计入）
 function resourceFreeSegments(
   store: Store,
   id: string,
   wStart: number,
   wEnd: number,
   excludeBookingIds: ReadonlySet<string> = new Set<string>(),
+  extraCuts: ReadonlyArray<[number, number]> = [],
 ): Array<[number, number]> {
   const r = store.resources.find((x) => x.id === id)!;
-  const available = clipSegments(availableSegmentsOf(store, r), wStart, wEnd);
+  const available = clipSegments(availableSegmentsOf(store, r, extraCuts), wStart, wEnd);
   const busy: Array<[number, number]> = [];
   for (const b of store.bookings) {
     if (b.status !== 'active') continue;
@@ -4001,14 +4023,22 @@ function sameResourceSet(picks: string[], curSorted: string[]): boolean {
 // 联合求解整单最终安排：先最小化变化预约数量，数量相同再按清单顺序逐项
 // 先比开始分钟、再按组序比资源标识字符串，取字典序最小完整方案。
 // 返回按清单顺序的各项安排（开始分钟 + 各组所选资源），无整体解返回 null。
-function solveFlexReschedule(store: Store, items: FlexRescheduleItem[]): FlexPlacement[] | null {
+// extraCutsById 给出拟登记但尚未落盘的停用区间（add-closure 附改期清单时
+// 与既有有效停用一并扣除），省略时只扣除已落盘的有效停用。
+function solveFlexReschedule(
+  store: Store,
+  items: FlexRescheduleItem[],
+  extraCutsById?: ReadonlyMap<string, ReadonlyArray<[number, number]>>,
+): FlexPlacement[] | null {
   // 本批预约的旧占用一律不视为障碍；其余有效预约按现状阻挡
   const batchIds = new Set(items.map((it) => it.booking.id));
   const baseFree: Array<Map<string, Array<[number, number]>>> = items.map((it) => {
     const m = new Map<string, Array<[number, number]>>();
     for (const g of it.groups) {
       for (const id of g.candidates) {
-        if (!m.has(id)) m.set(id, resourceFreeSegments(store, id, it.startMin, it.endMin, batchIds));
+        if (!m.has(id)) {
+          m.set(id, resourceFreeSegments(store, id, it.startMin, it.endMin, batchIds, extraCutsById?.get(id) ?? []));
+        }
       }
     }
     return m;
@@ -4377,6 +4407,16 @@ async function cmdUsageStats(args: string[]): Promise<void> {
 // ---------------------------------------------------------------------------
 // 资源临时停用：场地维护、设备检修、人员休息
 // 实际可用时间 = 原开放区间合并后扣除全部有效停用区间的并集（原开放记录保留）
+//
+// add-closure 可在三个必填选项之后附加一个可选的本地 JSON 清单位置参数：
+// 不附清单时沿用原规则（与有效预约时间重叠即拒绝）；附清单时一次提交停用与
+// 替代安排——清单格式、字段与输入校验完全沿用 reschedule-flex（items 非空有序，
+// bookingId/window/groups，时长保持预约当前值，未知、重复或已取消预约拒绝）。
+// 与拟停用共同资源时间重叠的全部有效预约必须纳入（可额外纳入为腾挪而调整的
+// 预约），漏项一次性列出全部遗漏标识并拒绝；拟停用虽未落盘，求解时与既有有效
+// 停用一并扣除，本批旧占用排除、其余有效预约阻挡。停用每次成功登记都新建；
+// 改期至少一项有变化时才同时建一条批量改期操作记录（同表、可 undo-batch-op
+// 整笔安全撤销；撤销只恢复改期、不取消停用，原安排仍被停用阻挡时整笔拒绝）。
 // ---------------------------------------------------------------------------
 
 const CLOSURE_STATUS_LABEL: Record<ClosureStatus, string> = {
@@ -4386,7 +4426,10 @@ const CLOSURE_STATUS_LABEL: Record<ClosureStatus, string> = {
 
 async function cmdAddClosure(args: string[]): Promise<void> {
   const {values, positionals} = parseFlags(args, ['resource', 'start', 'end']);
-  if (positionals.length > 0) throw new UsageError(`add-closure 不接受位置参数: ${positionals.join(' ')}`);
+  if (positionals.length > 1) {
+    throw new UsageError(`add-closure 至多接受一个位置参数（可选的本地弹性改期清单文件）: ${positionals.join(' ')}`);
+  }
+  const manifestPath = positionals[0];
 
   const resourceId = requireFlag(values, 'resource');
   const startRaw = requireFlag(values, 'start');
@@ -4405,8 +4448,8 @@ async function cmdAddClosure(args: string[]): Promise<void> {
   }
 
   // 登记前检查该资源的全部有效预约（含系列成员与候补兑现预约；已取消不阻挡）。
-  // 区间左闭右开，端点相接不算重叠；有重叠即拒绝，不改期或取消任何预约。
-  const affected = store.bookings
+  // 区间左闭右开，端点相接不算重叠。
+  const overlapping = store.bookings
     .filter((b) => {
       if (b.status !== 'active' || !b.resourceIds.includes(resourceId)) return false;
       const bs = parseDateTime(b.start, '预约开始时间');
@@ -4414,22 +4457,138 @@ async function cmdAddClosure(args: string[]): Promise<void> {
       return bs < endMin && startMin < be;
     })
     .sort((a, b) => a.id.localeCompare(b.id));
-  if (affected.length > 0) {
-    const lines = affected.map((b) => `- ${b.id}（${b.start} → ${b.end}）`);
+
+  // 不附清单：沿用原规则——有任何有效预约重叠即拒绝，不改期或取消任何预约。
+  if (manifestPath === undefined) {
+    if (overlapping.length > 0) {
+      const lines = overlapping.map((b) => `- ${b.id}（${b.start} → ${b.end}）`);
+      throw new BizError(
+        `无法登记停用：资源 ${resourceId}（${resource.name}）在该区间存在有效预约` +
+          `（不自动改期或取消，请先处理，或附加本地弹性改期清单一次提交停用与替代安排）：\n${lines.join('\n')}`,
+      );
+    }
+    await commitClosure(store, file, resource, startRaw, endRaw);
+    return;
+  }
+
+  // 附本地弹性改期清单：清单格式、字段与输入校验完全沿用 reschedule-flex
+  // （items 非空有序，bookingId/window/groups，未知、重复或已取消预约整单拒绝）。
+  const records = parseFlexRescheduleShape(await loadManifest(manifestPath), manifestPath);
+  const items = parseFlexRescheduleItems(store, records, manifestPath);
+
+  // 与拟停用共同资源时间重叠的全部有效预约都必须纳入清单（可额外纳入为腾挪
+  // 而调整的预约）；漏项一次性列出全部遗漏标识及时间并拒绝。
+  const listed = new Set(items.map((it) => it.booking.id));
+  const missing = overlapping.filter((b) => !listed.has(b.id));
+  if (missing.length > 0) {
+    const lines = missing.map((b) => `- ${b.id}（${b.start} → ${b.end}）`);
     throw new BizError(
-      `无法登记停用：资源 ${resourceId}（${resource.name}）在该区间存在有效预约` +
-        `（不自动改期或取消，请先处理）：\n${lines.join('\n')}`,
+      `无法登记停用：资源 ${resourceId}（${resource.name}）在该区间存在 ${missing.length} 项` +
+        `有效预约未纳入改期清单（重叠预约必须全部列入，可再额外列入为腾挪而调整的预约）：\n${lines.join('\n')}`,
     );
   }
 
-  // 全部校验通过后才生成标识、改内存、落盘；相同内容再次登记也是另一记录
+  // 拟停用虽未落盘，求解时已计入各资源实际可用时间的扣除（仅其资源）；
+  // 本批预约旧占用排除，其余有效预约按现状阻挡。
+  const extraCutsById = new Map<string, ReadonlyArray<[number, number]>>([[resourceId, [[startMin, endMin]]]]);
+  const plan = solveFlexReschedule(store, items, extraCutsById);
+  if (plan === null) {
+    throw new BizError(
+      `无整体解：停用 ${startRaw} → ${endRaw} 生效后，清单 ${manifestPath} 的 ${items.length} 项改期` +
+        '不存在同时可行的安排（每项须完整落在自身窗口内，各组所选资源互不相同并全程固定，' +
+        '拟停用与既有有效停用一并扣除，本批之间共同资源时间不得重叠）。' +
+        '未登记停用、未改动任何预约，数据文件与标识计数未改动。',
+    );
+  }
+
+  // 展开各项最终安排（开始分钟 -> 文本；窗口已校验在 0001-9999 内，时段不超出窗口）
+  const resolved = items.map((it, i) => {
+    const p = plan[i];
+    const s = formatDateTime(p.startMin);
+    const e = formatDateTime(p.endMin);
+    if (s === null || e === null) {
+      // 理论不可达：窗口已校验在四位年份内，时段不超出窗口
+      throw new BizError('可行时段超出四位年份范围');
+    }
+    const isChanged = !(p.startMin === it.curStartMin && sameResourceSet(p.picks, it.curResourceIds));
+    return {item: it, start: s, end: e, picks: p.picks, changed: isChanged};
+  });
+
+  // 每次成功登记都创建新停用；改期至少一项有变化时才同时建一条“未撤销”批量
+  // 改期操作记录（与 reschedule-batch/reschedule-flex 同表）。停用、改期与记录
+  // 同一次原子保存落盘后才报告成功；无变化只推进停用计数。
+  store.closureSeq += 1;
+  const closureId = `C${String(store.closureSeq).padStart(4, '0')}`;
+  store.closures.push({id: closureId, resourceId, start: startRaw, end: endRaw, status: 'active'});
+  store.closures.sort((a, b) => a.id.localeCompare(b.id));
+
+  let opId: string | null = null;
+  if (resolved.some((r) => r.changed)) {
+    const opItems: BatchOpItem[] = resolved.map((r) => {
+      const b = r.item.booking;
+      const item: BatchOpItem = {
+        bookingId: b.id,
+        before: {start: b.start, end: b.end, resourceIds: [...b.resourceIds]},
+        after: {start: r.start, end: r.end, resourceIds: [...r.picks].sort()},
+      };
+      if (b.seriesId !== undefined) item.seriesId = b.seriesId;
+      return item;
+    });
+    store.batchSeq += 1;
+    opId = `O${String(store.batchSeq).padStart(4, '0')}`;
+    store.batchOps.push({id: opId, status: 'active', items: opItems});
+  }
+  for (const r of resolved) {
+    r.item.booking.start = r.start;
+    r.item.booking.end = r.end;
+    r.item.booking.resourceIds = [...r.picks].sort();
+  }
+  await saveStore(file, store);
+
+  console.log(`已登记停用 ${closureId}（停用与本地弹性改期清单已一次原子提交）`);
+  console.log(`  资源: ${resourceId}（${resource.name}）`);
+  console.log(`  时间: ${startRaw} → ${endRaw}`);
+  if (opId !== null) {
+    console.log(
+      `  改期操作标识: ${opId}（共 ${resolved.length} 项，变化 ${resolved.filter((r) => r.changed).length} 项；` +
+        '仅改时间与资源，标识、状态与系列归属不变，未创建预约或系列）',
+    );
+  } else {
+    console.log(
+      `  改期: 共 ${resolved.length} 项安排均与现状一致，未生成改期操作记录` +
+        '（停用计数已推进，改期操作计数未推进）',
+    );
+  }
+  for (const r of resolved) {
+    const b = r.item.booking;
+    console.log(
+      `- 第 ${r.item.index} 项 ${b.id}` +
+        (b.seriesId !== undefined ? `（系列 ${b.seriesId}，归属不变）` : '') +
+        `: ${r.start} → ${r.end}（${r.item.duration} 分钟）`,
+    );
+    r.picks.forEach((id, g) => {
+      const res = store.resources.find((x) => x.id === id)!;
+      console.log(`    第 ${g + 1} 组: ${id}（${res.name}，${RESOURCE_TYPE_LABEL[res.type]}）`);
+    });
+  }
+  console.log('  取消停用不会自动恢复这些预约；需要恢复时先 cancel-closure 再 undo-batch-op。');
+}
+
+// 无清单的停用登记落盘与输出（沿用历史行为：相同内容再次登记也是另一记录）
+async function commitClosure(
+  store: Store,
+  file: string,
+  resource: ResourceRec,
+  startRaw: string,
+  endRaw: string,
+): Promise<void> {
   store.closureSeq += 1;
   const id = `C${String(store.closureSeq).padStart(4, '0')}`;
-  store.closures.push({id, resourceId, start: startRaw, end: endRaw, status: 'active'});
+  store.closures.push({id, resourceId: resource.id, start: startRaw, end: endRaw, status: 'active'});
   store.closures.sort((a, b) => a.id.localeCompare(b.id));
   await saveStore(file, store);
   console.log(`已登记停用 ${id}`);
-  console.log(`  资源: ${resourceId}（${resource.name}）`);
+  console.log(`  资源: ${resource.id}（${resource.name}）`);
   console.log(`  时间: ${startRaw} → ${endRaw}`);
   console.log('  该区间不再计入实际可用时间；取消停用请使用 cancel-closure。');
 }
@@ -5605,7 +5764,7 @@ async function cmdExportIcal(args: string[]): Promise<void> {
 // 帮助与入口
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用、批量改期记录与安全撤销、iCalendar 导入与已导入按周系列的本地导出、候选资源组合的最早可行时段查询、多项弹性预约的联合排程与原子创建、尽量少改动既有预约的弹性批量改期，以及资源使用率与繁忙时段统计）
+const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系列、固定/弹性候补队列、资源临时停用（可附本地弹性改期清单一次提交停用与替代安排）、批量改期记录与安全撤销、iCalendar 导入与已导入按周系列的本地导出、候选资源组合的最早可行时段查询、多项弹性预约的联合排程与原子创建、尽量少改动既有预约的弹性批量改期，以及资源使用率与繁忙时段统计）
 
 用法:
   node app.ts [--data <数据文件>] <命令> [选项]
@@ -5790,18 +5949,40 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
 
 停用命令（场地维护、设备检修、人员休息）:
   add-closure --resource <标识> --start <YYYY-MM-DDTHH:mm> --end <YYYY-MM-DDTHH:mm>
-      为一个已登记资源登记一段临时停用；不要求该区间原本开放。登记前检查该资源
-      的全部有效预约（含系列成员与候补兑现预约，已取消不阻挡；左闭右开，端点
-      相接不算重叠），有时间重叠即拒绝并列出全部受影响预约标识及时间，不改期
-      或取消它们。成功返回稳定且不复用的停用标识（如 C0001）；相同内容再次
-      登记也是另一记录，允许停用重叠或相接
+      [本地弹性改期清单文件]
+      为一个已登记资源登记一段临时停用；不要求该区间原本开放。
+      不附清单时，登记前检查该资源的全部有效预约（含系列成员与候补兑现预约，
+      已取消不阻挡；左闭右开，端点相接不算重叠），有时间重叠即拒绝并列出全部
+      受影响预约标识及时间，不改期或取消它们。
+      附加清单（可选的位置参数，UTF-8 JSON，写法与校验完全同 reschedule-flex：
+      顶层 {"items": [...]}，非空有序，每项 bookingId/window/groups，时长保持
+      预约当前值，未知、重复或已取消预约整单拒绝）时一次提交停用与替代安排：
+      与拟停用共同资源时间重叠的全部有效预约必须纳入清单（可再额外纳入为腾挪
+      而调整的预约），漏项一次性列出全部遗漏标识及时间并拒绝；拟停用与既有
+      有效停用一并计入求解（开放合并重叠或相接后扣除并集），排除本批旧占用，
+      其余有效预约阻挡，取消记录与未兑现候补不阻挡；各项完整落窗、每组恰选
+      一个互异资源且全程同时连续可用，共同资源左闭右开时间重叠才冲突、端点
+      相接可行；先最少变化预约数量（时间或完整资源集合不同才算变化，资源
+      顺序不计），数量相同再按清单顺序先比开始分钟、再按组序比资源标识字符串
+      取最小完整方案（候选书写顺序不影响结果）。停用、改期及有变化时的一条
+      批量改期操作记录同次原子保存后才退出 0，显示停用标识、各项时间、按组
+      资源，有变化另示操作标识；每次成功登记都创建新停用，改期无变化不建
+      操作记录、仅推进停用计数。只改本批预约的时间与资源，标识、状态、系列
+      归属、导入首次身份及候补原请求与关联保留，不自动处理候补。
+      取消停用（cancel-closure）不自动恢复预约；安全撤销（undo-batch-op）
+      只恢复改期、不取消停用，原安排仍被该停用阻挡时整笔拒绝，先解除停用且
+      全部预约仍有效并与记录后安排一致后整笔恢复才可行。
+      成功返回稳定且不复用的停用标识（如 C0001）；相同内容再次登记也是另一
+      记录，允许停用重叠或相接。无整体解、漏项、非法输入、读取或保存失败、
+      锁竞争均退出 1 且不留本次停用、改期、记录或计数变化；用法错误退出 2
   list-closures
       按开始时间、标识列出全部停用记录的资源、时间与有效/已取消状态
       （空结果明确提示）
   cancel-closure <停用标识>
       仅使指定停用记录失效并保留历史，该区间恢复可用（不超出原开放时间）；
       其他重叠停用仍有效；重复取消成功且无变化，未知标识失败；
-      取消不自动创建预约或处理候补
+      取消不自动恢复预约、不自动创建预约或处理候补（附清单登记时被改期的
+      预约须另行 undo-batch-op 安全撤销，且撤销只恢复改期、不取消停用）
 
 导入命令（本地 iCalendar 文件批量导入预约）:
   import-ical <iCalendar 文件> --resource <标识> [--resource <标识> ...]
@@ -5957,6 +6138,27 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       ]
     }
 
+停用同次改期清单（add-closure 附加的可选 JSON 文件）:
+  与上面的“弹性批量改期清单”完全相同的 UTF-8 JSON（顶层 {"items": [...]}，
+  非空有序，每项 bookingId/window/groups，校验、求解取舍、记录与撤销规则全部
+  沿用 reschedule-flex）：
+    node app.ts add-closure --resource R0001 \\
+        --start 2026-10-12T10:00 --end 2026-10-12T12:00 ./closure-moves.json
+  与拟停用在共同资源上时间重叠的全部有效预约必须列入清单，可额外列入为腾挪
+  而调整的预约；漏项列出全部遗漏标识并拒绝，未知、重复或已取消预约同样整单
+  拒绝。求解把拟停用计入（即使该区间原本不开放），开放合并重叠或相接后扣除
+  有效停用与拟停用的并集，排除本批旧占用，其余有效预约阻挡。停用每次成功
+  登记都创建新停用标识；改期有变化时另建一条批量改期操作记录（O0001…，与
+  reschedule-batch/reschedule-flex 同表），无变化不建操作记录、仅推进停用
+  计数。取消停用不自动恢复预约；undo-batch-op 只恢复改期、不取消停用，
+  原安排仍被停用阻挡时整笔拒绝。
+  清单示例（closure-moves.json）:
+    {
+      "items": [
+        {"bookingId": "B0001", "window": "2026-10-12T08:00/2026-10-12T18:00", "groups": [["R0001", "R0002"]]}
+      ]
+    }
+
 时间规则:
   日期时间格式 YYYY-MM-DDTHH:mm，查询日期 YYYY-MM-DD；
   为与机器时区无关的营业地时间，日期必须真实有效，结束晚于开始，允许跨日；
@@ -5991,6 +6193,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
      组内重复候选、已取消预约、时间非法、
      开放不足、冲突、非法次数、超出四位年份、未知系列、未知候补、取消已兑现
      候补、候补标识非法、停用区间与有效预约重叠、未知停用、停用标识非法、
+     停用同次改期清单不可读/损坏/内容非法、漏列与拟停用重叠的有效预约、
+     停用生效后整单无可行方案、
      改期清单不可读/损坏/内容非法、预约清单不可读/损坏/内容非法（含项间
      关系序号越界或非整数、自指、重复有向关系、有向环、间隔非法）或整单无
      可行方案、弹性批量改期清单不可读/损坏/内容非法或整单无可行方案、未知批量改期操作、撤销涉及预约与记录
@@ -6032,6 +6236,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       --resource R0001 --resource R0002
   node app.ts add-closure --resource R0001 \\
       --start 2026-10-06T00:00 --end 2026-10-07T00:00
+  node app.ts add-closure --resource R0001 \\
+      --start 2026-10-12T10:00 --end 2026-10-12T12:00 ./closure-moves.json
   node app.ts list-closures
   node app.ts cancel-closure C0001
   node app.ts import-ical ./events.ics --resource R0001 --resource R0002
