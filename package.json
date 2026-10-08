@@ -8,6 +8,6 @@
   },
   "scripts": {
     "start": "node app.ts",
-    "test": "node --test test/batch-ops.test.ts test/ical-import.test.ts test/ical-export.test.ts test/batch-validate.test.ts test/write-lock.test.ts test/find-slot.test.ts test/usage-stats.test.ts test/schedule-flex.test.ts test/schedule-flex-relations.test.ts test/schedule-flex-exhaustive.test.ts test/reschedule-flex.test.ts"
+    "test": "node --test test/batch-ops.test.ts test/ical-import.test.ts test/ical-export.test.ts test/batch-validate.test.ts test/write-lock.test.ts test/find-slot.test.ts test/usage-stats.test.ts test/schedule-flex.test.ts test/schedule-flex-relations.test.ts test/schedule-flex-exhaustive.test.ts test/reschedule-flex.test.ts test/add-closure-flex.test.ts"
   }
 }
