@@ -6,6 +6,18 @@
 // 内部统一换算为“自公元 1 年起的分钟数”做比较，杜绝时区影响。
 // 区间左闭右开 [start, end)，允许跨日。
 //
+// 预约记录保存的始终是“活动时间”起止。资源可用 add-resource 的 --prep/--teardown
+// 分别设置预约前准备与预约后整理分钟（非负安全整数，省略或旧资源缺字段为 0，
+// 持久化后读写与重启均保留；持久字段非法视为数据损坏）。每个所用资源对一项预约
+// 的实际占用分别为 [活动开始-该资源准备, 活动结束+该资源整理)：按资源各自缓冲
+// 分别扩张，不能取最大缓冲统一扩张。实际占用须被“开放合并后扣除有效停用”的连续
+// 区间完整覆盖，越出 0001-9999 年即拒绝；仅共同资源上双方实际占用重叠才冲突，
+// 扩张后端点相接可行。创建、改期、撤销、系列、导入新项、候补登记/兑现、find-slot
+// 及全部弹性排程（schedule-flex、reschedule-flex、add-closure 附清单）统一按此
+// 规则；查询窗口与排程窗口只限制活动起止，准备/整理可伸出窗口但仍须实际可用；
+// 停用自身不扩张，按其区间与预约实际占用识别受影响预约；usage-stats 按实际占用
+// 计时、拆日与计算峰值。
+//
 // 预约系列：create-series 按周（每 7 个营业地日历日）生成多项预约，
 // 全部成员使用相同资源；成员记录与普通预约同表，带 seriesId 归属。
 //
@@ -88,6 +100,11 @@ const DEFAULT_DATA_FILE = 'shiftbook-data.json';
 // 四位年份范围（与输入格式 YYYY 一致）；系列推算出的时间落在此范围外即拒绝
 const MIN_YEAR = 1;
 const MAX_YEAR = 9999;
+// 分钟值域：[0001-01-01T00:00, 10000-01-01T00:00)。
+// 预约活动时间经解析必在此域内；活动起止按资源准备/整理时间扩张后的“实际占用”
+// 若越出此域（准备早于公元 1 年或整理晚至 10000 年）即拒绝。
+const MIN_MINUTE = daysFromCivil(MIN_YEAR, 1, 1) * 1440;
+const MAX_MINUTE_EXCL = daysFromCivil(MAX_YEAR + 1, 1, 1) * 1440;
 // 系列最大次数：首项 + 每周一次，杜绝荒谬输入导致的长循环
 const MAX_OCCURRENCES = 100000;
 
@@ -258,24 +275,6 @@ function intersectSegments(
   return out;
 }
 
-// 多资源在窗口 [wStart, wEnd) 内的共同实际可用区间：
-// 各自实际可用时间（开放合并后扣除有效停用并集）裁进窗口后逐组求交
-function commonAvailableSegments(
-  store: Store,
-  ids: string[],
-  wStart: number,
-  wEnd: number,
-): Array<[number, number]> {
-  let common: Array<[number, number]> = [[wStart, wEnd]];
-  for (const id of ids) {
-    const r = store.resources.find((x) => x.id === id)!;
-    const clipped = clipSegments(availableSegmentsOf(store, r), wStart, wEnd);
-    common = intersectSegments(common, clipped);
-    if (common.length === 0) break;
-  }
-  return common;
-}
-
 // ---------------------------------------------------------------------------
 // 数据模型与文件存取
 // ---------------------------------------------------------------------------
@@ -292,6 +291,8 @@ interface ResourceRec {
   type: ResourceType;
   name: string;
   open: Array<[string, string]>;
+  prepMinutes: number; // 预约前准备（非负安全整数分钟；旧文件缺字段按 0）
+  teardownMinutes: number; // 预约后整理（非负安全整数分钟；旧文件缺字段按 0）
 }
 
 interface BookingRec {
@@ -419,6 +420,11 @@ function isInt(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= 0;
 }
 
+// 持久化缓冲字段的合法值域：非负安全整数（拒绝小数、负数与超过安全整数范围的值）
+function isNonNegSafeInt(v: unknown): v is number {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+}
+
 // 严格校验数据文件结构；非法时抛出 BizError，调用方不得写回文件
 function validateStore(raw: unknown, file: string): Store {
   const bad = (reason: string): never => {
@@ -493,7 +499,23 @@ function validateStore(raw: unknown, file: string): Store {
       if (e <= s) bad(`${at}(${r.id}).open[${j}] 结束必须晚于开始`);
       open.push([iv[0], iv[1]]);
     });
-    store.resources.push({id: r.id, type: r.type, name: r.name, open});
+    // 预约前准备/预约后整理分钟：可缺省（旧文件按 0），持久字段一旦存在必须是
+    // 非负安全整数，否则视为数据损坏
+    let prepMinutes = 0;
+    let teardownMinutes = 0;
+    if (r.prepMinutes !== undefined) {
+      if (!isNonNegSafeInt(r.prepMinutes)) {
+        bad(`${at}(${r.id}).prepMinutes 必须是非负安全整数`);
+      }
+      prepMinutes = r.prepMinutes;
+    }
+    if (r.teardownMinutes !== undefined) {
+      if (!isNonNegSafeInt(r.teardownMinutes)) {
+        bad(`${at}(${r.id}).teardownMinutes 必须是非负安全整数`);
+      }
+      teardownMinutes = r.teardownMinutes;
+    }
+    store.resources.push({id: r.id, type: r.type, name: r.name, open, prepMinutes, teardownMinutes});
     const n = Number(r.id.slice(1));
     if (n > store.resourceSeq) store.resourceSeq = n;
   });
@@ -1504,10 +1526,33 @@ function availableSegmentsOf(
 interface CoverageGap {
   id: string;
   r: ResourceRec;
-  closures: ClosureRec[]; // 与该区间重叠的相关有效停用（按开始时间、标识排序）
+  occStart: number; // 该资源上的实际占用开始（活动开始 - 准备）
+  occEnd: number; // 该资源上的实际占用结束（活动结束 + 整理）
+  outOfRange: boolean; // 实际占用越出 0001-9999 年分钟值域
+  closures: ClosureRec[]; // 与该实际占用重叠的相关有效停用（按开始时间、标识排序）
 }
 
-// 找出实际可用时间（开放扣除有效停用）不能完整覆盖 [startMin, endMin) 的资源。
+// 分钟数 -> 文本；落在四位年份外时按外推公历日期给出可读坐标（如 0000-12-31T23:50）
+function formatMinuteLoose(min: number): string {
+  const inRange = formatDateTime(min);
+  if (inRange !== null) return inRange;
+  const day = Math.floor(min / 1440);
+  const rem = min - day * 1440;
+  const {y, m, d} = civilFromDays(day);
+  const yearText = y < 0 ? `-${String(-y).padStart(4, '0')}` : String(y).padStart(4, '0');
+  return `${yearText}-${pad2(m)}-${pad2(d)}T${pad2(Math.floor(rem / 60))}:${pad2(rem % 60)}`;
+}
+
+// 活动 [startMin, endMin) 在某资源上的实际占用（左闭右开）：
+// 活动开始减该资源自己的准备时间，活动结束加该资源自己的整理时间。
+// 每个所用资源分别扩张，不能取多个资源的最大缓冲统一扩张。
+function occupancyOnResource(r: ResourceRec, startMin: number, endMin: number): [number, number] {
+  return [startMin - r.prepMinutes, endMin + r.teardownMinutes];
+}
+
+// 找出实际可用时间不能完整覆盖“活动在各资源上实际占用”的资源。
+// 每个资源按自身准备/整理时间分别扩张；扩张后越出 0001-9999 年分钟值域的
+// 资源以 outOfRange 标记（实际占用不可能被任何开放覆盖）。
 // extraCutsById 为按资源给出的附加扣除区间（拟登记但尚未落盘的停用），同样计入。
 function findCoverageGaps(
   store: Store,
@@ -1519,23 +1564,37 @@ function findCoverageGaps(
   const gaps: CoverageGap[] = [];
   for (const id of ids) {
     const r = store.resources.find((x) => x.id === id)!;
+    const [occS, occE] = occupancyOnResource(r, startMin, endMin);
+    const outOfRange = occS < MIN_MINUTE || occE > MAX_MINUTE_EXCL;
     const extra = extraCutsById?.get(id) ?? [];
-    if (isFullyCovered(availableSegmentsOf(store, r, extra), startMin, endMin)) continue;
+    const covered = !outOfRange && isFullyCovered(availableSegmentsOf(store, r, extra), occS, occE);
+    if (covered) continue;
     const closures = activeClosuresOf(store, id).filter((c) => {
       const cs = parseDateTime(c.start, '停用开始时间');
       const ce = parseDateTime(c.end, '停用结束时间');
-      return cs < endMin && startMin < ce;
+      return cs < occE && occS < ce;
     });
-    gaps.push({id, r, closures});
+    gaps.push({id, r, occStart: occS, occEnd: occE, outOfRange, closures});
   }
   return gaps;
 }
 
-// 开放不足资源的统一展示：资源行 + 相关有效停用（标识与时间）
+// 开放不足资源的统一展示：资源行 + 实际占用 + 相关有效停用（标识与时间）
 function gapLines(gaps: CoverageGap[], indent: string): string[] {
   const lines: string[] = [];
   for (const g of gaps) {
+    if (g.outOfRange) {
+      lines.push(
+        `${indent}- ${g.id}（${g.r.name}）：实际占用 ${formatMinuteLoose(g.occStart)} → ` +
+          `${formatMinuteLoose(g.occEnd)} 越出四位年份范围（0001-9999）`,
+      );
+      continue;
+    }
     lines.push(`${indent}- ${g.id}（${g.r.name}）`);
+    lines.push(
+      `${indent}  实际占用（活动时间含准备 ${g.r.prepMinutes} 分钟、整理 ${g.r.teardownMinutes} 分钟）: ` +
+        `${formatDateTime(g.occStart)} → ${formatDateTime(g.occEnd)}`,
+    );
     for (const c of g.closures) {
       lines.push(`${indent}  相关有效停用: ${c.id}（${c.start} → ${c.end}）`);
     }
@@ -1543,23 +1602,35 @@ function gapLines(gaps: CoverageGap[], indent: string): string[] {
   return lines;
 }
 
-// 校验每个资源的实际可用时间都能完整覆盖 [startMin, endMin)
+// 校验每个资源的实际可用时间都能完整覆盖“活动在该资源上的实际占用”
 function assertOpenCoverage(store: Store, ids: string[], startMin: number, endMin: number): void {
   const failing = findCoverageGaps(store, ids, startMin, endMin);
   if (failing.length > 0) {
     throw new BizError(
-      '开放时间不足，以下资源的实际可用时间（开放区间扣除有效停用）不能完整覆盖预约区间：\n' +
+      '开放时间不足，以下资源的实际可用时间（开放区间扣除有效停用）不能完整覆盖实际占用' +
+        '（活动开始前准备、活动结束后整理均须实际可用）：\n' +
         gapLines(failing, '').join('\n'),
     );
   }
 }
 
-interface Conflict {
-  booking: BookingRec;
-  shared: string[];
+// 一个共同资源上的双方实际占用（诊断用）：按该资源自身准备/整理时间分别扩张
+interface SharedOccupancy {
+  id: string;
+  selfStart: number;
+  selfEnd: number;
+  otherStart: number;
+  otherEnd: number;
 }
 
-// 与“已预约”记录求冲突：共同资源且时间重叠（左闭右开）；可排除自身
+interface Conflict {
+  booking: BookingRec;
+  shared: SharedOccupancy[]; // 实际占用重叠的共同资源（按标识排序）
+}
+
+// 与“已预约”记录求冲突：仅共同资源上“双方实际占用”重叠（左闭右开）才算冲突；
+// 每资源分别按其自身准备/整理时间扩张，扩张后端点相接可行；可排除自身。
+// 返回每个冲突预约上全部实际占用重叠的共同资源及双方占用起止。
 function findConflicts(
   store: Store,
   ids: string[],
@@ -1567,6 +1638,7 @@ function findConflicts(
   endMin: number,
   excludeBookingId?: string,
 ): Conflict[] {
+  const byId = new Map(store.resources.map((r) => [r.id, r]));
   const wanted = new Set(ids);
   const conflicts: Conflict[] = [];
   for (const b of store.bookings) {
@@ -1574,21 +1646,60 @@ function findConflicts(
     if (excludeBookingId !== undefined && b.id === excludeBookingId) continue;
     const bStart = parseDateTime(b.start, '预约开始时间');
     const bEnd = parseDateTime(b.end, '预约结束时间');
-    const overlap = bStart < endMin && startMin < bEnd;
-    if (!overlap) continue;
-    const shared = b.resourceIds.filter((id) => wanted.has(id)).sort();
-    if (shared.length > 0) conflicts.push({booking: b, shared});
+    const shared: SharedOccupancy[] = [];
+    for (const rid of b.resourceIds) {
+      if (!wanted.has(rid)) continue;
+      const r = byId.get(rid)!;
+      const [selfS, selfE] = occupancyOnResource(r, startMin, endMin);
+      const [otherS, otherE] = occupancyOnResource(r, bStart, bEnd);
+      // 左闭右开：端点相接（selfS === otherE 或 otherS === selfE）不冲突
+      if (selfS < otherE && otherS < selfE) {
+        shared.push({id: rid, selfStart: selfS, selfEnd: selfE, otherStart: otherS, otherEnd: otherE});
+      }
+    }
+    if (shared.length > 0) {
+      shared.sort((a, b) => a.id.localeCompare(b.id));
+      conflicts.push({booking: b, shared});
+    }
   }
   conflicts.sort((a, b) => a.booking.id.localeCompare(b.booking.id));
   return conflicts;
 }
 
+// 冲突诊断：每个实际占用重叠的共同资源一行（首行带预约前缀，续行缩进），
+// 逐资源列出资源标识、名称与双方实际占用起止（准备/整理分别扩张后的区间）。
+// prefix 给出预约标识与活动时间（如 B0001（start → end））。
+function renderConflictLines(
+  store: Store,
+  shared: ReadonlyArray<SharedOccupancy>,
+  indent: string,
+  prefix: string,
+): string[] {
+  return shared.map((c, k) => {
+    const r = store.resources.find((x) => x.id === c.id)!;
+    const head = k === 0 ? `${indent}${prefix}：共同资源 ` : `${indent}  共同资源 `;
+    return (
+      `${head}${c.id}（${r.name}）；本方实际占用 ${formatMinuteLoose(c.selfStart)} → ` +
+      `${formatMinuteLoose(c.selfEnd)}，对方实际占用 ${formatMinuteLoose(c.otherStart)} → ` +
+      `${formatMinuteLoose(c.otherEnd)}`
+    );
+  });
+}
+
 function assertNoConflicts(conflicts: Conflict[], store: Store): void {
   if (conflicts.length === 0) return;
-  const lines = conflicts.map(
-    (c) => `- ${c.booking.id}：共同资源 ${formatResourceIds(store, c.shared)}`,
-  );
-  throw new BizError(`预约与以下预约冲突（共同资源时间重叠）：\n${lines.join('\n')}`);
+  const lines: string[] = [];
+  for (const c of conflicts) {
+    lines.push(
+      ...renderConflictLines(
+        store,
+        c.shared,
+        '  ',
+        `${c.booking.id}（${c.booking.start} → ${c.booking.end}）`,
+      ),
+    );
+  }
+  throw new BizError(`预约与以下预约冲突（共同资源实际占用重叠；准备/整理时间相接不算冲突）：\n${lines.join('\n')}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1613,9 +1724,9 @@ interface ValidationTarget {
 
 interface BatchTargetFailure {
   index: number; // 目标数组下标（0 基）；报告顺序与业务定位由入口决定
-  gaps: CoverageGap[]; // 实际可用时间不能完整覆盖目标的资源及相关有效停用
+  gaps: CoverageGap[]; // 实际占用不能被完整覆盖的资源及相关有效停用
   external: Conflict[]; // 与批外有效预约的冲突（按预约标识排序）
-  internal: Array<{otherIndex: number; shared: string[]}>; // 批内冲突（双方互见）
+  internal: Array<{otherIndex: number; shared: SharedOccupancy[]}>; // 批内冲突（双方互见）
 }
 
 // excludeBookingIds：本批涉及预约的标识，其当前占用不计入批外占用
@@ -1625,6 +1736,7 @@ function validateBatchTargets(
   targets: ReadonlyArray<ValidationTarget>,
   excludeBookingIds: ReadonlySet<string> = new Set<string>(),
 ): BatchTargetFailure[] {
+  const byId = new Map(store.resources.map((r) => [r.id, r]));
   const failures: BatchTargetFailure[] = [];
   for (let i = 0; i < targets.length; i++) {
     const t = targets[i];
@@ -1637,8 +1749,18 @@ function validateBatchTargets(
     for (let j = 0; j < targets.length; j++) {
       if (j === i) continue;
       const o = targets[j];
-      if (!(o.startMin < t.endMin && t.startMin < o.endMin)) continue;
-      const shared = o.resourceIds.filter((id) => wanted.has(id)).sort();
+      // 仅共同资源上“双方实际占用”重叠才算冲突：每资源按自身准备/整理分别扩张
+      const shared: SharedOccupancy[] = [];
+      for (const rid of o.resourceIds) {
+        if (!wanted.has(rid)) continue;
+        const r = byId.get(rid)!;
+        const [selfS, selfE] = occupancyOnResource(r, t.startMin, t.endMin);
+        const [otherS, otherE] = occupancyOnResource(r, o.startMin, o.endMin);
+        if (selfS < otherE && otherS < selfE) {
+          shared.push({id: rid, selfStart: selfS, selfEnd: selfE, otherStart: otherS, otherEnd: otherE});
+        }
+      }
+      shared.sort((a, b) => a.id.localeCompare(b.id));
       if (shared.length > 0) internal.push({otherIndex: j, shared});
     }
     if (gaps.length > 0 || external.length > 0 || internal.length > 0) {
@@ -1740,8 +1862,24 @@ function requireFlag(values: Map<string, string[]>, key: string): string {
 // 子命令实现
 // ---------------------------------------------------------------------------
 
+// 解析资源缓冲分钟（预约前准备/预约后整理）：非负安全整数，接受 0、拒绝小数负数
+function parseBufferMinutes(raw: string, label: string): number {
+  if (!/^(0|[1-9]\d*)$/.test(raw)) {
+    throw new BizError(`${label}非法: “${raw}”，必须是非负整数分钟`);
+  }
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n)) {
+    throw new BizError(`${label}过大: “${raw}”，必须是安全整数（不超过 ${Number.MAX_SAFE_INTEGER}）`);
+  }
+  return n;
+}
+
 async function cmdAddResource(args: string[]): Promise<void> {
-  const {values, positionals} = parseFlags(args, ['type', 'name', 'open'], ['open']);
+  const {values, positionals} = parseFlags(
+    args,
+    ['type', 'name', 'open', 'prep', 'teardown'],
+    ['open'],
+  );
   if (positionals.length > 0) throw new UsageError(`add-resource 不接受位置参数: ${positionals.join(' ')}`);
 
   const typeRaw = requireFlag(values, 'type');
@@ -1759,15 +1897,22 @@ async function cmdAddResource(args: string[]): Promise<void> {
     return [iv.start, iv.end];
   });
 
+  // 可选的预约前准备/预约后整理分钟：省略按 0；非法值（小数、负数等）拒绝
+  const prepMinutes = values.has('prep') ? parseBufferMinutes(values.get('prep')![0], '预约前准备分钟') : 0;
+  const teardownMinutes = values.has('teardown')
+    ? parseBufferMinutes(values.get('teardown')![0], '预约后整理分钟')
+    : 0;
+
   const file = activeDataFile;
   const store = await loadStoreForWrite(file);
   // 全部校验通过后才生成标识、改内存、落盘
   store.resourceSeq += 1;
   const id = `R${String(store.resourceSeq).padStart(4, '0')}`;
-  store.resources.push({id, type, name, open});
+  store.resources.push({id, type, name, open, prepMinutes, teardownMinutes});
   store.resources.sort((a, b) => a.id.localeCompare(b.id));
   await saveStore(file, store);
   console.log(`已添加资源 ${id}（${RESOURCE_TYPE_LABEL[type]}｜${name}）`);
+  console.log(`  预约前准备: ${prepMinutes} 分钟；预约后整理: ${teardownMinutes} 分钟`);
 }
 
 async function cmdListResources(args: string[]): Promise<void> {
@@ -1789,6 +1934,7 @@ async function cmdListResources(args: string[]): Promise<void> {
     for (const [s, e] of r.open) {
       console.log(`    开放: ${s} → ${e}`);
     }
+    console.log(`    预约前准备: ${r.prepMinutes} 分钟；预约后整理: ${r.teardownMinutes} 分钟`);
   }
 }
 
@@ -1822,6 +1968,22 @@ async function cmdCreateBooking(args: string[]): Promise<void> {
   console.log(`已创建预约 ${id}`);
   console.log(`  时间: ${startRaw} → ${endRaw}`);
   console.log(`  资源: ${formatResourceIds(store, ids)}`);
+  for (const line of renderOccupancyLines(store, ids, startMin, endMin)) console.log(`  ${line}`);
+}
+
+// 各资源实际占用展示行（活动起止按资源自身准备/整理分别扩张）；全部为 0 时不输出
+function renderOccupancyLines(store: Store, ids: string[], startMin: number, endMin: number): string[] {
+  const lines: string[] = [];
+  for (const id of ids) {
+    const r = store.resources.find((x) => x.id === id)!;
+    if (r.prepMinutes === 0 && r.teardownMinutes === 0) continue;
+    const [occS, occE] = occupancyOnResource(r, startMin, endMin);
+    lines.push(
+      `${id}（${r.name}）实际占用: ${formatDateTime(occS)} → ${formatDateTime(occE)}` +
+        `（准备 ${r.prepMinutes} 分钟、整理 ${r.teardownMinutes} 分钟）`,
+    );
+  }
+  return lines;
 }
 
 async function cmdRescheduleBooking(args: string[]): Promise<void> {
@@ -1873,6 +2035,7 @@ async function cmdRescheduleBooking(args: string[]): Promise<void> {
   if (booking.seriesId) console.log(`  所属系列: ${booking.seriesId}（改期后仍属该系列）`);
   console.log(`  时间: ${startRaw} → ${endRaw}`);
   console.log(`  资源: ${formatResourceIds(store, ids)}`);
+  for (const line of renderOccupancyLines(store, ids, startMin, endMin)) console.log(`  ${line}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2069,18 +2232,26 @@ async function cmdRescheduleBatch(args: string[]): Promise<void> {
         lines.push(...gapLines(f.gaps, '    '));
       }
       if (f.external.length + f.internal.length > 0) {
-        lines.push('  冲突预约:');
+        lines.push('  冲突预约（共同资源实际占用重叠）:');
         for (const c of f.external) {
           lines.push(
-            `    - ${c.booking.id}（${c.booking.start} → ${c.booking.end}）` +
-              `：共同资源 ${formatResourceIds(store, c.shared)}`,
+            ...renderConflictLines(
+              store,
+              c.shared,
+              '    ',
+              `${c.booking.id}（${c.booking.start} → ${c.booking.end}）`,
+            ),
           );
         }
         for (const x of f.internal) {
           const o = targets[x.otherIndex];
           lines.push(
-            `    - ${o.booking.id}（本批第 ${o.index + 1} 项目标 ${o.startRaw} → ${o.endRaw}）` +
-              `：共同资源 ${formatResourceIds(store, x.shared)}`,
+            ...renderConflictLines(
+              store,
+              x.shared,
+              '    ',
+              `${o.booking.id}（本批第 ${o.index + 1} 项目标 ${o.startRaw} → ${o.endRaw}）`,
+            ),
           );
         }
       }
@@ -2314,18 +2485,26 @@ async function cmdUndoBatchOp(args: string[]): Promise<void> {
         lines.push(...gapLines(f.gaps, '    '));
       }
       if (f.external.length + f.internal.length > 0) {
-        lines.push('  冲突预约:');
+        lines.push('  冲突预约（共同资源实际占用重叠）:');
         for (const c of f.external) {
           lines.push(
-            `    - ${c.booking.id}（${c.booking.start} → ${c.booking.end}）` +
-              `：共同资源 ${formatResourceIds(store, c.shared)}`,
+            ...renderConflictLines(
+              store,
+              c.shared,
+              '    ',
+              `${c.booking.id}（${c.booking.start} → ${c.booking.end}）`,
+            ),
           );
         }
         for (const x of f.internal) {
           const o = op.items[x.otherIndex];
           lines.push(
-            `    - ${o.bookingId}（本操作第 ${x.otherIndex + 1} 项恢复为 ${o.before.start} → ${o.before.end}）` +
-              `：共同资源 ${formatResourceIds(store, x.shared)}`,
+            ...renderConflictLines(
+              store,
+              x.shared,
+              '    ',
+              `${o.bookingId}（本操作第 ${x.otherIndex + 1} 项恢复为 ${o.before.start} → ${o.before.end}）`,
+            ),
           );
         }
       }
@@ -2491,20 +2670,29 @@ async function cmdCreateSeries(args: string[]): Promise<void> {
         lines.push(...gapLines(f.gaps, '    '));
       }
       if (f.external.length > 0) {
-        lines.push('  与以下既有预约冲突:');
+        lines.push('  与以下既有预约冲突（共同资源实际占用重叠）:');
         for (const c of f.external) {
           lines.push(
-            `    - ${c.booking.id}（${c.booking.start} → ${c.booking.end}）` +
-              `：共同资源 ${formatResourceIds(store, c.shared)}`,
+            ...renderConflictLines(
+              store,
+              c.shared,
+              '    ',
+              `${c.booking.id}（${c.booking.start} → ${c.booking.end}）`,
+            ),
           );
         }
       }
       if (f.internal.length > 0) {
-        lines.push('  与系列内其他成员冲突:');
+        lines.push('  与系列内其他成员冲突（共同资源实际占用重叠）:');
         for (const x of f.internal) {
           const o = members[x.otherIndex];
           lines.push(
-            `    - 第 ${x.otherIndex + 1} 项（${o.startRaw} → ${o.endRaw}）：双方时间重叠`,
+            ...renderConflictLines(
+              store,
+              x.shared,
+              '    ',
+              `第 ${x.otherIndex + 1} 项（${o.startRaw} → ${o.endRaw}）`,
+            ),
           );
         }
       }
@@ -2733,14 +2921,17 @@ async function cmdAddFlexWaitlist(args: string[]): Promise<void> {
     );
   }
 
-  // 登记忽略预约占用；只要求窗口内全部资源的“共同实际可用时间”
-  // （开放合并扣除有效停用并集，无需整窗开放）存在能容纳完整时长的连续区间
-  const common = commonAvailableSegments(store, ids, win.startMin, win.endMin);
+  // 登记忽略预约占用；只要求窗口内全部资源存在共同“可供活动区间”——各资源的
+  // 实际可用时间扣除自身前后预留（[a+准备,b-整理)）后取交并裁进窗口（窗口只
+  // 限制活动起止，准备/整理可伸出窗口但仍须实际可用），其中须有容纳完整时长的
+  // 连续区间
+  const common = commonActivityAvailableSegments(store, ids, win.startMin, win.endMin);
   if (!common.some(([s, e]) => e - s >= durationMinutes)) {
     const lines = [
-      `弹性候补登记失败：窗口 ${win.start} → ${win.end} 内，全部资源的共同实际可用时间` +
-        `不存在长度不少于 ${durationMinutes} 分钟的连续区间（登记忽略预约占用，无需整窗开放）。`,
-      '窗口内全部最大共同实际可用区间（开放区间合并重叠或相接后扣除有效停用并集）:',
+      `弹性候补登记失败：窗口 ${win.start} → ${win.end} 内，扣除各资源预约前准备、` +
+        `预约后整理预留后的全部资源共同可供活动时间，不存在长度不少于 ${durationMinutes} ` +
+        '分钟的连续区间（登记忽略预约占用，无需整窗开放）。',
+      '窗口内全部最大共同可供活动区间（实际可用扣除各资源自身前后预留后取交）:',
     ];
     if (common.length === 0) {
       lines.push('  （空集：窗口内全部资源没有任何共同实际可用时间）');
@@ -2832,8 +3023,10 @@ async function cmdCancelWaitlist(args: string[]): Promise<void> {
   console.log(`已取消候补 ${id}，记录保留；该候补不再参与 process-waitlist 处理。`);
 }
 
-// 弹性项的窗口占用：与任一资源的有效预约（含本轮已选新预约）时间重叠即计入；
-// 全部资源必须同时连续空闲，故任一资源被占都使该时刻不可安排。
+// 弹性项的窗口内活动坐标占用：有效预约（含本轮已选新预约）在任一相关资源上的
+// 活动坐标阻挡都计入——预约活动 [bs,be) 对资源 r 的新活动阻挡
+// [bs-(准备_r+整理_r), be+(准备_r+整理_r))（仅缓冲端点相接不阻挡）；
+// 全部资源必须同时连续空闲，故任一资源被占都使该活动时刻不可安排。
 // 返回裁剪到窗口内并合并后的占用区间。
 function flexBusySegments(
   store: Store,
@@ -2842,27 +3035,34 @@ function flexBusySegments(
   wEnd: number,
 ): Array<[number, number]> {
   const wanted = new Set(ids);
+  const byId = new Map(store.resources.map((r) => [r.id, r]));
   const cuts: Array<[number, number]> = [];
   for (const b of store.bookings) {
     if (b.status !== 'active') continue;
     if (!b.resourceIds.some((id) => wanted.has(id))) continue;
     const bStart = parseDateTime(b.start, '预约开始时间');
     const bEnd = parseDateTime(b.end, '预约结束时间');
-    const a = Math.max(bStart, wStart);
-    const c = Math.min(bEnd, wEnd);
-    if (a < c) cuts.push([a, c]);
+    for (const rid of b.resourceIds) {
+      if (!wanted.has(rid)) continue;
+      const buf = (byId.get(rid)!.prepMinutes ?? 0) + (byId.get(rid)!.teardownMinutes ?? 0);
+      const a = Math.max(bStart - buf, wStart);
+      const c = Math.min(bEnd + buf, wEnd);
+      if (a < c) cuts.push([a, c]);
+    }
   }
   return mergeIntervals(cuts);
 }
 
-// 弹性项在窗口内的全部最大共同空闲区间（共同实际可用扣除有效预约与本轮已选占用）
+// 弹性项在窗口内的全部最大共同空闲区间（活动坐标）：
+// 共同“可供活动区间”（各资源扣除自身前后预留后取交、裁进窗口）再扣除有效预约
+// 与本轮已选占用在活动坐标下的阻挡
 function flexFreeSegments(
   store: Store,
   w: WaitlistRec,
 ): Array<[number, number]> {
   const wStart = parseDateTime(w.start, '弹性窗口开始时间');
   const wEnd = parseDateTime(w.end, '弹性窗口结束时间');
-  const common = commonAvailableSegments(store, w.resourceIds, wStart, wEnd);
+  const common = commonActivityAvailableSegments(store, w.resourceIds, wStart, wEnd);
   return subtractSegments(common, flexBusySegments(store, w.resourceIds, wStart, wEnd));
 }
 
@@ -2983,6 +3183,9 @@ async function cmdProcessWaitlist(args: string[]): Promise<void> {
       if (w.kind === 'flexible') console.log(`    原请求: ${renderWaitlistRequest(w)}`);
       console.log(`    实际时间: ${s.startRaw} → ${s.endRaw}`);
       console.log(`    资源: ${formatResourceIds(store, w.resourceIds)}`);
+      for (const line of renderOccupancyLines(store, w.resourceIds, s.startMin, s.endMin)) {
+        console.log(`    ${line}`);
+      }
     } else {
       console.log(renderBlocked(store, w, fromWaitlistByBooking));
     }
@@ -3008,14 +3211,18 @@ function renderBlocked(
     }
     const conflicts = findConflicts(store, w.resourceIds, startMin, endMin);
     if (conflicts.length > 0) {
-      lines.push('    冲突预约（共同资源时间重叠）:');
+      lines.push('    冲突预约（共同资源实际占用重叠）:');
       for (const c of conflicts) {
         const fromId = fromWaitlistByBooking.get(c.booking.id);
         const note = fromId ? `（本轮新预约，兑现自候补 ${fromId}）` : '';
-        lines.push(
-          `      - ${c.booking.id}${note}（${c.booking.start} → ${c.booking.end}）` +
-            `：共同资源 ${formatResourceIds(store, c.shared)}`,
-        );
+        c.shared.forEach((sh, k) => {
+          const r = store.resources.find((x) => x.id === sh.id)!;
+          const head = k === 0 ? `${c.booking.id}${note}（${c.booking.start} → ${c.booking.end}）` : '';
+          lines.push(
+            `      - ${head}共同资源 ${sh.id}（${r.name}）；本方实际占用 ${formatMinuteLoose(sh.selfStart)} → ` +
+              `${formatMinuteLoose(sh.selfEnd)}，对方实际占用 ${formatMinuteLoose(sh.otherStart)} → ${formatMinuteLoose(sh.otherEnd)}`,
+          );
+        });
       }
     }
     return lines.join('\n');
@@ -3023,7 +3230,10 @@ function renderBlocked(
 
   // 弹性项：按最终安排列出窗口内全部最大共同空闲区间及分钟数（按开始时间排序）
   const free = flexFreeSegments(store, w);
-  lines.push('    窗口内全部最大共同空闲区间（全部资源同时连续可用，按开始时间排序）:');
+  lines.push(
+    '    窗口内全部最大共同空闲区间（全部资源同时连续可用；已扣除预约占用与各资源' +
+      '预约前准备、预约后整理预留，按开始时间排序）:',
+  );
   if (free.length === 0) {
     lines.push('      （空集：窗口内全部资源没有任何共同空闲区间，无法容纳所需连续时长）');
   } else {
@@ -3036,13 +3246,16 @@ function renderBlocked(
 // 候选资源组合的最早可行时段查询（find-slot，只读）
 //
 // 给定营业地时间窗口、所需连续分钟数与有顺序的需求组（每组列出可任选其一的
-// 已登记资源），在窗口内寻找能同时满足全部需求的最早开始分钟：每组恰选一个
-// 候选，全部所选资源互不相同，并在整个时段保持同一组合（不中途更换资源、
-// 不拼接间断时间）。各资源空闲时间 = 开放区间合并重叠或相接后扣除有效停用
-// 并集与当前有效预约占用（取消的预约/停用与未兑现候补不阻挡），区间左闭
-// 右开、端点相接可行。同一最早开始有多个组合时，按组顺序的资源标识序列取
-// 字典序最小者。本命令只读一份完整快照：不取写入保护、不创建任何记录、
-// 不写数据文件或推进计数；方案不保留位置，后续创建预约仍检查最新状态。
+// 已登记资源），在窗口内寻找能同时满足全部需求的最早活动开始分钟：每组恰选
+// 一个候选，全部所选资源互不相同，并在整个活动时段保持同一组合（不中途更换
+// 资源、不拼接间断时间）。窗口只限制活动起止；每个资源的实际占用为活动开始
+// 减其自身准备、活动结束加其自身整理（不取统一最大缓冲），准备/整理可伸出
+// 窗口但仍须实际可用。各资源活动坐标下的空闲时间 =（开放合并扣除有效停用后
+// 各段 [a,b) 化为 [a+准备,b-整理)）再扣除当前有效预约按各自缓冲扩张的阻挡
+// （取消的预约/停用与未兑现候补不阻挡），区间左闭右开、实际占用端点相接可行。
+// 同一最早开始有多个组合时，按组顺序的资源标识序列取字典序最小者。本命令只读
+// 一份完整快照：不取写入保护、不创建任何记录、不写数据文件或推进计数；方案不
+// 保留位置，后续创建预约仍检查最新状态。
 // ---------------------------------------------------------------------------
 
 interface RequirementGroup {
@@ -3074,33 +3287,70 @@ function parseRequirementGroups(store: Store, rawGroups: string[]): RequirementG
   });
 }
 
-// 单个资源在窗口内的空闲区间：实际可用时间（开放合并后扣除有效停用并集）
-// 裁进窗口，再扣除该资源当前有效预约的占用（普通预约、系列成员、导入预约与
-// 候补兑现预约均按当前安排占用；已取消不占用）；
-// excludeBookingIds 中的预约（弹性批量改期、停用同次改期的本批预约）旧占用不计；
-// extraCuts 为拟登记但尚未落盘的停用区间（add-closure 附改期清单时计入）
-function resourceFreeSegments(
+// 单个资源在“活动时间坐标”下、活动窗口 [wStart, wEnd) 内的可供活动区间（不计预约占用）。
+// 窗口只限制活动起止；准备/整理可伸出窗口，但仍须落在实际可用时间内：
+//   实际可用段 [a,b)（开放合并扣除有效停用，extraCuts 为拟登记停用）
+//     -> 活动可行段 [a+准备, b-整理)（活动 [s,e) 须使 [s-准备,e+整理) 被完整覆盖），
+// 再裁进活动窗口。可行即意味着实际占用未越出 0001-9999 年（可用段本身在年份域内）。
+function resourceActivityAvailableSegments(
   store: Store,
-  id: string,
+  r: ResourceRec,
+  wStart: number,
+  wEnd: number,
+  extraCuts: ReadonlyArray<[number, number]> = [],
+): Array<[number, number]> {
+  const shifted: Array<[number, number]> = [];
+  for (const [a, b] of availableSegmentsOf(store, r, extraCuts)) {
+    const s = a + r.prepMinutes;
+    const e = b - r.teardownMinutes;
+    if (s < e) shifted.push([s, e]);
+  }
+  return clipSegments(mergeIntervals(shifted), wStart, wEnd);
+}
+
+// 单个资源在“活动时间坐标”下、活动窗口内的空闲区间：可供活动区间再扣除当前
+// 有效预约在活动坐标下的阻挡（普通预约、系列成员、导入预约与候补兑现预约均按
+// 当前安排占用；已取消不占用）。预约活动 [bs,be) 对新活动阻挡
+// [bs-(准备+整理), be+(准备+整理))——仅准备/整理端点相接时不重叠，自然可行。
+// excludeBookingIds 中的预约（弹性改期、停用同次改期的本批预约）旧占用不计；
+// extraCuts 为拟登记但尚未落盘的停用区间（add-closure 附改期清单时计入）。
+function resourceActivityFreeSegments(
+  store: Store,
+  r: ResourceRec,
   wStart: number,
   wEnd: number,
   excludeBookingIds: ReadonlySet<string> = new Set<string>(),
   extraCuts: ReadonlyArray<[number, number]> = [],
 ): Array<[number, number]> {
-  const r = store.resources.find((x) => x.id === id)!;
-  const available = clipSegments(availableSegmentsOf(store, r, extraCuts), wStart, wEnd);
+  const free = resourceActivityAvailableSegments(store, r, wStart, wEnd, extraCuts);
+  const buf = r.prepMinutes + r.teardownMinutes;
   const busy: Array<[number, number]> = [];
-  for (const b of store.bookings) {
-    if (b.status !== 'active') continue;
-    if (excludeBookingIds.has(b.id)) continue;
-    if (!b.resourceIds.includes(id)) continue;
-    const bStart = parseDateTime(b.start, '预约开始时间');
-    const bEnd = parseDateTime(b.end, '预约结束时间');
-    const a = Math.max(bStart, wStart);
-    const c = Math.min(bEnd, wEnd);
-    if (a < c) busy.push([a, c]);
+  for (const bk of store.bookings) {
+    if (bk.status !== 'active') continue;
+    if (excludeBookingIds.has(bk.id)) continue;
+    if (!bk.resourceIds.includes(r.id)) continue;
+    const bs = parseDateTime(bk.start, '预约开始时间');
+    const be = parseDateTime(bk.end, '预约结束时间');
+    busy.push([bs - buf, be + buf]);
   }
-  return subtractSegments(available, busy);
+  return busy.length === 0 ? free : subtractSegments(free, mergeIntervals(busy));
+}
+
+// 窗口内全部资源在活动坐标下的共同“实际可行”区间（不计预约占用）：
+// 各资源 [a+准备,b-整理) 段裁进窗口后逐组求交——弹性候补登记时用（登记忽略占用）
+function commonActivityAvailableSegments(
+  store: Store,
+  ids: string[],
+  wStart: number,
+  wEnd: number,
+): Array<[number, number]> {
+  let common: Array<[number, number]> = [[wStart, wEnd]];
+  for (const id of ids) {
+    const r = store.resources.find((x) => x.id === id)!;
+    common = intersectSegments(common, resourceActivityAvailableSegments(store, r, wStart, wEnd));
+    if (common.length === 0) break;
+  }
+  return common;
 }
 
 // 固定开始分钟上的字典序最小可行资源序列：逐组按标识升序试探，
@@ -3167,7 +3417,10 @@ function findEarliestSlot(
   for (const g of groups) {
     for (const id of g.candidates) {
       if (freeById.has(id)) continue;
-      const free = resourceFreeSegments(store, id, wStart, wEnd);
+      // 活动坐标下的空闲区间：窗口只限制活动起止，各资源准备/整理可伸出窗口
+      // 但须实际可用；仅准备/整理重叠时该活动起点已被排除，端点相接可行
+      const r = store.resources.find((x) => x.id === id)!;
+      const free = resourceActivityFreeSegments(store, r, wStart, wEnd);
       freeById.set(id, free);
       for (const [s, e] of free) {
         if (e - s >= duration) starts.add(s);
@@ -3237,12 +3490,15 @@ async function cmdFindSlot(args: string[]): Promise<void> {
     // 理论不可达：窗口已校验在 0001-9999 内，时段不超出窗口
     throw new BizError('可行时段超出四位年份范围');
   }
-  console.log(`最早可行时段: ${startRaw} → ${endRaw}（${durationMinutes} 分钟）`);
+  console.log(`最早可行时段: ${startRaw} → ${endRaw}（${durationMinutes} 分钟，活动时间）`);
   console.log('所选资源（按需求组顺序，全程保持同一组合）:');
   found.picks.forEach((id, i) => {
     const r = store.resources.find((x) => x.id === id)!;
     console.log(`  第 ${i + 1} 组: ${id}（${r.name}，${RESOURCE_TYPE_LABEL[r.type]}）`);
   });
+  for (const line of renderOccupancyLines(store, found.picks, found.startMin, found.endMin)) {
+    console.log(`  ${line}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3597,13 +3853,17 @@ function* assignmentsInLexOrder(
 // 首个完整方案即“逐项先比开始分钟、再比资源序列”的最小方案。
 function solveFlexPlan(store: Store, items: FlexPlanItem[]): FlexPlacement[] | null {
   const n = items.length;
-  // 每项各候选资源的基础空闲段：实际可用时间（开放合并后扣除有效停用并集）
-  // 裁进自身窗口，再扣除当前有效预约占用（已取消预约/停用与未兑现候补不阻挡）
+  // 每项各候选资源的基础空闲段：活动坐标下 [a+准备,b-整理) 裁进自身窗口（窗口只
+  // 限制活动起止，准备/整理可伸出窗口但须实际可用），再扣除当前有效预约按活动坐标
+  // 的扩张阻挡（已取消预约/停用与未兑现候补不阻挡；端点相接可行）
   const baseFree: Array<Map<string, Array<[number, number]>>> = items.map((it) => {
     const m = new Map<string, Array<[number, number]>>();
     for (const g of it.groups) {
       for (const id of g.candidates) {
-        if (!m.has(id)) m.set(id, resourceFreeSegments(store, id, it.startMin, it.endMin));
+        if (!m.has(id)) {
+          const r = store.resources.find((x) => x.id === id)!;
+          m.set(id, resourceActivityFreeSegments(store, r, it.startMin, it.endMin));
+        }
       }
     }
     return m;
@@ -3611,23 +3871,30 @@ function solveFlexPlan(store: Store, items: FlexPlanItem[]): FlexPlacement[] | n
 
   // 候选开始分钟闭包：
   // 1) 基础空闲段起点；
-  // 2) “被其他项占用结束顶住”的起点 s_i = s_j + d_j（仅候选资源集合有交集的项
-  //    之间传播，对应共同资源左闭右开冲突的边界）；
-  // 3) 项间关系边界：关系 p -> q（间隔 [lo,hi]）要求 s_p + d_p + lo <= s_q
-  //    <= s_p + d_p + hi。已知 s_p 时 s_q 的边界为 s_p+d_p+lo、s_p+d_p+hi；
-  //    已知 s_q 时 s_p 的边界为 s_q-d_p-hi、s_q-d_p-lo（关系可逆清单顺序、
-  //    也适用于不同资源的项）。
+  // 2) “被其他项在共同资源上的实际占用结束顶住”的起点：若共同候选资源为 r，
+  //    j 在 r 上占用至 s_j+d_j+整理_r，i 在 r 上自 s_i-准备_r 起占用，相接可行
+  //    给出 s_i = s_j + d_j + 准备_r + 整理_r（仅候选资源集合有交集的项之间，
+  //    逐共同资源传播其缓冲；不能取统一最大缓冲）；
+  // 3) 项间关系边界：关系按活动时间计算（前项活动结束到后项活动开始），与缓冲
+  //    无关。关系 p -> q（间隔 [lo,hi]）要求 s_p + d_p + lo <= s_q <= s_p+d_p+hi。
+  //    已知 s_p 时 s_q 的边界为 s_p+d_p+lo、s_p+d_p+hi；已知 s_q 时 s_p 的边界
+  //    为 s_q-d_p-hi、s_q-d_p-lo（关系可逆清单顺序、也适用于不同资源的项）。
   // 最小方案中每项的开始必落在自身窗口内某约束边界的闭包上（按开始分钟归纳：
   // 若两侧均不贴边界即可整体平移至更小开始，与最小性矛盾），闭包在有限整数
-  // 值域（各项窗内）上迭代必收敛。
+  // 值域（各项窗内）上迭代必收敛。枚举全部共同候选资源的缓冲边界是超集：
+  // 多余候选不可行即跳过，不改变最小方案。
   const candidateIds = items.map((it) => {
     const set = new Set<string>();
     for (const g of it.groups) for (const id of g.candidates) set.add(id);
     return set;
   });
-  const sharesCandidate = (a: number, b: number): boolean => {
-    for (const id of candidateIds[a]) if (candidateIds[b].has(id)) return true;
-    return false;
+  const bufferById = new Map(store.resources.map((r) => [r.id, r.prepMinutes + r.teardownMinutes]));
+  const conflictBoundsFrom = (j: number, s: number, i: number): number[] => {
+    const out: number[] = [];
+    for (const id of candidateIds[j]) {
+      if (candidateIds[i].has(id)) out.push(s + items[j].duration + (bufferById.get(id) ?? 0));
+    }
+    return out;
   };
   // 关系邻接：incoming[i] 已按后项归并；outgoing 供“先放置后项、后放置前项”
   // （逆清单顺序关系）时在放置前项处统一检查
@@ -3670,9 +3937,9 @@ function solveFlexPlan(store: Store, items: FlexPlanItem[]): FlexPlacement[] | n
       for (const s of candStarts[j]) {
         for (let i = 0; i < n; i++) {
           if (i === j) continue;
-          // 2) 共同资源冲突边界：i 紧接 j 之后开始
-          if (sharesCandidate(i, j)) add(i, s + items[j].duration);
-          // 3) 项间关系边界
+          // 2) 共同资源冲突边界：逐共同候选资源按其各自准备+整理传播
+          for (const t of conflictBoundsFrom(j, s, i)) add(i, t);
+          // 3) 项间关系边界（按活动时间，与缓冲无关）
           const a = Math.min(i, j);
           const b = Math.max(i, j);
           for (const rel of relBetween.get(`${a},${b}`) ?? []) {
@@ -3691,7 +3958,9 @@ function solveFlexPlan(store: Store, items: FlexPlanItem[]): FlexPlacement[] | n
     }
   }
 
-  // 已放置项的开始/结束（未放置为 null）与对各资源的占用（随试探入栈/出栈增减）
+  // 已放置项的开始/结束（未放置为 null）与对各资源的活动坐标阻挡（随试探入栈/
+  // 出栈增减）：项在资源 r 上实际占用 [s-准备_r, e+整理_r)，换成对其他活动的
+  // 活动坐标阻挡即 [s-(准备_r+整理_r), e+(准备_r+整理_r))，与 baseFree 同坐标
   const placedStart = new Array<number | null>(n).fill(null);
   const placedEnd = new Array<number | null>(n).fill(null);
   const occById = new Map<string, Array<[number, number]>>();
@@ -3736,8 +4005,10 @@ function solveFlexPlan(store: Store, items: FlexPlanItem[]): FlexPlacement[] | n
       };
       for (const picks of assignmentsInLexOrder(it.groups, usable)) {
         for (const id of picks) {
+          // 活动坐标阻挡：[s-(准备+整理), e+(准备+整理))，按所选资源各自缓冲
+          const buf = bufferById.get(id) ?? 0;
           const occ = occById.get(id) ?? [];
-          occ.push([s, e]);
+          occ.push([s - buf, e + buf]);
           occById.set(id, occ);
         }
         placedStart[idx] = s;
@@ -4037,24 +4308,39 @@ function solveFlexReschedule(
     for (const g of it.groups) {
       for (const id of g.candidates) {
         if (!m.has(id)) {
-          m.set(id, resourceFreeSegments(store, id, it.startMin, it.endMin, batchIds, extraCutsById?.get(id) ?? []));
+          const r = store.resources.find((x) => x.id === id)!;
+          m.set(
+            id,
+            resourceActivityFreeSegments(
+              store,
+              r,
+              it.startMin,
+              it.endMin,
+              batchIds,
+              extraCutsById?.get(id) ?? [],
+            ),
+          );
         }
       }
     }
     return m;
   });
 
-  // 候选开始分钟闭包：基础空闲段起点 ∪ 各项当前开始（在窗内时），
-  // 加上“被其他项占用结束顶住”的起点 s_i = s_j + d_j
-  // （仅候选资源集合有交集的项之间传播；值域有限，必收敛）
+  // 候选开始分钟闭包：基础空闲段起点 ∪ 各项当前开始（在窗内时），加上“被其他项
+  // 在共同资源上的实际占用结束顶住”的起点——逐共同候选资源按其各自准备+整理
+  // 传播 s_i = s_j + d_j + 准备_r + 整理_r（不取统一最大缓冲；值域有限，必收敛）
+  const bufferById = new Map(store.resources.map((r) => [r.id, r.prepMinutes + r.teardownMinutes]));
   const candidateIds = items.map((it) => {
     const set = new Set<string>();
     for (const g of it.groups) for (const id of g.candidates) set.add(id);
     return set;
   });
-  const sharesCandidate = (a: number, b: number): boolean => {
-    for (const id of candidateIds[a]) if (candidateIds[b].has(id)) return true;
-    return false;
+  const conflictBoundsFrom = (j: number, s: number, i: number): number[] => {
+    const out: number[] = [];
+    for (const id of candidateIds[j]) {
+      if (candidateIds[i].has(id)) out.push(s + items[j].duration + (bufferById.get(id) ?? 0));
+    }
+    return out;
   };
   const candStarts: Array<Set<number>> = items.map((it, i) => {
     const set = new Set<number>();
@@ -4074,23 +4360,24 @@ function solveFlexReschedule(
     changed = false;
     for (let j = 0; j < items.length; j++) {
       for (let i = 0; i < items.length; i++) {
-        if (i === j || !sharesCandidate(i, j)) continue;
+        if (i === j) continue;
         for (const s of candStarts[j]) {
-          const t = s + items[j].duration;
-          if (
-            t >= items[i].startMin &&
-            t + items[i].duration <= items[i].endMin &&
-            !candStarts[i].has(t)
-          ) {
-            candStarts[i].add(t);
-            changed = true;
+          for (const t0 of conflictBoundsFrom(j, s, i)) {
+            if (
+              t0 >= items[i].startMin &&
+              t0 + items[i].duration <= items[i].endMin &&
+              !candStarts[i].has(t0)
+            ) {
+              candStarts[i].add(t0);
+              changed = true;
+            }
           }
         }
       }
     }
   }
 
-  // 已放置项对各资源的占用（随试探入栈/出栈增减；不变项同样放置以阻挡他项）
+  // 已放置项对各资源的活动坐标阻挡（随试探入栈/出栈增减；不变项同样放置以阻挡他项）
   const occById = new Map<string, Array<[number, number]>>();
 
   // 按清单顺序深度优先：开始分钟升序、同一开始的资源序列字典序升序，
@@ -4119,8 +4406,10 @@ function solveFlexReschedule(
         const cost = s === it.curStartMin && sameResourceSet(picks, it.curResourceIds) ? 0 : 1;
         if (cost > budget) continue;
         for (const id of picks) {
+          // 活动坐标阻挡：[s-(准备+整理), e+(准备+整理))，按所选资源各自缓冲
+          const buf = bufferById.get(id) ?? 0;
           const occ = occById.get(id) ?? [];
-          occ.push([s, e]);
+          occ.push([s - buf, e + buf]);
           occById.set(id, occ);
         }
         const rest = search(idx + 1, budget - cost);
@@ -4265,8 +4554,9 @@ function formatBusinessDate(dayIndex: number): string {
   return `${String(y).padStart(4, '0')}-${pad2(m)}-${pad2(d)}`;
 }
 
-// 某资源在窗口内的占用区间：全部有效预约按当前时间与当前资源裁剪进窗口，
-// 再与实际可用区间求交；同一资源的重叠占用合并，一分钟只计一次
+// 某资源在窗口内的实际占用区间：全部有效预约的活动起止按该资源自身准备/整理
+// 时间分别扩张（活动开始-准备 → 活动结束+整理），裁进窗口后与实际可用区间求交；
+// 同一资源的重叠占用合并，一分钟只计一次
 function occupiedSegmentsOf(
   store: Store,
   resourceId: string,
@@ -4274,13 +4564,15 @@ function occupiedSegmentsOf(
   wStart: number,
   wEnd: number,
 ): Array<[number, number]> {
+  const r = store.resources.find((x) => x.id === resourceId)!;
   const raw: Array<[number, number]> = [];
   for (const b of store.bookings) {
     if (b.status !== 'active' || !b.resourceIds.includes(resourceId)) continue;
     const bs = parseDateTime(b.start, '预约开始时间');
     const be = parseDateTime(b.end, '预约结束时间');
-    const s = Math.max(bs, wStart);
-    const e = Math.min(be, wEnd);
+    const [occS, occE] = occupancyOnResource(r, bs, be);
+    const s = Math.max(occS, wStart);
+    const e = Math.min(occE, wEnd);
     if (s < e) raw.push([s, e]);
   }
   return intersectSegments(available, mergeIntervals(raw));
@@ -4424,6 +4716,17 @@ const CLOSURE_STATUS_LABEL: Record<ClosureStatus, string> = {
   cancelled: '已取消',
 };
 
+// 受停用影响预约的清单行：缓冲为 0 时实际占用即活动时间（沿用旧写法）；
+// 该资源有准备/整理时另附实际占用起止
+function formatAffectedBookingLine(resource: ResourceRec, b: BookingRec): string {
+  const base = `- ${b.id}（${b.start} → ${b.end}）`;
+  if (resource.prepMinutes === 0 && resource.teardownMinutes === 0) return base;
+  const bs = parseDateTime(b.start, '预约开始时间');
+  const be = parseDateTime(b.end, '预约结束时间');
+  const [occS, occE] = occupancyOnResource(resource, bs, be);
+  return `${base}（活动时间；实际占用 ${formatDateTime(occS)} → ${formatDateTime(occE)}）`;
+}
+
 async function cmdAddClosure(args: string[]): Promise<void> {
   const {values, positionals} = parseFlags(args, ['resource', 'start', 'end']);
   if (positionals.length > 1) {
@@ -4448,22 +4751,24 @@ async function cmdAddClosure(args: string[]): Promise<void> {
   }
 
   // 登记前检查该资源的全部有效预约（含系列成员与候补兑现预约；已取消不阻挡）。
-  // 区间左闭右开，端点相接不算重叠。
+  // 按该资源上的“实际占用”（活动开始-准备、活动结束+整理）与停用区间求重叠；
+  // 停用自身不扩张，区间左闭右开，端点相接不算重叠。
   const overlapping = store.bookings
     .filter((b) => {
       if (b.status !== 'active' || !b.resourceIds.includes(resourceId)) return false;
       const bs = parseDateTime(b.start, '预约开始时间');
       const be = parseDateTime(b.end, '预约结束时间');
-      return bs < endMin && startMin < be;
+      const [occS, occE] = occupancyOnResource(resource, bs, be);
+      return occS < endMin && startMin < occE;
     })
     .sort((a, b) => a.id.localeCompare(b.id));
 
-  // 不附清单：沿用原规则——有任何有效预约重叠即拒绝，不改期或取消任何预约。
+  // 不附清单：沿用原规则——有任何有效预约的实际占用重叠即拒绝，不改期或取消任何预约。
   if (manifestPath === undefined) {
     if (overlapping.length > 0) {
-      const lines = overlapping.map((b) => `- ${b.id}（${b.start} → ${b.end}）`);
+      const lines = overlapping.map((b) => formatAffectedBookingLine(resource, b));
       throw new BizError(
-        `无法登记停用：资源 ${resourceId}（${resource.name}）在该区间存在有效预约` +
+        `无法登记停用：资源 ${resourceId}（${resource.name}）在该区间与有效预约的实际占用重叠` +
           `（不自动改期或取消，请先处理，或附加本地弹性改期清单一次提交停用与替代安排）：\n${lines.join('\n')}`,
       );
     }
@@ -4481,10 +4786,11 @@ async function cmdAddClosure(args: string[]): Promise<void> {
   const listed = new Set(items.map((it) => it.booking.id));
   const missing = overlapping.filter((b) => !listed.has(b.id));
   if (missing.length > 0) {
-    const lines = missing.map((b) => `- ${b.id}（${b.start} → ${b.end}）`);
+    const lines = missing.map((b) => formatAffectedBookingLine(resource, b));
     throw new BizError(
       `无法登记停用：资源 ${resourceId}（${resource.name}）在该区间存在 ${missing.length} 项` +
-        `有效预约未纳入改期清单（重叠预约必须全部列入，可再额外列入为腾挪而调整的预约）：\n${lines.join('\n')}`,
+        '有效预约未纳入改期清单（按该资源上的实际占用识别；重叠预约必须全部列入，' +
+        `可再额外列入为腾挪而调整的预约）：\n${lines.join('\n')}`,
     );
   }
 
@@ -5324,21 +5630,29 @@ async function cmdImportIcal(args: string[]): Promise<void> {
         lines.push(...gapLines(f.gaps, '    '));
       }
       if (f.external.length > 0) {
-        lines.push('  冲突预约:');
+        lines.push('  冲突预约（共同资源实际占用重叠）:');
         for (const c of f.external) {
           lines.push(
-            `    - ${c.booking.id}（${c.booking.start} → ${c.booking.end}）` +
-              `：共同资源 ${formatResourceIds(store, c.shared)}`,
+            ...renderConflictLines(
+              store,
+              c.shared,
+              '    ',
+              `${c.booking.id}（${c.booking.start} → ${c.booking.end}）`,
+            ),
           );
         }
       }
       if (f.internal.length > 0) {
-        lines.push('  批内冲突:');
+        lines.push('  批内冲突（共同资源实际占用重叠）:');
         for (const x of f.internal) {
           const o = flat[x.otherIndex];
           lines.push(
-            `    - 第 ${o.item.index + 1} 项 UID “${o.item.ev.uid}” 第 ${o.occNo} 次发生（${occLabel(o.occ)}）` +
-              `：共同资源 ${formatResourceIds(store, x.shared)}`,
+            ...renderConflictLines(
+              store,
+              x.shared,
+              '    ',
+              `第 ${o.item.index + 1} 项 UID “${o.item.ev.uid}” 第 ${o.occNo} 次发生（${occLabel(o.occ)}）`,
+            ),
           );
         }
       }
@@ -5776,10 +6090,13 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
 
 资源命令:
   add-resource --type <venue|equipment|person> --name <名称> \\
-      --open <YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm> [--open ...]
-      登记场地/设备/人员（类型也可写 场地、设备、人员），返回稳定标识，如 R0001
+      --open <YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm> [--open ...] \\
+      [--prep <非负整数分钟>] [--teardown <非负整数分钟>]
+      登记场地/设备/人员（类型也可写 场地、设备、人员），返回稳定标识，如 R0001。
+      --prep/--teardown 为该资源每个预约的预约前准备/预约后整理分钟（省略按 0），
+      取值必须是非负安全整数；非法值拒绝，已持久化字段非法视为数据文件损坏
   list-resources
-      列出全部资源的标识、类型、名称与开放区间
+      列出全部资源的标识、类型、名称、开放区间及预约前准备、预约后整理分钟
 
 预约命令:
   create-booking --resource <标识> [--resource <标识> ...] \\
@@ -5842,11 +6159,13 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   add-flex-waitlist --resource <标识> [--resource <标识> ...] \\
       --window <开始/结束> --duration <正整数分钟>
       登记一项弹性时段候补：在窗口（YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm，
-      真实有效、结束晚于开始、允许跨日、与机器时区无关）内为全部资源寻找所需
-      连续时长的最早安排；时长为不超过窗口长度的正整数分钟。登记忽略预约
-      占用，但窗口内全部资源的共同实际可用时间（开放合并重叠或相接后扣除
-      有效停用并集，无需整窗开放）须能容纳完整时长，否则拒绝。候补不占用
-      资源，返回稳定且不复用的候补标识；重复登记相同内容视为另一项候补
+      真实有效、结束晚于开始、允许跨日、与机器时区无关；窗口只限制活动起止）
+      内为全部资源寻找所需连续时长的最早活动安排；时长为不超过窗口长度的正
+      整数分钟。登记忽略预约占用，但窗口内全部资源在扣除各自预约前准备、预约
+      后整理预留后的共同可供活动时间（开放合并扣除有效停用，再各取
+      [开放段开始+准备, 开放段结束-整理) 后求交并裁进窗口，无需整窗开放）须
+      能容纳完整时长，否则拒绝。候补不占用资源，返回稳定且不复用的候补标识；
+      重复登记相同内容视为另一项候补
   list-waitlist
       按登记顺序列出全部候补的标识、种类、两种原请求（固定时段或弹性窗口+
       时长）、资源、等待/已兑现/已取消状态及兑现后的预约标识（空队列明确提示）
@@ -5869,15 +6188,18 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   find-slot --window <开始/结束> --duration <正整数分钟> \\
       --group <候选资源,逗号分隔> [--group <候选资源,逗号分隔> ...]
       在营业地时间窗口（YYYY-MM-DDTHH:mm/YYYY-MM-DDTHH:mm，真实有效、
-      结束晚于开始、允许跨日、与机器时区无关）内，为一组有顺序的需求寻找
+      结束晚于开始、允许跨日、与机器时区无关；窗口只限制活动起止，准备/整理
+      可伸出窗口但仍须实际可用）内，为一组有顺序的需求寻找
       能同时满足全部需求的最早连续时段：每个 --group 列出一组可任选其一的
       已登记资源（至少一组，每组非空；组内重复或未知资源拒绝；同一资源可
       出现在不同组，例如两名工作人员用两个需求组表达）。时长为不超过窗口
       长度的正整数分钟。每组恰选一个候选，全部所选资源互不相同，并在整个
-      时段保持同一组合（不中途更换资源、不拼接间断时间）。各资源空闲时间
-      = 开放区间合并重叠或相接后扣除有效停用并集与当前有效预约占用（取消
-      的预约/停用与未兑现候补不阻挡），区间左闭右开、端点相接可行。有解时
-      显示起止时间与按需求组顺序的所选资源（标识、名称、类型）；同一最早
+      活动时段保持同一组合（不中途更换资源、不拼接间断时间）。各资源空闲
+      时间按活动时间计算：实际可用段 [a,b) 化为 [a+准备,b-整理) 后裁进窗口，
+      再扣除当前有效预约按各资源自身缓冲扩张的占用（取消的预约/停用与未兑现
+      候补不阻挡），区间左闭右开、实际占用端点相接可行。有解时
+      显示活动起止时间与按需求组顺序的所选资源（标识、名称、类型）及各资源
+      实际占用；同一最早
       开始有多个组合时，按组顺序的资源标识序列取字典序最小者（组内候选
       输入顺序不影响结果）。无解明确提示且退出码为 0，不返回少组或缩短
       时长的方案。本命令只读一份完整数据快照：不等待写入保护、不创建预约
@@ -5894,10 +6216,12 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
         "groups":   有顺序的需求组数组，每组是一个候选资源标识数组
                     （如 [["R0001","R0002"],["R0003"]]）；至少一组、每组非空，
                     未知或组内重复资源整单拒绝；资源可跨组、跨项出现
-      每项须完整落在自身窗口内：每组恰选一个候选，一项所选资源互不相同，
-      全部所选资源同时连续可用且全程固定（不换资源、不拼接间断）；开放重叠
-      或相接先合并，再扣除有效停用与全部有效预约的当前占用（取消记录及未
-      兑现候补不阻挡）；新项之间仅共同资源的左闭右开时间重叠才冲突，端点
+      每项须完整落在自身窗口内（窗口只限制活动起止）：每组恰选一个候选，一项
+      所选资源互不相同，全部所选资源同时连续可用且全程固定（不换资源、不拼接
+      间断）；各资源的实际占用（活动起止按其自身准备/整理分别扩张，可伸出窗口
+      但仍须实际可用）被开放重叠或相接先合并再扣除有效停用后的时间完整覆盖，
+      并扣除全部有效预约按各资源自身缓冲扩张的当前占用（取消记录及未
+      兑现候补不阻挡）；新项之间仅共同资源的左闭右开实际占用重叠才冲突，端点
       相接可行。求解面向整单可行性：不会逐项固定最早选择后漏掉须调整前项
       时间或资源的解，也不跳过受阻项。多个完整方案按清单顺序逐项比较：
       先比该项开始分钟，再按需求组顺序以字符串字典序比资源标识，第一处
@@ -5934,9 +6258,10 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       （名册为空时明确提示并退出 0）；未知或重复资源拒绝。每个资源的实际可用
       时间 = 开放区间合并重叠或相接后扣除有效停用并集，再裁剪到窗口；占用只计
       有效预约（普通、系列成员、导入与候补兑现预约同口径；已取消预约/停用、
-      未兑现候补、导入首次请求快照与改期历史快照均不计）的当前时间与当前
-      资源，并取与实际可用区间的交集，同一资源的重叠占用合并、一分钟只计
-      一次，多资源预约在每个所选资源分别计时。逐日明细覆盖与窗口有正长度
+      未兑现候补、导入首次请求快照与改期历史快照均不计）在每个资源上的实际
+      占用（活动起止按该资源自身准备/整理时间分别扩张后的区间）与当前资源，
+      并取与实际可用区间的交集，同一资源的重叠占用合并、一分钟只计一次，
+      多资源预约在每个所选资源分别计时。逐日明细覆盖与窗口有正长度
       交集的全部营业日期（按午夜拆分，首尾不足一天只计窗口内部分，含零可用
       或零占用的所选资源，按日期再按资源标识排序）；整窗再按资源逐行汇总并
       合计全部所选资源的可用、占用、空闲资源分钟与使用率（空闲 = 可用 - 占用，
@@ -5951,8 +6276,9 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   add-closure --resource <标识> --start <YYYY-MM-DDTHH:mm> --end <YYYY-MM-DDTHH:mm>
       [本地弹性改期清单文件]
       为一个已登记资源登记一段临时停用；不要求该区间原本开放。
-      不附清单时，登记前检查该资源的全部有效预约（含系列成员与候补兑现预约，
-      已取消不阻挡；左闭右开，端点相接不算重叠），有时间重叠即拒绝并列出全部
+      不附清单时，登记前按该资源上的实际占用（活动起止按其准备/整理扩张后的
+      区间）检查全部有效预约（含系列成员与候补兑现预约，已取消不阻挡；左闭
+      右开，端点相接不算重叠），有实际占用重叠即拒绝并列出全部
       受影响预约标识及时间，不改期或取消它们。
       附加清单（可选的位置参数，UTF-8 JSON，写法与校验完全同 reschedule-flex：
       顶层 {"items": [...]}，非空有序，每项 bookingId/window/groups，时长保持
@@ -6071,12 +6397,19 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
       失败均退出 1 并说明原因，原输出文件与业务文件保持不变；输出文件原本不
       存在时失败也不留下半成品。用法错误退出 2。
 
-实际可用时间:
+实际可用时间与预约占用:
   资源的实际可用时间 = 原开放区间合并后扣除全部有效停用区间的并集（原开放
-  记录保留）。创建预约、单项及批量改期、创建系列、登记及处理候补均按实际
-  可用时间检查全部资源的完整覆盖；停用导致不足时列出受影响资源及相关有效
-  停用标识和时间。已有候补不因新增停用而删除、取消或判作损坏；处理时受阻
-  项继续等待并检查后项。取消停用后候补仅在再次手动处理时尝试兑现。
+  记录保留）。资源可用 add-resource 的 --prep/--teardown 设置每个预约的
+  预约前准备分钟与预约后整理分钟（非负安全整数，省略或旧资源缺字段均为 0；
+  读写与重启保留设置）。预约记录保存的始终是活动起止：每个所用资源对该预约
+  的实际占用分别为“活动开始减该资源自己的准备”至“活动结束加该资源自己的
+  整理”（左闭右开），不按多个资源的最大缓冲统一扩张。创建预约、单项及批量
+  改期、创建系列、登记及处理候补均要求每个资源上的实际占用被其实际可用时间
+  完整覆盖（准备/整理可伸出查询或排程窗口，但仍须实际可用），实际占用越出
+  0001-9999 年即拒绝；停用导致不足时列出受影响资源及相关有效停用标识和时间。
+  仅共同资源上的双方实际占用重叠才算冲突，扩张后的端点相接可行。已有候补不
+  因新增停用而删除、取消或判作损坏；处理时受阻项继续等待并检查后项。取消
+  停用后候补仅在再次手动处理时尝试兑现。
 
 批量改期清单（reschedule-batch 的 JSON 文件，UTF-8，顶层 {"items": [...]}）:
   清单不能为空；每项字段：
@@ -6164,9 +6497,11 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
   为与机器时区无关的营业地时间，日期必须真实有效，结束晚于开始，允许跨日；
   按周移动按营业地日历日计算，跨月、闰日、跨年均准确，结果须落在 0001-9999 年内；
   区间左闭右开：一个预约的结束恰为另一预约的开始不算冲突；
-  开放区间重叠或相接视为连续开放，预约须被每个所选资源的实际可用时间
-  （开放区间扣除有效停用）完整覆盖；
-  仅当存在共同资源且时间重叠时预约才冲突。
+  开放区间重叠或相接视为连续开放，预约在每个所用资源上的实际占用（活动起止
+  分别按该资源自身准备/整理时间扩张）须被其实际可用时间
+  （开放区间扣除有效停用）完整覆盖，实际占用越出 0001-9999 年即拒绝；
+  仅共同资源上的双方实际占用时间重叠时预约才冲突（每资源分别扩张，扩张后的
+  端点相接可行），查询与弹性排程的窗口只限制活动起止，准备/整理可伸出窗口。
 
 并发写入保护:
   所有修改入口以同一数据文件为单位互斥：先取得写入保护（锁文件
@@ -6190,8 +6525,8 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
 退出码:
   0  成功
   1  业务或文件失败（名称为空、未知/重复资源或预约、需求组为空或含未知/
-     组内重复候选、已取消预约、时间非法、
-     开放不足、冲突、非法次数、超出四位年份、未知系列、未知候补、取消已兑现
+     组内重复候选、已取消预约、时间非法、预约前准备/预约后整理分钟非法、
+     开放不足、实际占用越出四位年份、冲突、非法次数、超出四位年份、未知系列、未知候补、取消已兑现
      候补、候补标识非法、停用区间与有效预约重叠、未知停用、停用标识非法、
      停用同次改期清单不可读/损坏/内容非法、漏列与拟停用重叠的有效预约、
      停用生效后整单无可行方案、
@@ -6209,7 +6544,7 @@ const HELP_TEXT = `shiftbook —— 本地多资源预约（含按周重复系�
 
 示例:
   node app.ts add-resource --type 场地 --name 一号会议室 \\
-      --open 2026-01-01T00:00/2027-01-01T00:00
+      --open 2026-01-01T00:00/2027-01-01T00:00 --prep 15 --teardown 15
   node app.ts create-booking --resource R0001 \\
       --start 2026-10-05T10:00 --end 2026-10-05T11:00
   node app.ts create-series --resource R0001 \\
